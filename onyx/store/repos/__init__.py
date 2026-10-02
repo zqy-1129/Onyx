@@ -7,7 +7,8 @@ ORM 会把最该被看见的 SQL 藏起来，而 SQL 正是看板性能与正确
 from __future__ import annotations
 
 from .model_repo import ModelRepo
+from .tool_repo import ToolRepo
 from .trace_repo import TraceRepo
 from .usage_repo import UsageRepo
 
-__all__ = ["ModelRepo", "TraceRepo", "UsageRepo"]
+__all__ = ["ModelRepo", "ToolRepo", "TraceRepo", "UsageRepo"]

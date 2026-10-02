@@ -182,3 +182,56 @@ class AnomalyRecord:
     trace_id: str | None = None
     detail: dict[str, Any] = field(default_factory=dict)
     created_at: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ToolDefRecord:
+    id: str
+    name: str
+    version: str
+    kind: str
+    schema_json: dict[str, Any]
+    hash: str
+    impl_ref: str = ""
+    tokens: int | None = None
+    bytes: int | None = None
+    tags: tuple[str, ...] = ()
+    owner: str = ""
+    enabled: bool = True
+    side_effect: str = "read"
+    timeout_ms: int | None = None
+    doc: str = ""
+    examples: tuple[dict[str, Any], ...] = ()
+    description: str = ""
+    extra: dict[str, Any] = field(default_factory=dict)
+    created_at: str = ""
+    updated_at: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ToolTestRecord:
+    id: str
+    tool_id: str
+    name: str
+    args: dict[str, Any]
+    expect: dict[str, Any] | None = None
+    checks: tuple[dict[str, Any], ...] = ()
+    live: bool = False
+    created_at: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ToolRunRecord:
+    id: str
+    status: str
+    started_at: str
+    tool_id: str | None = None
+    tool_def_hash: str | None = None
+    test_id: str | None = None
+    trace_id: str | None = None
+    latency_ms: float | None = None
+    output_ref: str | None = None
+    error: str | None = None
+    deterministic: bool | None = None
+    idempotent: bool | None = None
+    extra: dict[str, Any] = field(default_factory=dict)

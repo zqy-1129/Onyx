@@ -751,6 +751,151 @@ def serve(
     uvicorn.run(app_obj, host=host, port=port, log_level="info")
 
 
+# ── tools ──────────────────────────────────────────────────────────
+tools_app = typer.Typer(help="工具注册表：导入、审计、上下文开销核算", no_args_is_help=True)
+app.add_typer(tools_app, name="tools")
+
+
+def _tool_registry(db: Path | None, model: str | None):
+    """构造注册表。给了 --model 就用**该模型标定过的计数档位**，
+    与 gateway 归因走同一个 `text_counter`——开销数字必须与 trace 里的
+    `part=tool_defs` 同源，不许两处各算一套。"""
+    from onyx.llm.measurement.fidelity import text_counter
+    from onyx.runtime import counter_ctx_factory
+    from onyx.store.repos import ToolRepo
+    from onyx.tools.registry import ToolRegistry
+
+    settings = _settings()
+    database = Database(_db_path(settings, db))
+    count_fn = None
+    if model:
+        ctx = counter_ctx_factory(database, "ollama-local")(model)
+        count_fn = text_counter(ctx)
+        count_fn.source_name = (  # type: ignore[attr-defined]
+            "gguf_vocab" if ctx.tokenizer is not None
+            else "fitted" if ctx.fitted_ratio and ctx.fitted_n >= 30
+            else "heuristic"
+        )
+    return ToolRegistry(ToolRepo(database), count_fn=count_fn), database
+
+
+@tools_app.command("import")
+def tools_import(
+    file: Path = typer.Argument(..., exists=True, dir_okay=False, readable=True),
+    db: Path = typer.Option(None, "--db"),
+) -> None:
+    """从 YAML/JSON 导入工具定义（内容 hash 变化即版本递增）。"""
+    import json as _json
+
+    from onyx.tools.registry import defs_from_payload
+
+    text = file.read_text(encoding="utf-8")
+    if file.suffix.lower() in {".yaml", ".yml"}:
+        import yaml
+
+        payload = yaml.safe_load(text)
+    else:
+        payload = _json.loads(text)
+    registry, database = _tool_registry(db, None)
+    try:
+        records = registry.register_many(defs_from_payload(payload))
+        for record in records:
+            typer.echo(f"  {record.name:<24} v{record.version} {record.kind} "
+                       f"{record.side_effect} tokens={record.tokens} hash={record.hash}")
+        typer.echo(f"已导入 {len(records)} 个工具")
+    finally:
+        database.close()
+
+
+@tools_app.command("ls")
+def tools_ls(db: Path = typer.Option(None, "--db")) -> None:
+    """列出已注册工具。"""
+    from rich.console import Console
+    from rich.table import Table
+
+    registry, database = _tool_registry(db, None)
+    try:
+        records = registry.repo.list_defs()
+        table = Table(title=f"工具（{len(records)}）", pad_edge=False)
+        for column in ("工具", "版本", "类型", "副作用", "tokens", "bytes", "启用", "hash"):
+            table.add_column(column)
+        for record in records:
+            table.add_row(
+                record.name, f"v{record.version}", record.kind, record.side_effect,
+                str(record.tokens if record.tokens is not None else "—"),
+                str(record.bytes if record.bytes is not None else "—"),
+                "✓" if record.enabled else "✗", record.hash,
+            )
+        Console().print(table)
+    finally:
+        database.close()
+
+
+@tools_app.command("audit")
+def tools_audit(
+    db: Path = typer.Option(None, "--db"),
+    model: str = typer.Option(None, "--model", help="用该模型的标定档位核算描述预算"),
+) -> None:
+    """契约审计：逐条规则列出问题与修法。"""
+    from rich.console import Console
+    from rich.table import Table
+
+    registry, database = _tool_registry(db, model)
+    try:
+        results = registry.audit_all()
+        table = Table(title="工具契约审计", pad_edge=False)
+        for column in ("工具", "规则", "级别", "问题", "修法"):
+            table.add_column(column)
+        counts = {"error": 0, "warn": 0, "info": 0}
+        for name, findings in results.items():
+            for finding in findings:
+                counts[str(finding.severity)] = counts.get(str(finding.severity), 0) + 1
+                table.add_row(name, finding.rule, str(finding.severity), finding.message, finding.fix)
+        Console().print(table)
+        typer.echo(f"error={counts['error']} warn={counts['warn']} info={counts['info']}")
+        if counts["error"]:
+            raise typer.Exit(1)
+    finally:
+        database.close()
+
+
+@tools_app.command("cost")
+def tools_cost(
+    db: Path = typer.Option(None, "--db"),
+    model: str = typer.Option(None, "--model", help="按该模型的计数档位核算（推荐）"),
+    overhead: int = typer.Option(0, "--overhead", help="模板脚手架开销，取 trace 归因的 template_ctl"),
+) -> None:
+    """工具库上下文开销：JSON 本身 + 模板脚手架。
+
+    P17：只报 JSON 会把优化方向引到"精简描述"，而实测 73% 的开销来自模板注入的说明文本。
+    """
+    from rich.console import Console
+    from rich.table import Table
+
+    registry, database = _tool_registry(db, model)
+    try:
+        report = registry.cost(template_overhead=overhead)
+        table = Table(title=f"工具库开销 · count_source={report['count_source']}", pad_edge=False)
+        for column in ("工具", "tokens", "bytes", "类型", "副作用"):
+            table.add_column(column, justify="right" if column in {"tokens", "bytes"} else "left")
+        for item in report["tools"]:
+            table.add_row(item["name"], str(item["tokens"]), str(item["bytes"]),
+                          item["kind"], item["side_effect"])
+        Console().print(table)
+        typer.echo(f"JSON 本身      : {report['json_tokens']} token / {report['json_bytes']} bytes")
+        typer.echo(f"模板脚手架     : {report['template_overhead_tokens']} token"
+                   f"{'（用 --overhead 传入 trace 归因的 template_ctl）' if not overhead else ''}")
+        typer.echo(f"每次请求实付   : {report['effective_tokens']} token")
+        if report["template_share"] is not None:
+            typer.echo(f"模板占比       : {report['template_share']:.1%}"
+                       "  ← 换模板/换模型比精简描述更有效")
+        if report["count_source"] == "heuristic":
+            typer.echo("[!] 用的是 heuristic 档（未标定/未指定模型），"
+                       "绝对值仅供比较，加 --model 可得到标定后的数字")
+    finally:
+        database.close()
+
+
 def main() -> None:
     app()
 

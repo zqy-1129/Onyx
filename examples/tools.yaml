@@ -1,0 +1,74 @@
+# 示例工具定义。导入：onyx tools import examples/tools.yaml
+# side_effect 必须显式标注：沙箱据此决定是否需要审批，未标注会被审计判为 error。
+tools:
+  - name: get_weather
+    description: 查询指定城市的当前天气，包括温度、天气状况与风力。仅在用户询问实时天气时使用。
+    kind: python_fn
+    side_effect: network
+    impl_ref: onyx.tools.builtin.weather:get_weather
+    timeout_ms: 8000
+    owner: platform
+    tags: [demo, network]
+    parameters:
+      type: object
+      properties:
+        city:
+          type: string
+          description: 城市名称，使用中文或英文均可，例如「北京」或「Beijing」。
+        unit:
+          type: string
+          enum: [celsius, fahrenheit]
+          description: 温度单位。默认摄氏度；用户明确要求华氏度时才传 fahrenheit。
+      required: [city]
+      additionalProperties: false
+    examples:
+      - instruction: 北京现在天气怎么样？
+        expect:
+          name: get_weather
+          arguments: { city: 北京 }
+
+  - name: calculator
+    description: 计算一个数学表达式的值，支持四则运算、括号与常见函数。用于任何需要精确算术的场合。
+    kind: python_fn
+    side_effect: read
+    impl_ref: onyx.tools.builtin.calculator:calculate
+    timeout_ms: 2000
+    tags: [demo, pure]
+    parameters:
+      type: object
+      properties:
+        expr:
+          type: string
+          description: 待求值的数学表达式，例如 "(3 + 5) * 12"。不要包含赋值或函数定义。
+      required: [expr]
+      additionalProperties: false
+    examples:
+      - instruction: 帮我算 (3+5)*12
+        expect:
+          name: calculator
+          arguments: { expr: "(3+5)*12" }
+
+  - name: db_query
+    description: 在只读副本上执行一条 SELECT 查询并返回结果行。禁止执行任何写操作或 DDL。
+    kind: python_fn
+    side_effect: read
+    impl_ref: onyx.tools.builtin.db:query
+    timeout_ms: 15000
+    owner: data
+    tags: [demo, data]
+    parameters:
+      type: object
+      properties:
+        sql:
+          type: string
+          description: 要执行的 SELECT 语句。必须是只读查询，不允许 INSERT/UPDATE/DELETE/DROP。
+        limit:
+          type: integer
+          description: 返回行数上限，默认 100，最大 1000。用于避免一次性拉取过多数据。
+      required: [sql]
+      additionalProperties: false
+    examples:
+      - instruction: 查一下 3 月的订单总数
+        expect:
+          name: db_query
+          arguments: { sql: "SELECT COUNT(*) FROM orders WHERE month = 3" }

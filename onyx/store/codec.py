@@ -23,6 +23,10 @@ def dumps(obj: Any) -> str | None:
 def loads(raw: str | None, default: Any = None) -> Any:
     if raw is None or raw == "":
         return default
+    # 幂等：已经解码过的 dict/list 原样返回。
+    # 曾经在这里对 dict 再调一次 json.loads 直接抛 TypeError（tool_repo 的嵌套字段）。
+    if isinstance(raw, dict | list):
+        return raw
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
