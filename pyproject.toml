@@ -1,0 +1,72 @@
+[project]
+name = "onyx"
+version = "0.1.0"
+description = "本地大模型观测与评测看板：token 计量、工具调用观测、数据集评测"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.optional-dependencies]
+runtime = ["httpx>=0.27", "typer>=0.12", "rich>=13", "PyYAML>=6", "jsonschema>=4.21"]
+tokens = ["minja>=0.3", "tokenizers>=0.20", "gguf>=0.10"]
+api = ["fastapi>=0.115", "uvicorn[standard]>=0.30", "pydantic>=2.7"]
+bench = ["rapidfuzz>=3.9", "datasets>=3.0"]
+analysis = ["duckdb>=1.1"]
+dev = ["pytest>=8.3", "pytest-asyncio>=0.24", "ruff>=0.6", "import-linter>=2.0", "respx>=0.21"]
+
+[project.scripts]
+onyx = "onyx.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["onyx"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "live: 需要运行中的 Ollama",
+  "probe: 语义实测实验",
+  "e2e: 浏览器端到端",
+]
+addopts = "-m 'not live and not probe and not e2e' --strict-markers -q"
+# 挂死时自动 dump 所有线程栈：死锁必须留下现场，而不是让人干等
+faulthandler_timeout = 90
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+# BLE 刻意开启：观测系统里"吞掉异常"是有意设计，必须逐处显式标注 noqa 并写明理由，
+# 而不是让宽泛 except 悄悄扩散。
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF", "BLE"]
+# E501 交给格式化器；RUF001-003 会把中文全角标点判为"歧义字符"，本项目注释为中文，属误报
+ignore = ["E501", "RUF001", "RUF002", "RUF003"]
+
+[tool.ruff.lint.per-file-ignores]
+# B008：Typer/FastAPI 要求在参数默认值里调用 Option()/Depends()，这是框架契约
+"onyx/cli.py" = ["B008"]
+"onyx/api/**/*.py" = ["B008"]
+# 测试里故意制造异常与畸形输入
+"tests/**/*.py" = ["BLE001", "B017"]
+
+[tool.importlinter]
+root_packages = ["onyx"]
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "core uses stdlib only"
+type = "forbidden"
+source_modules = ["onyx.core"]
+forbidden_modules = [
+  "httpx", "fastapi", "pydantic", "duckdb", "tokenizers", "minja", "gguf",
+  "typer", "rich", "yaml", "jsonschema", "rapidfuzz",
+]
+
+[[tool.importlinter.contracts]]
+name = "only llm layer performs network IO"
+type = "forbidden"
+source_modules = ["onyx.store", "onyx.core"]
+forbidden_modules = ["httpx", "requests", "urllib3"]

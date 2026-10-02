@@ -1,0 +1,779 @@
+# Onyx — 分步实现方案（每步含自测与验收）
+
+> 用法：从 S0 顺序执行。每一步都是一个可独立提交、可独立验证的最小闭环。
+> **纪律**：每步先写自测（`tests/`），跑到红，再写实现跑到绿，再执行该步"验收命令"，通过后 `git commit`。禁止跨步合并提交——出错时无法定位是哪一层契约破了。
+
+---
+
+## 0. 全局约定
+
+### 0.1 里程碑与出口判据
+| 里程碑 | 步骤 | 出口判据（人话验收） |
+|---|---|---|
+| M0 环境 | S0 | `uv run onyx doctor` 全绿，能列出本机 Ollama 模型 |
+| M1 计量 | S1–S7 | **任意一次本地对话，DB 里能查到一条 trace，含 input/output token、TTFT、decode TPS、来源与置信度、工具调用若干，且原始 body 可回放** |
+| M2 看板 | S8–S9 | 浏览器打开 Fleet 与 Traces 页，Playground 流式对话实时出现在 Traces |
+| M3 工具 | S10–S12 | `onyx tool contract` 与 `onyx tool fire` 都能跑出通过/失败明细；工具库 token 开销有数字 |
+| M4 评测 | S13–S14 | 意图识别与工具调用两个 task 各跑完一次，输出 macro-F1 / must-call 命中率 + 95% CI，每个分数可下钻 trace |
+| M5 对比 | S15 | 两个模型同一 task 的矩阵与回归 diff 可导出 md/csv |
+| M6 扩展 | S16 | 不改动 `core/`，仅加插件 entry point 就能新增一个 provider 与一个 task 并跑通 |
+
+### 0.2 测试分层与命令
+```
+tests/unit/         纯函数，无 IO、无网络、无模型          → make test
+tests/contract/     工具契约/接口实现检查，无模型           → make test
+tests/integration/  需要 Ollama 在跑（@pytest.mark.live）  → make test-live
+tests/probe/        语义实测实验，产出 docs/PROBES.md      → make probe
+tests/e2e/          浏览器过看板（@pytest.mark.e2e）       → make test-e2e
+```
+`pyproject.toml`：
+```toml
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["live: 需要运行中的 Ollama", "probe: 语义实测实验", "e2e: 浏览器"]
+addopts = "-m 'not live and not probe and not e2e' --strict-markers -q"
+filterwarnings = ["error::DeprecationWarning:onyx.*"]
+```
+
+### 0.3 依赖
+```toml
+[project]
+requires-python = ">=3.12"
+dependencies = [
+  "fastapi", "uvicorn[standard]", "httpx", "pydantic>=2.7", "typer", "rich",
+  "jsonschema", "minja",          # chat template 渲染（llama.cpp 同源）
+  "rapidfuzz", "PyYAML",
+]
+[project.optional-dependencies]
+tokens  = ["tokenizers", "gguf"]           # T1/T2 复算档位
+bench   = ["pandas", "matplotlib"]         # 校准拟合与图
+analysis= ["duckdb"]                        # 只读列式聚合
+dev     = ["pytest", "pytest-asyncio", "respx", "import-linter", "ruff"]
+```
+> **`core/` 与 `store/` 禁止 import 上面任何三方库**（只有 stdlib）；这条由 §附B 的 import-linter 强制，不是口头约定。
+
+---
+
+## S0 — 环境引导
+
+**目的**：这台机器目前没有 Python、没有 Node、没有 Ollama。先把地基立起来，否则后面每一步都无法自测。
+
+**操作（PowerShell）**
+```powershell
+winget install astral-sh.uv
+winget install Ollama.Ollama
+winget install OpenJS.NodeJS.LTS
+```
+```bash
+uv python install 3.12
+ollama pull qwen3:8b        # 工具调用 + thinking，覆盖 M1/M4 需要
+ollama pull nomic-embed-text
+```
+
+**产出文件**：`scripts/bootstrap.ps1`（幂等：已安装则跳过）
+
+**自测**
+```bash
+uv --version && node --version && ollama --version
+curl -s http://127.0.0.1:11434/api/version
+ollama list | head -5
+```
+预期：三条版本行；`{"version":"0.x.y"}`；至少 1 个模型。
+
+**验收 DoD**：`ollama list` 非空；`/api/ps` 能访问（空 models 也算通过）。
+
+**常见阻塞**：服务未启动 → `Start-Service OllamaService` 或手动跑 `ollama serve`；8GB 显存则只保留 `qwen3:8b`（4B 量化档），并把评测默认上下文压到 4096。
+
+**提交**：`chore: bootstrap toolchain (uv/python3.12/ollama/node)`
+
+---
+
+## S1 — 仓库骨架 + L0 契约（types / ids / clock / event / errors / content）
+
+**目的**：把"数据形状"先钉死。后面所有层都依赖它，所以它必须最稳、且零依赖。
+
+**产出文件**
+```
+pyproject.toml  Makefile  .gitignore  onyx.example.yaml  README.md
+onyx/__init__.py  onyx/settings.py  onyx/cli.py
+onyx/core/types.py   # Role, Message, ToolSpec, ToolCall, GenParams, GenerationRequest,
+                     # EngineLatency, TokenSample, FinishReason, Generation（全 dataclass）
+onyx/core/ids.py     # new_trace_id(): 时间前缀可排序 id（无三方依赖）
+onyx/core/clock.py   # monotonic/wall 时钟注入点（测试用假时钟）
+onyx/core/event.py   # CONTRACT_VERSION=1 + EventType 枚举 + 每类型 payload 字段表(§10 DESIGN)
+onyx/core/errors.py  # OnyxError 族: ProviderUnreachable/SchemaInvalid/Tool*/Eval*/CapabilityMissing
+onyx/core/content.py # BlobStore: put(bytes)->'sha256:..' / get(ref) / .data/blobs 分片目录
+tests/unit/test_ids.py  test_event.py  test_content.py  test_types.py
+```
+
+**接口要点**
+```python
+@dataclass(frozen=True, slots=True)
+class GenerationRequest:
+    model: str; messages: tuple[Message, ...]; params: GenParams
+    tools: tuple[ToolSpec, ...] = (); tool_choice: str | None = None
+    stream: bool = False; thinking: bool | None = None
+    keep_alive: str | None = None
+    kind: str = "generation"; purpose: str = "chat"
+    context: dict[str, Any] = field(default_factory=dict)  # eval_run_id/case_id/seq 透传
+```
+`context` 是评测与观测的连接点：**trace 必须能反查它是哪个 case 的第几个样本**。
+
+**自测**
+```bash
+uv run pytest tests/unit -q
+uv run python -c "from onyx.core.ids import new_trace_id as n; a,b=[n() for _ in range(2)]; print(a<b)"
+```
+预期：`N passed`；打印 `True`（id 单调可排序）。必须覆盖的断言：
+1. `new_trace_id()` 连续 1000 个严格递增且唯一；
+2. `GenerationRequest` 未知字段不炸（extra 进 `context`）；
+3. `BlobStore` 同内容两次 put 返回同一 ref（去重）；
+4. `event.EventType` 每个成员都有 payload 声明（表驱动测试，防漏）。
+
+**验收 DoD**：`uv run onyx --help` 出帮助；`grep -rE "^(import|from) (httpx|fastapi|pydantic)" onyx/core/` **无输出**（零依赖是真的）。
+
+**提交**：`feat(core): domain types, sortable ids, event contract, blob store`
+
+---
+
+## S2 — 存储层（SQLite/WAL + 迁移 + repo + sink 抽象）
+
+**产出文件**
+```
+onyx/store/db.py  onyx/store/migrations/0001_init.sql        # DESIGN §5 全部 DDL
+onyx/store/repos/{model,trace,usage,tool,eval}_repo.py
+onyx/store/sinks/{base,sqlite,jsonl,null}.py
+tests/unit/test_migrations.py  test_repos.py  test_sink_jsonl.py
+```
+
+**接口要点**
+```python
+class Sink(Protocol):
+    def emit(self, ev: TraceEvent) -> None: ...      # 非阻塞，内部队列
+    def flush(self, timeout: float = 1.0) -> None: ...
+    def close(self) -> None: ...
+```
+- 单写队列：gateway 线程安全投递，后台线程批量事务落库（避免 SQLite 写锁竞争，R11）。
+- 迁移 = 编号 SQL 文件 + `schema_version` 表；启动时按序重放，**幂等**。
+
+**自测**
+```bash
+uv run pytest tests/unit/test_migrations.py tests/unit/test_repos.py -q
+uv run onyx db init --db .tmp/t.sqlite && uv run onyx db info
+```
+预期：`db info` 打印 `schema_version=1 tables=18`。必须覆盖：
+1. 空库迁移 → 全部表存在；
+2. 重复 init 不报错且版本不变；
+3. `trace insert + usage_alt 多来源 upsert + 采信读回` 一致；
+4. 未知 JSON 字段进 `extra_json` 不丢（前向兼容，原则 6）；
+5. 500 并发 emit → flush 后行数恰为 500（不丢不重）。
+
+**验收 DoD**：`onyx db info` 正确；`sqlite3` 手工 `.tables` 与 §5 一致；DB 文件在无数据时 < 200KB。
+
+**提交**：`feat(store): sqlite wal schema, idempotent migrations, single-writer sinks`
+
+---
+
+## S3 — Ollama 适配器：控制面 + 原生数据面 + 流式增量
+
+**目的**：拿到 T0（引擎真数）。**只用真实服务验证，不做 mock-only 开发**——mock 会把你没能力做的假设固化进代码。
+
+**产出文件**
+```
+onyx/llm/providers/base.py            # LlmProvider Protocol + Cap + 重试/超时
+onyx/llm/providers/ollama/client.py   # httpx client、错误体 {error} 解析、超时与取消
+onyx/llm/providers/ollama/native.py   # /api/chat(/api/generate) 请求构造与响应解析
+onyx/llm/providers/ollama/lifecycle.py# /api/tags /api/show /api/ps /api/version /api/delete /api/pull(流)
+onyx/llm/providers/ollama/openai_compat.py  # /v1/*（T4 交叉验证用）
+onyx/llm/streaming.py                 # 增量缝合：content/thinking/tool_calls 分片累积
+onyx/llm/params.py                    # GenParams ↔ options 映射（含未支持项显式记录）
+tests/contract/test_provider_contract.py   # 契约检查（任何 provider 都要过）
+tests/integration/test_ollama_live.py      # @live
+```
+
+**接口要点**
+- `generate(req, on_event=...)`：流式时只在**最后一个 ndjson 事件**读 `prompt_eval_count/eval_count/*_duration/done_reason`（DESIGN §6.3 的 `stream_usage` 探针会证实这条）。
+- `capabilities()` 由 `/api/version` + 探测结果驱动，**硬编码要留 TODO 指向具体探针**。
+- `unload(name)` = `keep_alive:"0"` 的空请求；不依赖任何未文档化端点。
+- 所有 HTTP 失败必须转 `ProviderUnreachable`，带上 base_url 与耗时（看板要显示"服务没起"而不是 500 栈）。
+
+**自测**
+```bash
+uv run pytest tests/contract -q
+uv run onyx models sync --provider ollama-local     # 期望: 同步 N 个模型, M 个已加载
+uv run onyx chat "用一句话介绍你自己" --model qwen3:8b --stream
+```
+预期最后一条打印：流式文本、`in/out tokens`、`TTFT`、`decode TPS`、`load_duration`、`done_reason`，且末尾给出 `trace_id`。
+必须覆盖：
+1. 非流式与流式对同一请求给出**相同** token 数（不一致即 `probe/stream_usage` 失败）；
+2. `tool_calls` 分片累积能拼回完整 JSON（多分片断言）；
+3. `thinking` 与 `content` 不串流（推理文本不混进正文）；
+4. 服务停掉时 `onyx models sync` 报错信息含 base_url 而非堆栈；
+5. `/api/ps` 的 `expires_at` 能算出剩余秒数且随时间递减。
+
+**验收 DoD**：`onyx chat --stream` 输出的 4 个数字与 `curl -s localhost:11434/api/chat -d '{...}' | jq` 原始返回逐项一致。
+
+**提交**：`feat(ollama): native provider, streaming reassembly, control-plane lifecycle`
+
+---
+
+## S4 — Token 计量：保真阶梯 + 归因 + 对账
+
+**目的**：把 §6 的阶梯变成代码，并**在写第一行业务前完成语义实测**。
+
+**产出文件**
+```
+onyx/llm/measurement/fidelity.py   # 各档 Counter: engine/compat/hf_tokenizer/gguf_vocab/fitted/heuristic
+onyx/llm/measurement/parts.py      # 渲染后 prompt 的分段归因（system/tool_defs/msg_i/gen_prompt）
+onyx/llm/measurement/reconciler.py # 采信顺序 + drift 计算 + confidence 标注
+onyx/llm/measurement/heuristic.py  # chars/4 + CJK 修正系数（R8）
+onyx/llm/providers/ollama/template.py  # minja 渲染；不可用时退化为内置 ChatML/简单模板并降 confidence
+onyx/llm/providers/ollama/tokenizer.py # model_info → vocab；(可选) remote_model → HF tokenizer.json
+onyx/probe/{usage_fields,cache,stream_usage,think,tool_format,structured}.py
+docs/PROBES.md                     # 实测结论（含日期/Ollama 版本/模型）
+tests/unit/{test_reconciler,test_parts,test_heuristic_cjk}.py
+tests/probe/test_probe_cache.py    # @probe
+```
+
+**接口要点**
+```python
+@dataclass
+class TokenSample: source: str; in_tokens: int|None; out_tokens: int|None
+                   thinking: int|None; cached: int|None; ok: bool; note: str
+class Counter(Protocol):
+    name: ClassVar[str]; fidelity: ClassVar[int]
+    def count(self, req: GenerationRequest, gen: Generation) -> TokenSample: ...
+```
+- 归因只有在能渲染模板时才产 `token_part`；不能渲染 → 该 trace 只有总量，UI 显示"归因不可用"。
+- `fitted` 档由 `onyx calibrate` 生成，结果写回 `model.usage_ratio/usage_ratio_n`；样本 <50 时 `usage_ratio` 视为不可信。
+
+**自测**
+```bash
+uv run pytest tests/unit -q
+uv run onyx probe run --model qwen3:8b --suite usage,cache,think   # 写 docs/PROBES.md
+uv run onyx calibrate --model qwen3:8b --n 200                     # 打印拟合值与残差
+uv run onyx token explain <trace_id>                                # 逐来源对比表 + drift
+```
+`token explain` 预期输出（关键验收形态）：
+```
+source        in    out   thinking  cached  ok  note
+engine        1842   213     —        0     ✓  /api/chat prompt_eval_count
+compat        1842   213     —        —     ✓  /v1 usage
+hf_tokenizer  1855   209     —        —     ✓  minja+qwen2, drift 0.7%
+fitted        1796   205     —        —     ✓  ratio 0.62 tok/char (n=210)
+chosen: engine (high)   drift(engine vs hf_tokenizer)=0.7%  ✓ 阈值内
+```
+必须覆盖：
+1. 采信顺序单测（engine 缺失→降级 hf_tokenizer→fitted→heuristic，每级 confidence 正确）；
+2. CJK 修正：纯中文样本的 heuristic 误差 < 纯英文样本误差的 2 倍（防 R8）；
+3. `tool_defs` 归因 ≥ 0 且随工具数量单调增（拿 1/5/20 个工具各测一次）；
+4. `drift_pct` 超阈值时 reconciler 产 `anomaly(TOKEN_DRIFT)` 事件；
+5. 探针脚本在无模型时 **skip 并提示**，不产生假结论。
+
+**验收 DoD（M1 前半）**：`docs/PROBES.md` 里 cache / think / stream_usage 三个语义有明确结论或标注"未定"，且代码里的假设与之逐条对应（能 grep 到引用）。
+
+**提交**：`feat(measure): token fidelity ladder, template attribution, drift reconciliation + probes`
+
+---
+
+## S5 — Gateway 装配 + 观测引擎 + visitors
+
+**目的**：把 S3/S4 接到 S2，形成"唯一调用路径"。这一步结束，任何一次对话都会留下可回溯的完整证据链。
+
+**产出文件**
+```
+onyx/llm/gateway.py        # normalize → provider.generate → 事件产出 → fanout(sinks+visitors)
+onyx/llm/registry.py       # entry points 'onyx.providers' 发现
+onyx/obs/engine.py         # EventVisitor 链：异常隔离（一个 visitor 崩不影响主链路）
+onyx/obs/visitors/{token,tool,anomaly,gpu,cost}.py
+onyx/obs/anomalies.py      # code 常量表: TOKEN_DRIFT/TRUNCATED_JSON/ORPHAN_TOOL_CALL/MALFORMED_JSON/
+                           # UNKNOWN_TOOL/BUDGET_EXCEEDED/TOOL_LOOP/CONTEXT_OVERFLOW/CACHE_MISS_ANOMALY/THINKING_LEAK
+tests/unit/test_gateway_pipeline.py   # 用 providers/mock.py 做端到端
+tests/unit/test_obs_isolation.py
+onyx/llm/providers/mock.py  # 脚本化响应（固定 usage、可注入畸形 tool JSON、可注入超时）
+```
+
+**接口要点**
+- visitor 协议：`def on(self, ev: TraceEvent) -> Iterable[TraceEvent]`（可产新事件，如 `reconciled`）。
+- visitor 抛异常 → 记 `anomaly(OBSERVER_ERROR)` 并继续，**绝不影响用户请求**。
+- gateway 是唯一允许 `provider.generate()` 的地方；`grep -rn "\.generate(" onyx/ | grep -v gateway.py` 必须为空（写进自测）。
+
+**自测**
+```bash
+uv run pytest tests/unit -q
+uv run onyx chat "hi" --model mock/echo --dry-run     # 不碰 GPU，纯管道验证
+uv run onyx traces ls --limit 3
+```
+`traces ls` 预期：
+```
+id                 purpose    model        in    out  ttft  tps   status  tools
+01J9X...QK7        chat       qwen3:8b     1842   213  142ms 31.2  ok      0
+```
+必须覆盖：
+1. mock 注入 `prompt_eval_count=None` → 降级到 heuristic 且 `confidence=low`；
+2. mock 注入截断 JSON 工具调用 → `parse_status=truncated` + `args_raw` 保住了原文；
+3. 两个 sink（sqlite + jsonl）同写，JSONL 行数 == DB trace 行数；
+4. 故意让 `visitors/cost` 抛异常 → 请求仍 `status=ok`，且有 `OBSERVER_ERROR`；
+5. `context={'eval_run_id':..,'case_id':..,'sample_seq':..}` 正确透传进 trace 行。
+
+**验收 DoD**：**M1 出口判据在此达成** —— 一次真实对话后，`onyx traces show <id>` 能显示 token(带来源/置信度)、TTFT、TPS、cold/warm、工具列表、原始 body 指针；`onyx traces replay <id> --dry-run` 能重建等价请求。
+
+**提交**：`feat(llm): gateway single throat + observer chain with fault isolation`
+
+---
+
+## S6 — 能力探测与模型档案落库
+
+**目的**：让"这个模型能不能测工具调用、走哪种格式"成为**查出来的事实**，而不是配置里抄来的说法。
+
+**产出文件**
+```
+onyx/probe/runner.py               # 编排探针：逐模型跑，写 model 表
+onyx/probe/report.py               # 输出 docs/PROBES.md 追加段 + 控制台矩阵
+onyx/llm/caps.py                   # Cap 推断：capabilities + 版本 + 探测结果 → frozenset[Cap]
+tests/unit/test_caps_inference.py  tests/probe/test_probe_matrix.py(@probe)
+```
+
+**探测矩阵**（对每个模型产出一行，全部落 `model.tool_format/capabilities_json/extra_json`）
+| 探测 | 判定依据 |
+|---|---|
+| tools 能力 | `/api/show.capabilities` 含 `"tools"` |
+| thinking 开关 | `think:false` 是否真减少 `eval_count`（未生效则 task 侧禁用 think 参数） |
+| 工具格式 | 最小工具调用的**原文**：出现 XML 标签→`xml`；纯 JSON→`json`；有 native tool_calls 字段→`native_head`；否则 `unknown` |
+| structured | `format:json_schema` 后输出是否 schema 合法 |
+| stream_usage | 流式末事件是否含计数（决定 T0 是否走流式路径） |
+| 上下文上限 | `context_length` 实测（超限时是截断还是报错 → `CONTEXT_OVERFLOW` 判定策略） |
+
+**自测**
+```bash
+uv run onyx probe matrix --provider ollama-local        # 表格：模型 × 能力位
+uv run pytest tests/unit/test_caps_inference.py -q
+```
+预期矩阵形态：
+```
+model            tools  tool_choice  think  structured  tool_format  stream_usage  max_ctx
+qwen3:8b         ✓      ✗(cap)       ✓      ✓           native_head  ✓             32768
+llama3.2:3b      ✓      ✗(cap)       ✗      ✗           json         ✓             8192
+```
+必须覆盖：`unknown` 与 `✗(cap)` 是不同状态（一个是"不支持"，一个是"没测出来"），UI 与评测 skip 原因都依赖这个区分。
+
+**验收 DoD（M1 完整出口）**：`probe matrix` 全绿且无 `unknown` 的工具格式列；`docs/PROBES.md` 每个结论可追溯到一次真实 trace id。
+
+**提交**：`feat(probe): capability matrix and per-model behavior profiling`
+
+---
+
+## S7 — M1 收口：CLI 报表 + 证据回放 + 数据保留
+
+**产出文件**
+```
+onyx/cli.py（补齐子命令：models/chat/traces/token/tools/eval/probe/calibrate/doctor/db）
+onyx/report/exporters/{csv,md,jsonl}.py
+scripts/rotate.py   # blob 与 trace 保留策略（默认 trace 90d / 原始 body 30d / eval 记录永久）
+tests/unit/test_exporters.py  tests/unit/test_doctor.py
+```
+`onyx doctor` 检查项：Ollama 可达性/版本、DB 与迁移版本、磁盘与 blob 一致性（引用计数）、tokenizer 档位可用性、**每个模型是否有 probe 结论**、GPU 锁是否被残留占用。
+
+**自测**
+```bash
+uv run onyx doctor            # 全绿；任何红项有修复提示
+uv run onyx report usage --since 7d --format md > reports/week.md
+uv run onyx db backup --to .tmp/backup.sqlite && uv run onyx db verify-backup .tmp/backup.sqlite
+```
+必须覆盖：`doctor` 在故意停掉 Ollama / 删一个 blob 文件后能报出具体项（不是笼统 500）；`verify-backup` 比对行数与 blob 摘要。
+
+**验收 DoD**：M1 出口判据 + `doctor` 全绿 + 备份可恢复。
+
+**提交**：`feat(cli): doctor, reporting, retention, backup verify`
+
+---
+
+## S8 — API 层 + 前端骨架 + Fleet 页
+
+**产出文件**
+```
+onyx/api/{app.py,deps.py,sse.py}
+onyx/api/routes/{fleet,models,traces,usage,admin}.py
+onyx/web/  (Vite+React+TS+Tailwind) src/{main.tsx,App.tsx,api/client.ts,api/events.ts}
+          src/pages/Fleet.tsx  src/components/{StatCard.tsx,TraceTable.tsx,SourceBadge.tsx,ConfidenceBar.tsx}
+```
+**接口要点**
+- REST 只读优先；写操作只留 `admin`（pull/unload/delete）且需 `?confirm=1`。
+- SSE `/api/stream` 转发事件流（新 trace、eval 进度）；前端断线自动重连并补 `Last-Event-ID`。
+- **`SourceBadge` 是全站必备组件**：任何数字旁边必须显示 `engine/hf/fitted/heuristic` + 置信度。没有它，看板会在骗人。
+- 分页 + 服务端排序（trace 表会大到前端拉不完）。
+
+**自测**
+```bash
+uv run pytest tests/unit -q && uv run onyx serve --port 8000
+curl -s localhost:8000/api/fleet | jq '{providers,loaded_models,rate_1h}'
+curl -s "localhost:8000/api/traces?limit=5" | jq '.items[].usage.source'
+cd onyx/web && npm i && npm run build && npm run test -- --run
+```
+必须覆盖（前端 vitest）：
+1. `SourceBadge` 对 unknown 源渲染 "—" 而非 0；
+2. cold/warm 两列在延迟卡上不混算；
+3. SSE 断开重连不重复渲染（按 trace id 去重）。
+
+**验收 DoD（M2 前半）**：Fleet 页显示服务存活/版本、已加载模型（keep-alive 倒计时、`size_vram`、`ctx_util`）、近 1h 调用量与 TPS、异常列表；数据与 CLI `onyx models ls` 一致。
+
+**提交**：`feat(api,web): read-only REST + SSE, fleet dashboard`
+
+---
+
+## S9 — Traces 详情 + Playground
+
+**产出文件**
+```
+onyx/api/routes/{playground,traces_detail}.py
+onyx/web/src/pages/{Traces,TraceDetail,Playground,Usage}.tsx
+onyx/web/src/components/{Timeline.tsx,PromptBreakdown.tsx,ToolTree.tsx,RawBody.tsx,CompareModels.tsx}
+```
+- `TraceDetail`：时间轴（load → first_token → 每步 tool 调用 → end）、消息树、**prompt 分段条形图（tool_defs 高亮）**、原始 body（可复制成 curl）、"转成评测 case"按钮。
+- `Playground`：多模型并排（走 GPU 锁串行执行，UI 显示排队状态）；thinking 分栏；工具面板实时渲染 `tool_call_delta`。
+- `Usage`（Token Ledger）：时序、来源占比、drift 散点、prefill vs decode。
+
+**自测**
+```bash
+uv run pytest tests/e2e -m e2e -q        # Playwright: 发一条对话 → Traces 里出现 → 详情数字非空
+```
+必须覆盖：
+1. 一次带工具调用的对话，详情页里 tool 步骤顺序与 `step` 字段一致；
+2. 截断 JSON 的 trace 显示原文 + `truncated` 徽标（不是"解析失败"一句话）；
+3. 并排 3 个模型时，GPU 锁使请求串行（断言 ttft 区间不重叠）；
+4. "转成 case" 后 `case.input_json` 与原 trace 的 messages 等价。
+
+**验收 DoD（M2 完整出口）**：浏览器完成"对话 → 定位 trace → 看归因 → 转 case"全链路，无控制台报错。
+
+**提交**：`feat(web): trace detail with token attribution, playground over gpu lock`
+
+---
+
+## S10 — 工具注册表：定义、校验、token 开销
+
+**产出文件**
+```
+onyx/tools/spec.py       # ToolDef / ToolResult / ToolError 族 / OpenAI↔内部↔MCP 形状转换
+onyx/tools/registry.py   # CRUD + 版本(hash) + 校验 + 开销核算 + 启停
+onyx/api/routes/tools.py
+tests/contract/test_toolspec.py
+```
+**校验规则**（每条一个 rule id，违规产 warning/error 列表，不阻塞保存但看板标红）
+`NAME_PATTERN` `^[a-zA-Z0-9_-]{1,64}$` · `SCHEMA_VALID`(draft 2020-12) · `DESC_MISSING`(工具或参数无描述)
+`DESC_TOO_SHORT`(<20 字符) · `DESCRIPTION_BUDGET`(单工具 >400 token 警告) · `DUPLICATE_NAME`
+`SIDE_EFFECT_UNTAGGED`(未标 read/write/network/exec) · `NO_EXAMPLE`(无 examples 难以 fire-verify)
+`REQUIRED_MISMATCH`(required 与 properties 不一致) · `ADDITIONAL_PROPS_UNSET`
+
+**自测**
+```bash
+uv run onyx tools import examples/tools.yaml
+uv run onyx tools audit          # 逐条列出 rule id 命中
+uv run onyx tools cost --model qwen3:8b
+```
+`tools cost` 预期（Tools 页核心视图，DESIGN §6.2）：
+```
+tool               tokens  bytes  share
+search_web           312    1186   14.1%
+db_query             268    1042   12.1%
+...
+TOTAL (24 tools)    1380    5410   62.4% of system+tools context
+```
+必须覆盖：`tools audit` 对故意写坏的 5 个 schema 各命中对应 rule id；hash 变化即生成新版本且旧 trace 仍能定位到当时的 `tool_def_hash`。
+
+**验收 DoD**：开销数字与 `onyx token explain <trace>` 里 `part=tool_defs` 一致（同一套渲染代码，不许两处各算一次）。
+
+**提交**：`feat(tools): registry, schema audit, per-model context cost accounting`
+
+---
+
+## S11 — 执行器 + 沙箱 + 契约测试运行器（无模型）
+
+**产出文件**
+```
+onyx/tools/executors/{python_fn,http,mcp,ollama_builtin,mock_replay}.py
+onyx/tools/sandbox.py     # deadline / 审批 / side_effect 白名单 / dry_run / 审计
+onyx/tools/contract.py    # 契约测试运行器
+onyx/tools/builtin/{calculator.py,time_now.py,http_get.py,fs_read.py,echo.py}
+tests/contract/test_executors.py  tests/contract/test_sandbox.py
+```
+每个工具可声明 `tool_test`：`args_json` + `checks_json`（`type_of` / `path_exists` / `regex` / `subset_of` / `raises`）。
+契约断言集（**所有 executor 必须全过**）：
+1. 合法参数 → `status=ok`，结果类型符合声明；
+2. 缺 required / 类型错 → `ToolArgError`（**不能崩、不能返回 200**）；
+3. 未知工具名 → `ToolUnknown`；
+4. 超 deadline → `ToolTimeout`，且底层任务真的被取消（不泄漏）；
+5. `side_effect='write'` 且未授权 → `ToolSandboxDenied`，且副作用未发生；
+6. `read` 类工具连调两次结果一致 → `idempotent=1`；
+7. `mock_replay` 用 fixture 时**不发真实网络请求**（`respx` 断言零命中）。
+
+**自测**
+```bash
+uv run onyx tools contract            # 期望: 24 tools, 61 tests, all passed
+uv run onyx tools run calculator --args '{"expr":"6*7"}'
+uv run onyx tools contract --tool http_get --live
+```
+预期（失败形态也要能复现，这是这一步真正要演示的东西）：
+```
+tool        test                     status   latency  note
+calculator  basic                    PASS     0.4ms
+http_get    timeout_1500ms           FAIL     1501ms ToolTimeout — deadline 未传播到 socket
+fs_read     traversal                PASS     —        blocked as expected (SandboxDenied)
+```
+
+**验收 DoD**：7 条契约断言在 5 个 executor 上全过（`ollama_builtin` 允许 `not_applicable` 但须写明原因）；故意注入的 timeout 缺陷能被检出并修复。
+
+**提交**：`feat(tools): executors, sandbox, contract runner`
+
+---
+
+## S12 — 工具循环 + 模型侧 fire-and-verify（M3 出口）
+
+**产出文件**
+```
+onyx/tools/loop.py       # 多步循环 / 预算 / 循环检测 / 孤儿调用补齐 / 停止词（DESIGN §8.3）
+onyx/tools/verify.py     # 指令→期望工具→实际调用 的差异报告
+tests/unit/test_loop.py  # 用 mock provider 驱动，含全部边界
+tests/integration/test_fire_verify.py  (@live)
+```
+必须实现并单测的边界（每条一个用例）：
+`max_steps` 截断 · token 预算耗尽 · `(name,args)` 重复 → `TOOL_LOOP` 熔断 · 模型返回不存在的工具名 · `finish_reason=tool_calls` 但无 tool_calls（本地模型高频）· 工具异常后能继续对话 · 孤儿调用补齐占位（断言下一条请求 messages 结构合法，无悬空 tool 消息）· 截断 JSON 进 `args_raw`。
+
+**自测**
+```bash
+uv run pytest tests/unit/test_loop.py -q
+uv run onyx tools fire "北京明天天气怎么样" --tools weather,search --model qwen3:8b --mock weather
+uv run onyx traces show <id> --tree
+uv run onyx chat --model qwen3:8b "查一下 3 月销售额然后换算成百分比" --tools db,calc --fixture db.yaml
+```
+`tools fire` 预期：
+```
+expected weather.now  actual weather.now          ✓  args: city=北京(date 缺省→今天) ✓
+tool_call#1 latency 412ms  executed_by=client(mocked)
+parse_status=ok  steps=1  tokens in=1502 out=47
+verdict: PASS
+```
+**验收 DoD**：同一指令在 5 个模型上跑，能明确区分三种失败：`NO_CALL`(不调) / `WRONG_TOOL`(调错) / `BAD_ARGS`(参数错)；且 `--mock` 时零真实网络请求（respx 断言）。
+
+**提交**：`feat(tools): client-side tool loop + fire-and-verify harness`
+
+---
+
+## S13 — 评测内核 + 意图识别任务
+
+**产出文件**
+```
+onyx/eval/task.py      # EvalTask/Case/Grade 契约 + capability skip
+onyx/eval/metrics.py   # prf1/macro/balanced-accuracy/confusion/hit@k/pass^k/bootstrap-ci
+onyx/eval/graders/{exact,set_match,regex,json_schema,fuzz}.py
+onyx/eval/datasets/{cache,loader,sources}.py
+onyx/eval/datasets/builtin/intent_zh.jsonl     # ≥200 条，模板生成 + 人工补充
+onyx/eval/tasks/intent_classification.py
+tests/unit/{test_metrics,test_graders,test_intent_task}.py
+```
+- `test_metrics` 用**手算好的小表格**断言（2×2 混淆矩阵的 P/R/F1、macro、CI 边界），不用浮点容差掩盖逻辑错。
+- `test_intent_task` 用 `mock provider` 的四类响应：正确 / 错标签 / **越界标签（不在标签集）** / 附加解释文字。断言四类得分与 `verdict` 各不相同。
+- `Grade` 必须把"格式不合法"与"内容答错"分成两个维度（`invalid_format` 单独计数，DESIGN §9.4）。
+
+**自测**
+```bash
+uv run onyx eval import onyx/eval/datasets/builtin/intent_zh.jsonl --id intent-zh-v1
+uv run onyx eval run --task intent_classification --model mock/classifier --limit 20   # 离线跑通管道
+uv run onyx eval run --task intent_classification --model qwen3:8b --k 1 --seed 42
+```
+预期最后一条：
+```
+intent_classification · qwen3:8b · n=200 · seed=42
+macro_f1 0.812 [95% CI 0.771–0.849]   acc 0.835   format_valid 0.995   out_of_label 0.005
+per-class: 转账 0.92 / 查余额 0.88 / 投诉 0.71 / 其他 0.62 ← 「其他」最低，混淆集中在 投诉↔其他
+```
+**验收 DoD**：mock 与真实模型都能跑完；`--limit 20` 与 `--limit 200` 的 macro_f1 有可见差异且 CI 变宽（证明区间真的在算，不是常数）；每条 grade 有 `trace_id`。
+
+**提交**：`feat(eval): task contract, metrics with CI, intent classification`
+
+---
+
+## S14 — 工具调用评测 + runner 调度（M4 出口）
+
+**产出文件**
+```
+onyx/eval/tasks/{tool_selection,tool_args,structured_extraction,instruction_following}.py
+onyx/eval/graders/args_match.py   # 类型感知：数值容差/日期归一/枚举/集合/字符串模糊
+onyx/eval/runner.py               # GPU 独占锁、并发=1、断点续跑、取消、ETA、skip 记录
+onyx/eval/datasets/sources.py     # BFCL 导入器（记录 upstream/revision/license）
+onyx/api/routes/evals.py
+tests/unit/{test_args_match,test_tool_selection_grade,test_runner_resume}.py
+```
+**skip 必须有原因**：`requires={tools}` 且 `Cap.tools ∉ caps` → 写 `skipped(reason='model lacks native tool calling; needs prompted loop')`，不许静默。
+**runner 语义**：`--resume` 跳过已有 grade；`Ctrl-C` 后已完成的 case 全部保留；GPU 锁被占用时排队并打印 ETA。
+**fixture 默认**：评测期工具返回来自 `case.fixture_json`（DESIGN §8.4），`--live` 才真跑。
+
+**自测**
+```bash
+uv run onyx eval dataset add bfcl --split v1 --subset ast
+uv run onyx eval run --task tool_selection --dataset bfcl-ast --model qwen3:8b --k 3 --seed 7 --fixture
+uv run onyx eval run --task tool_selection --model llama3.2:3b --limit 50 --live   # 触发 no_call_needed
+```
+预期：
+```
+tool_selection · qwen3:8b · k=3 (pass^3)
+must_call_acc 0.86 [0.80–0.91]   hit@1 0.79   set_f1 0.84   false_call_rate 0.07
+hallucinated_tool 0.02   args_exact 0.66   args_subset 0.81   parse_fail 0.04
+skipped 6 cases: tool_choice unsupported (Ollama) — forced-call variants not runnable
+pass^3 vs pass@3 = 0.61 / 0.78  ← 稳定性缺口 17pp：可用但不可靠
+```
+必须覆盖：
+1. `test_runner_resume`：跑一半 kill → 再跑不重复计费（trace 数 = case 数 × k）；
+2. GPU 锁：并发起两个 eval run，第二个排队且日志有 ETA；
+3. `no_call_needed` 子集：误调率单独统计（不是算成"没调对"）；
+4. `args_match` 的手算用例表（日期/数值容差/枚举/集合各一）；
+5. 每条 grade 的 trace 里 `usage.source` 存在（评测同时是观测的数据来源，DESIGN §15）。
+
+**验收 DoD（M4 完整出口）**：两个 task 各有一次真实运行；`eval show` 任一分数能跳到 trace；judge/评测自身耗时与 token 计入 `eval_run.aggregate_json`。
+
+**提交**：`feat(eval): tool calling tasks, args matcher, gpu-locked runner`
+
+---
+
+## S15 — 对比矩阵、回归 diff、Eval UI 与报告（M5）
+
+**产出文件**
+```
+onyx/eval/compare.py            # 两 run 配对对比：per-case diff + bootstrap CI + 劣化清单
+onyx/web/src/pages/{EvalRuns,EvalMatrix,Regression}.tsx
+onyx/report/eval_report.py      # md/csv/html：模型 × task 矩阵 + 雷达图
+tests/unit/test_compare_paired.py
+```
+**配对对比的正确做法**（`test_compare_paired` 覆盖）：同一 `case_id` 两 run 配对；只看均值差是错的，要报"净改善数 / 净劣化数 / 无变化数 + 配对 bootstrap CI"；`n<30` 时 UI 必须显示低样本警告。
+
+**自测**
+```bash
+uv run onyx eval compare <runA> <runB> --format md > reports/qwen3-vs-llama.md
+uv run pytest tests/e2e -m e2e -q      # 矩阵页 + case 钻取 + diff 页
+```
+**验收 DoD（M5 出口）**：给定同一数据集的两个模型，能一眼回答"该用哪个、在哪些意图/工具上它更差、差多少置信度多少"；报告导出可脱离看板阅读。
+
+**提交**：`feat(eval): paired regression diff, matrix UI, exportable reports`
+
+---
+
+## S16 — 扩展点固化 + 第二 Provider + MCP（M6）
+
+**产出文件**
+```
+onyx/plugins_example/{example_task,example_provider}/   # 独立可 pip -e 安装的小包
+onyx/llm/providers/openai_compat.py                     # vLLM / LM Studio / Xinference（验证抽象）
+onyx/tools/executors/mcp.py                             # 任意 MCP server 的工具纳入注册表与测试
+onyx/store/sinks/otlp.py（或 langfuse.py）               # 事件流导出，验证 Sink 抽象
+docs/eval-recipes.md
+tests/contract/test_plugin_discovery.py
+```
+这一步是**抽象的验收测试**：
+- 第二 provider 必须**只实现 `LlmProvider`** 就能让全部看板与评测工作；若需要改 `core/` 或 `gateway.py`，说明抽象泄漏 → 记 issue 并在 DESIGN §13 补契约，不许在 gateway 里加 `if kind == ...`。
+- 插件发现：外部包注册一个 `EvalTask` 并跑通一次，`onyx eval tasks` 能看到它。
+- MCP：发现工具 → 自动进 `tool_def`（带 `kind='mcp'`）→ 能跑 contract 与 fire-verify。
+
+**自测**
+```bash
+uv add -e onyx/plugins_example/example_task && uv run onyx eval tasks | grep example
+uv run onyx providers add openai-compat --base-url http://127.0.0.1:1234/v1 --name lmstudio
+uv run onyx probe matrix --provider lmstudio        # 能力位与 skip 原因要合理
+uv run pytest tests/contract -q
+```
+**验收 DoD（M6 出口）**：`git diff` 显示接入新 provider **未修改** `onyx/core/**`、`onyx/llm/gateway.py`、`onyx/obs/**`；新 task 未修改 `onyx/eval/runner.py`。这条用脚本断言（`scripts/check_extension_boundary.sh`），不靠人review。
+
+**提交**：`feat(plugins): entry-point discovery, openai-compatible provider, mcp executor`
+
+---
+
+## 附录 A — 每步自测速查
+
+| 步 | 命令 | 绿的条件 |
+|---|---|---|
+| S1 | `pytest tests/unit -q` | 全过 + `grep` 证明 core 零三方依赖 |
+| S2 | `onyx db init && onyx db info` | `schema_version=1`，迁移可重复执行 |
+| S3 | `onyx chat --stream` | 4 项数字与 `curl+jq` 原始返回一致 |
+| S4 | `onyx probe run --suite usage,cache,think` | `docs/PROBES.md` 有结论；`token explain` 多源对比表 |
+| S5 | `onyx traces show <id>` | token/延迟/工具/原始 body 齐备，来源与置信度可见 |
+| S6 | `onyx probe matrix` | 无 `unknown` 工具格式；`✗(cap)` 与 `unknown` 可区分 |
+| S7 | `onyx doctor` | 全绿；破坏性测试能报出具体项 |
+| S8 | `curl /api/fleet` + `npm run test` | 与 CLI 数字一致；unknown 渲染为 — |
+| S9 | `pytest -m e2e` | 对话→trace→归因→转 case 全链路 |
+| S10 | `onyx tools cost` | 与 `token explain` 的 `tool_defs` 同源一致 |
+| S11 | `onyx tools contract` | 7 条断言 × 5 executor 全过 |
+| S12 | `onyx tools fire --mock` | NO_CALL/WRONG_TOOL/BAD_ARGS 可区分；零真实网络 |
+| S13 | `onyx eval run --task intent_classification` | macro_f1 + CI + 混淆对；mock 也能跑 |
+| S14 | `onyx eval run --task tool_selection --k 3` | skip 带原因；resume 不重复计费 |
+| S15 | `onyx eval compare A B` | 配对净变化 + CI；n 小有警告 |
+| S16 | `scripts/check_extension_boundary.sh` | 接入新 provider/task 未碰内核 |
+
+## 附录 B — 架构自测（让"模块化"可验证，而非口号）
+
+`Makefile` 关键 target：
+```makefile
+test:        ; uv run pytest -q
+test-live:   ; uv run pytest -m live -q
+probe:       ; uv run pytest -m probe -q && uv run onyx probe matrix
+lint:        ; uv run ruff check . && uv run lint-imports
+e2e:         ; uv run pytest -m e2e -q
+dev:         ; uv run onyx serve --reload & cd onyx/web && npm run dev
+```
+`.importlinter`（DESIGN §3 那张表的机器版）：
+```ini
+[importlinter]
+root_packages = onyx
+[importlinter:contract:layers]
+name = Onyx layering
+type = layers
+layers =
+  onyx.api | onyx.web | onyx.report
+  onyx.eval
+  onyx.tools
+  onyx.obs | onyx.probe
+  onyx.llm
+  onyx.store
+  onyx.core
+[importlinter:contract:core-purity]
+name = core uses stdlib only
+type = forbidden
+source_modules = onyx.core
+forbidden_modules = httpx fastapi pydantic duckdb tokenizers minja gguf
+[importlinter:contract:no-direct-http]
+name = only llm layer performs network IO
+type = forbidden
+source_modules = onyx.eval onyx.tools onyx.obs onyx.api
+forbidden_modules = httpx
+```
+> `no-direct-http` 是原则 1（单一咽喉点）的**强制实现**：评测/工具/API 想绕过 gateway 直接发 HTTP，`make lint` 就红。
+> 另加一条 grep 断言进 S5 自测：`.generate(` 只出现在 `gateway.py` 与 `providers/`。
+
+## 附录 C — 提交点与回滚
+
+每一步一个 commit（见各步末尾）。任何步骤验收不过 → **不要继续下一步**，回退到该步起点重做；因为后续步骤的正确性建立在前序契约上，跳步会让"哪一层破了"不可判定。
+
+## 附录 D — 需要人工介入 / 无法自动验收的点
+
+| 项 | 为何不能自动 | 建议 |
+|---|---|---|
+| `intent_zh.jsonl` 标注质量 | 需要业务口径 | 先 200 条，跑一次后按混淆对补最难样本；错例走"trace 转 case"回灌 |
+| 中文工具调用指令的自然度 | 自动指标只看结构 | 每 task 留 20 条人工阅读集，`onyx eval report` 单列 |
+| 探针结论是否随 Ollama 升级失效 | 版本相关 | `probe matrix` 记录 `provider_version`；版本变化时 doctor 提示重跑 |
+| 视觉/交互 | — | S9/S15 的 e2e 只能验证不报错，布局需你实际用一轮后反馈 |
+
+---
+
+## 实施顺序与工作量（RTX 4060 Ti 单卡的现实排期）
+
+| 里程碑 | 步骤 | 说明 |
+|---|---|---|
+| M0 | S0 | 装 uv/python3.12/Ollama/Node，拉 2 个模型 |
+| M1 计量 | S1→S7 | 骨架与契约 → 存储 → Ollama 适配 → token 阶梯与实测探针 → gateway 装配 → 能力矩阵 → CLI/报表 |
+| M2 看板 | S8→S9 | REST+SSE+Fleet → Traces/Playground/Ledger |
+| M3 工具 | S10→S12 | 注册表与开销 → 执行器与契约测试 → 循环与 fire-and-verify |
+| M4 评测 | S13→S14 | 内核与意图 → 工具调用与调度 |
+| M5 对比 | S15 | 矩阵、回归 diff、报告 |
+| M6 扩展 | S16 | 插件边界、第二 provider、MCP、导出 sink |
+
+> M1 是唯一有"研究性质"的阶段（S4/S6 的语义实测决定后续所有数字的可信度），其余都是常规工程。
+> 建议 M1 完成后先用一周（真实使用），再决定是否值得做 M4 的公开数据集接入——很多情况下你自建的回灌 case 集比 BFCL 更贴合用途。
+
+
