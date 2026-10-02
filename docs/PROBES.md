@@ -75,17 +75,83 @@
 
 ---
 
-## 2. 未定 / 待测（S4 探针负责回答）
+## 2. 探针运行结论（S4，`uv run pytest -m probe -q -s`）
+
+环境：Ollama 0.35.0 · `qwen3.5:9b` · 2026-10-02
+
+### P10 · 缓存命中时 `prompt_eval_count` 数的是**整个 prompt** ✅（U1 已答）
+同一 644-token 长 prompt 连发 3 次（`keep_alive=5m` 保持载入）：
+
+| 次数 | `prompt_eval_count` | `prompt_eval_duration` |
+|---|---|---|
+| 1（冷） | **644** | 384.5 ms |
+| 2 | **644** | 83.4 ms |
+| 3 | **644** | 82.8 ms |
+
+计数三次完全相同，耗时降 **4.65×**。结论：**输入 token 汇总不会系统性偏低**（DESIGN R1 解除）。
+
+### P11 · ⚠️ 缓存命中会让 `prefill_tps` 虚高 4.65 倍（新发现，高危）
+由 P10 直接推出：
+- 冷：`644 / 0.3845s` = **1675 t/s**
+- 热：`644 / 0.0834s` = **7722 t/s**
+
+`prefill_tps = in_tokens / prompt_eval_duration` 这个公式在缓存命中时算出的是
+"**等效吞吐**"而不是"**真实计算吞吐**"。两者混进同一个 P50 会得到一个
+既不代表冷启动、也不代表稳态的数字，而且**看起来完全合理**——这是最难发现的一类错误。
+
+**处置**（已进 DESIGN §6.4 的实现要求）：
+1. `usage` 表新增派生列 `prefill_mode ∈ {cold, warm}`，由 `prompt_eval_ms / in_tokens` 的比值判定；
+2. 吞吐类指标一律按 cold/warm 分列聚合，UI 不给合并视图；
+3. 冷启动判据从"load_duration > 50ms"扩展为"load_duration > 50ms **或** prompt 未命中缓存"。
+
+### P12 · thinking token **计入** `eval_count` ✅（U2 已答）
+同一问题、`max_tokens=256`：
+
+| 设置 | `eval_count` | thinking 字符 | 正文字符 |
+|---|---|---|---|
+| `think:true` | **256**（撞上限） | 663 | **0** |
+| `think:false` | **5** | 0 | 4 |
+
+比值 51.2×。结论：**"输出 token"实际是"正文 + 推理"**。
+成本与吞吐口径必须写明这一点，否则同一模型开/关推理的 token 数差 50 倍而无法解释。
+另：`think:true` 时正文为空（预算被推理吃光，见 P5），`think:false` 确实生效。
+
+### P13 · 流式与非流式计数完全一致 ✅（U4 已答）
+同一 prompt：`in=20, out=42` 两条路径逐位相同；流式末事件确实携带计数（`saw_done=True`）；
+流式 `ttft=125.0ms`，非流式 `ttft=None`（实现里刻意不伪造）。
+
+### P14 · `/v1` 兼容层的 usage 与原生**不一致** ✅（U5 已答）
+| | 原生 `/api/chat` | `/v1/chat/completions` | 差 |
+|---|---|---|---|
+| 输入 token | 22 | 20 | **−2** |
+| 输出 token | 48 | 64 | +16 |
+
+**结论：T4（compat 档）只能记录、永不采信**（DESIGN §6.1 的决定被实测支持）。
+输入差 −2 说明两条通道的 chat template 包装不完全相同；输出差 +16 有一个已知混淆因素：
+本次 `/v1` 调用未传 `think:false`，模型可能进入推理并撞上 `max_tokens=64`。
+即便如此，**输入侧的 −2 与"两通道模板不同"这一结论成立**。
+
+### P15 · `format: json_schema` 真的强制生效 ✅（U6 已答）
+给定含 `required` 与 `enum` 的 schema，输出为
+`{"city":"北京","unit":"celsius","temperature":21}` —— 合法 JSON、字段齐、枚举正确。
+结构化抽取评测可以直接依赖它，但**仍须记录 JSON 合法率**（换模型就不一定）。
+
+### P16 · 工具调用走原生 tool_calls 头 ✅
+`get_weather` 被正确调用，`arguments={"city":"北京"}` 直接是结构化字段（非正文里的 XML/JSON），
+`parse_status=ok`。同时**再次确认 P4**：`done_reason` 报 `stop` 而非 `tool_calls`，
+`wants_tool_call` 派生信号为 True。工具定义使该请求 `in` 从 ~20 涨到 **280** token
+（≈260 token 的工具 schema 开销，这正是 DESIGN §6.2 要量化的东西）。
+
+---
+
+## 3. 仍未定 / 待测
 
 | 编号 | 待答问题 | 为什么关键 |
 |---|---|---|
-| U1 | warm 缓存下 `prompt_eval_count` 数的是**整个 prompt** 还是**只有未缓存后缀** | 决定输入 token 汇总是否系统性偏低（DESIGN R1） |
-| U2 | thinking token 是否计入 `eval_count` | 决定输出成本口径；P5 显示 256 上限被 thinking 占满，强烈提示**是计入的**，但需专门实验 |
-| U3 | ~~各模型能否离线复算 token~~ **已测，见 P9** | — |
-| U4 | 原生流是否**只在**最后一个 ndjson 事件给计数 | 决定流式 TTFT/计数的采集点 |
-| U5 | `/v1` 的 `usage` 与原生 `prompt_eval_count` 是否一致 | T4 交叉验证是否有意义 |
-| U6 | `format: json_schema` 是否强制生效、失败是否静默降级 | 结构化抽取评测的前提 |
-| U7 | `qwen3.8:27b`(17.7GB > 16GB VRAM) 的 offload 行为与吞吐落差 | 验证 `offloaded` 判定与"必须分开聚合"的规则（DESIGN R5） |
+| U7 | `qwen3.8:27b`(17.7GB > 16GB VRAM) 的 offload 行为与吞吐落差 | 验证 `offloaded` 判定与"必须分开聚合"（DESIGN R5） |
+| U8 | 图片输入的 token 如何计（`vision` 能力模型） | 文本 tokenizer 估不准，需标 `vision_estimate_low_conf`（R6） |
+| U9 | `prompt_eval_cached_count` 之类字段是否存在（本次实测 `cached_tokens` 恒为 None） | 若引擎不报缓存量，`prefill_mode` 只能用 P11 的比值推断 |
+
 
 ---
 

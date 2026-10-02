@@ -14,9 +14,11 @@ def db(tmp_path) -> Database:
 
 
 def test_fresh_db_applies_migrations(db):
-    assert db.version() == 1
+    assert db.version() == 2
     tables = set(db.table_names())
     assert {"provider", "model", "trace", "usage", "usage_alt", "token_part", "tool_call", "anomaly"} <= tables
+    columns = {r["name"] for r in db.query("PRAGMA table_info(usage)")}
+    assert {"prefill_mode", "prefill_ms_per_token"} <= columns, "P11 的冷/热分列必须落库"
 
 
 def test_migration_is_idempotent(tmp_path):
@@ -25,7 +27,7 @@ def test_migration_is_idempotent(tmp_path):
     assert first.migrate() == []  # 已在构造时应用
     first.close()
     second = Database(path)
-    assert second.version() == 1
+    assert second.version() == 2
     assert second.migrate() == []
     second.close()
 
@@ -50,17 +52,28 @@ def test_tampering_applied_migration_is_refused(tmp_path):
 
 
 def test_incremental_migration_applies_only_new(tmp_path):
+    """真实场景：已有数据的库，新增一个迁移文件后重开，只应用新的那个且旧数据完好。"""
     migrations = tmp_path / "migrations"
     shutil.copytree(MIGRATIONS_DIR, migrations)
-    (migrations / "0002_add_tool_tables.sql").write_text(
+    path = tmp_path / "t.sqlite"
+
+    with Database(path, migrate=False) as db:
+        assert db.migrate(migrations) == [1, 2]
+        db.execute(
+            "INSERT INTO provider(id, kind, base_url, api_style, created_at) VALUES('p','mock','','native','')"
+        )
+        assert db.version() == 2
+
+    # 之后新增一个迁移
+    (migrations / "0003_add_tool_def.sql").write_text(
         "CREATE TABLE IF NOT EXISTS tool_def(id TEXT PRIMARY KEY, name TEXT NOT NULL);", encoding="utf-8"
     )
-    db = Database(tmp_path / "t.sqlite", migrate=False)
-    assert db.migrate(migrations) == [1, 2]
-    assert db.version() == 2
-    assert "tool_def" in db.table_names()
-    assert db.migrate(migrations) == []  # 再跑一次不重复应用
-    db.close()
+    with Database(path, migrate=False) as db:
+        assert db.migrate(migrations) == [3], "只应用新增的迁移"
+        assert db.version() == 3
+        assert "tool_def" in db.table_names()
+        assert db.scalar("SELECT COUNT(*) FROM provider") == 1, "既有数据必须完好"
+        assert db.migrate(migrations) == []
 
 
 def test_bad_migration_filename_rejected(tmp_path):
@@ -106,6 +119,6 @@ def test_failed_migration_rolls_back(tmp_path):
 
 def test_memory_db_supported():
     with Database(":memory:") as db:
-        assert db.version() == 1
+        assert db.version() == 2
         db.execute("INSERT INTO provider(id,kind,base_url,api_style,created_at) VALUES('p','mock','','native','')")
         assert db.scalar("SELECT COUNT(*) FROM provider") == 1

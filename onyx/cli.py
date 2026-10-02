@@ -26,6 +26,8 @@ app = typer.Typer(
 )
 db_app = typer.Typer(help="数据库：迁移、体检、备份", no_args_is_help=True)
 app.add_typer(db_app, name="db")
+probe_app = typer.Typer(help="语义实测探针：把引擎行为变成可复现的结论", no_args_is_help=True)
+app.add_typer(probe_app, name="probe")
 
 
 @dataclass
@@ -200,6 +202,51 @@ def _check_ollama(base_url: str) -> CheckResult:
             "Ollama 可达", False, f"{base_url} 无响应（{type(exc).__name__}）",
             "启动 Ollama 服务，或用 --skip-network 跳过",
         )
+
+
+# ── probe ──────────────────────────────────────────────────────────
+@probe_app.command("list")
+def probe_list() -> None:
+    """列出已注册的探针。"""
+    from onyx.probe import registered_probes
+
+    for name in registered_probes():
+        typer.echo(name)
+
+
+@probe_app.command("run")
+def probe_run(
+    model: str = typer.Option(..., "--model", help="要实测的模型名"),
+    suite: str = typer.Option("all", "--suite", help="逗号分隔的探针名，或 all"),
+    url: str = typer.Option("http://127.0.0.1:11434", "--url", help="Ollama base url"),
+    write: Path = typer.Option(None, "--append-to", help="把 markdown 结论追加到该文件"),
+) -> None:
+    """对真实引擎跑语义实验。单 GPU 独占 ⇒ 探针串行执行。"""
+    from onyx.llm.providers.ollama import OllamaProvider
+    from onyx.probe import registered_probes, render_markdown, run_suite
+
+    names = registered_probes() if suite == "all" else [s.strip() for s in suite.split(",") if s.strip()]
+    provider = OllamaProvider(base_url=url)
+    if not provider.client.is_reachable():
+        typer.echo(f"Ollama 不可达: {url}", err=True)
+        raise typer.Exit(1)
+    version = provider.info().version
+    report, ctx = run_suite(provider, model, names, provider_version=version)
+    provider.close()
+
+    markdown = render_markdown(report, ctx)
+    if write:
+        existing = write.read_text(encoding="utf-8") if write.exists() else ""
+        write.write_text(existing.rstrip() + "\n\n---\n\n" + markdown, encoding="utf-8")
+        typer.echo(f"已追加到 {write}")
+    for finding in report.findings:
+        flag = "?" if finding.unknown else "✓"
+        typer.echo(f"{flag} {finding.probe:<16} {finding.verdict}")
+        for key, value in finding.evidence.items():
+            typer.echo(f"    {key} = {value}")
+    unknown = [f.probe for f in report.findings if f.unknown]
+    if unknown:
+        typer.echo(f"\n以下探针未得出确定结论（UI 应显示「—」而不是 0）: {unknown}")
 
 
 def main() -> None:

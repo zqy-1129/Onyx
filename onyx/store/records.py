@@ -124,6 +124,9 @@ class UsageRecord:
     wall_ms: float | None = None
     bytes_out: int | None = None
     drift_pct: float | None = None
+    #: cold|warm|unknown —— 吞吐聚合必须按它分列（PROBES P11）
+    prefill_mode: str | None = None
+    prefill_ms_per_token: float | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
 

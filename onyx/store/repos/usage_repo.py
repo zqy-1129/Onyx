@@ -48,19 +48,21 @@ class UsageRepo:
         self.db.execute(
             """INSERT INTO usage(trace_id, in_tokens, out_tokens, thinking_tokens, cached_tokens,
                                  source, confidence, ttft_ms, prefill_tps, decode_tps, wall_ms,
-                                 bytes_out, drift_pct, extra_json)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                                 bytes_out, drift_pct, prefill_mode, prefill_ms_per_token, extra_json)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(trace_id) DO UPDATE SET
                  in_tokens=excluded.in_tokens, out_tokens=excluded.out_tokens,
                  thinking_tokens=excluded.thinking_tokens, cached_tokens=excluded.cached_tokens,
                  source=excluded.source, confidence=excluded.confidence, ttft_ms=excluded.ttft_ms,
                  prefill_tps=excluded.prefill_tps, decode_tps=excluded.decode_tps,
                  wall_ms=excluded.wall_ms, bytes_out=excluded.bytes_out,
-                 drift_pct=excluded.drift_pct, extra_json=excluded.extra_json""",
+                 drift_pct=excluded.drift_pct, prefill_mode=excluded.prefill_mode,
+                 prefill_ms_per_token=excluded.prefill_ms_per_token, extra_json=excluded.extra_json""",
             (
                 rec.trace_id, rec.in_tokens, rec.out_tokens, rec.thinking_tokens, rec.cached_tokens,
                 str(rec.source), str(rec.confidence), rec.ttft_ms, rec.prefill_tps, rec.decode_tps,
-                rec.wall_ms, rec.bytes_out, rec.drift_pct, dumps(rec.extra),
+                rec.wall_ms, rec.bytes_out, rec.drift_pct, rec.prefill_mode, rec.prefill_ms_per_token,
+                dumps(rec.extra),
             ),
         )
 
@@ -101,6 +103,7 @@ class UsageRepo:
                 thinking_tokens=row["thinking_tokens"], cached_tokens=row["cached_tokens"],
                 ttft_ms=row["ttft_ms"], prefill_tps=row["prefill_tps"], decode_tps=row["decode_tps"],
                 wall_ms=row["wall_ms"], bytes_out=row["bytes_out"], drift_pct=row["drift_pct"],
+                prefill_mode=row["prefill_mode"], prefill_ms_per_token=row["prefill_ms_per_token"],
                 extra=loads_dict(row["extra_json"]),
             )
         alts = tuple(

@@ -285,6 +285,29 @@ def test_usage_upsert_overwrites(db, repos):
     assert got.source == "engine" and got.in_tokens == 120
 
 
+def test_usage_records_prefill_mode(db, repos):
+    """PROBES P11：冷/热必须落库，否则吞吐聚合无法分列，会得到一个看起来合理的错数字。"""
+    _, traces, usage = repos
+    rec = _trace()
+    traces.upsert(rec)
+    usage.upsert(UsageRecord(
+        trace_id=rec.id, source="engine", confidence="high", in_tokens=644,
+        prefill_tps=7722.0, prefill_mode="warm", prefill_ms_per_token=0.129,
+    ))
+    got = usage.fetch(rec.id).usage
+    assert got.prefill_mode == "warm"
+    assert got.prefill_ms_per_token == 0.129
+
+    cold = _trace()
+    traces.upsert(cold)
+    usage.upsert(UsageRecord(
+        trace_id=cold.id, source="engine", confidence="high", in_tokens=644,
+        prefill_tps=1675.0, prefill_mode="cold", prefill_ms_per_token=0.597,
+    ))
+    rows = db.query("SELECT prefill_mode, COUNT(*) AS n FROM usage GROUP BY prefill_mode")
+    assert {r["prefill_mode"]: r["n"] for r in rows} == {"warm": 1, "cold": 1}
+
+
 def test_summarize_aggregates(db, repos):
     _, traces, usage = repos
     for i in range(4):
