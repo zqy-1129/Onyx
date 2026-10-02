@@ -8,8 +8,10 @@ import { useApi } from './hooks/useApi'
 import { navigate, useRoute } from './router'
 import { FleetPage } from './pages/Fleet'
 import { ModelsPage } from './pages/Models'
+import { PlaygroundPage } from './pages/Playground'
 import { TracesPage } from './pages/Traces'
 import { TraceDetailPage } from './pages/TraceDetail'
+import { UsagePage } from './pages/Usage'
 
 interface NavItem {
   path: string
@@ -20,7 +22,9 @@ interface NavItem {
 const NAV: NavItem[] = [
   { path: '/fleet', glyph: '◫', label: 'Fleet 总览' },
   { path: '/models', glyph: '▤', label: '模型' },
+  { path: '/playground', glyph: '▶', label: 'Playground' },
   { path: '/traces', glyph: '≡', label: 'Traces' },
+  { path: '/usage', glyph: '∿', label: 'Token Ledger' },
 ]
 
 function useTheme(): [string, () => void] {
@@ -51,6 +55,10 @@ export function App() {
     content = <TracesPage />
   } else if (page === 'models') {
     content = <ModelsPage />
+  } else if (page === 'playground') {
+    content = <PlaygroundPage />
+  } else if (page === 'usage') {
+    content = <UsagePage />
   } else {
     content = <FleetPage />
   }

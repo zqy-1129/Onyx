@@ -48,8 +48,13 @@ class SseBroker:
         return len(self._subscribers)
 
     # ── 发布（同步线程调用）───────────────────────────────────────
-    def publish(self, event: TraceEvent) -> None:
-        """实现 EventSink 协议，可直接挂进 EventFanout。"""
+    def emit(self, event: TraceEvent) -> None:
+        """实现 `EventSink` 协议，可直接挂进 EventFanout。
+
+        方法名必须是 `emit`：Fanout 按协议调用它，而协议方法的失败是被**隔离**的
+        （只记 warning 不抛错）。名字对不上时不会报错，只会静默丢事件——
+        这正是本方法曾经踩过的坑，故在此显式注明。
+        """
         self.published += 1
         line = _sse_frame(event.to_dict())
         for queue_ in list(self._subscribers.values()):
@@ -62,6 +67,9 @@ class SseBroker:
                     queue_.put_nowait(line)
                 except queue.Empty:
                     pass
+
+    #: 语义化别名（CLI/测试里可读性更好）
+    publish = emit
 
     def flush(self, timeout: float = 1.0) -> None: ...
     def close(self) -> None:

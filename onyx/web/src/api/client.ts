@@ -98,6 +98,8 @@ export const api = {
     stream?: boolean
     tools?: string[]
     system?: string
+    /** 客户端关联键：SSE 事件流靠它对上这次请求（trace_id 仍由服务端生成以保持可排序） */
+    client_key?: string
   }) =>
     request<ChatResponse>('/api/playground/chat', {
       method: 'POST',

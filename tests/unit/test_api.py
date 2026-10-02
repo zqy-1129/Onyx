@@ -191,6 +191,31 @@ def test_usage_summary(client):
     assert "drift" in body and "timeseries" in body
 
 
+def test_chat_client_key_is_broadcast_for_sse_correlation(client):
+    """多模型并排时，前端靠 client_key 把 SSE 事件流对上自己那次请求。
+
+    trace_id 必须由服务端生成（游标分页依赖它时间可排序），所以关联只能用 client_key。
+    """
+    broker = client.app.state.onyx.broker
+    sub_id, queue_ = broker.subscribe()
+    try:
+        body = _chat(client, client_key="pg-test-1")
+        frames: list[str] = []
+        while not queue_.empty():
+            frames.append(queue_.get_nowait())
+        starts = [f for f in frames if '"trace_start"' in f]
+        assert starts, "SSE 必须广播 trace_start，否则前端无法关联后续增量事件"
+        assert "pg-test-1" in starts[0]
+        assert body["trace_id"] in starts[0]
+        # 增量与收尾事件必须带同一个 trace_id，前端才能按 id 折叠
+        related = [f for f in frames if body["trace_id"] in f]
+        kinds = {k for k in ("usage_engine", "generation_end", "trace_end") if any(k in f for f in related)}
+        assert {"usage_engine", "generation_end", "trace_end"} <= kinds, f"缺事件: {kinds}"
+        assert broker.published >= len(related) > 0
+    finally:
+        broker.unsubscribe(sub_id)
+
+
 # ── admin ──────────────────────────────────────────────────────────
 def test_unload_requires_confirm(client):
     resp = client.post("/api/admin/models/unload", params={"name": "mock/echo"})
@@ -214,6 +239,28 @@ def test_broker_publishes_to_subscribers():
     broker.publish(make_event(EventType.TRACE_END, "t1", {"status": "ok", "wall_ms": 1.0}))
     assert queue_.empty()
     assert broker.subscriber_count == 0
+
+
+def test_broker_satisfies_event_sink_protocol():
+    """回归：SseBroker 曾只有 publish() 没有 emit()，挂进 EventFanout 后
+    每个事件都失败——而 Fanout 的异常隔离把它吞成 warning，SSE 静默失效。
+    协议一致性必须被断言，不能靠"看起来接上了"。"""
+    from onyx.store.sinks import EventSink
+
+    assert isinstance(SseBroker(), EventSink)
+
+
+def test_broker_receives_events_through_fanout():
+    from onyx.store.sinks import EventFanout
+
+    broker = SseBroker()
+    fanout = EventFanout([broker])
+    _, queue_ = broker.subscribe()
+    fanout.emit(make_event(EventType.TEXT_DELTA, "t1", {"seq": 0, "text": "a"}))
+    fanout.flush()
+    assert fanout.errors == {}, f"Fanout 报告下游失败: {fanout.errors}"
+    assert broker.published == 1
+    assert '"text_delta"' in queue_.get_nowait()
 
 
 def test_broker_drops_oldest_when_subscriber_is_slow():

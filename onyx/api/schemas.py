@@ -184,6 +184,9 @@ class ChatRequest(BaseModel):
     stream: bool = False
     tools: list[str] = Field(default_factory=list)
     system: str = ""
+    #: 客户端生成的关联键。多模型并排时前端靠它把 SSE 事件流对上自己那次请求。
+    #: 刻意不让客户端指定 trace_id：id 必须时间可排序（游标分页依赖它）。
+    client_key: str = ""
 
 
 class ChatResponse(BaseModel):

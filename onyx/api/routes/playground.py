@@ -18,7 +18,15 @@ from onyx.api.schemas import (
     ToolCallView,
     UsageAlt,
 )
-from onyx.core.types import GenerationRequest, GenParams, Message, Role, ToolSpec
+from onyx.core.types import (
+    GenerationRequest,
+    GenParams,
+    Message,
+    Role,
+    ToolSpec,
+    TraceContext,
+    TracePurpose,
+)
 from onyx.llm.measurement.reconciler import latency_summary
 from onyx.obs.anomalies import SPECS
 
@@ -59,6 +67,10 @@ def chat(body: ChatRequest, state: AppState = Depends(get_state)) -> ChatRespons
         model=body.model, messages=tuple(messages), tools=tools, stream=body.stream,
         thinking=body.thinking, keep_alive="5m",
         params=GenParams(max_tokens=body.max_tokens, temperature=body.temperature),
+        context=TraceContext(
+            purpose=TracePurpose.PLAYGROUND,
+            extra={"client_key": body.client_key} if body.client_key else {},
+        ),
     )
     acquired = state.gpu_lock.acquire(timeout=GPU_LOCK_TIMEOUT)
     if not acquired:

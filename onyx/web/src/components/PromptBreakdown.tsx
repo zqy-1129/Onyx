@@ -49,8 +49,13 @@ export function PromptBreakdown({
     )
   }
   const total = visible.reduce((sum, p) => sum + p.tokens, 0)
-  // 闭合校验：Σ分段 + template_ctl 必须等于引擎计数；不等就在 UI 上直说，不掩盖
-  const closed = engineIn != null && Math.abs(total - engineIn) <= Math.max(1, engineIn * 0.02)
+  // 闭合校验只对**输入侧**分段做：引擎的 prompt_eval_count 不含生成内容。
+  // 曾经把 output 段也算进总和，于是 Playground 上一律显示"未闭合（差 = 输出 token 数）"。
+  const inputTotal = visible
+    .filter((p) => p.part !== 'output')
+    .reduce((sum, p) => sum + p.tokens, 0)
+  const outputTotal = total - inputTotal
+  const closed = engineIn != null && Math.abs(inputTotal - engineIn) <= Math.max(1, engineIn * 0.02)
 
   return (
     <div>
@@ -76,17 +81,23 @@ export function PromptBreakdown({
       </div>
       <div className="row mt-3 small">
         <span className="muted">
-          Σ分段 = <b className="num">{fmtInt(total)}</b>
+          Σ输入分段 = <b className="num">{fmtInt(inputTotal)}</b>
         </span>
         <span className="muted">
           引擎计数 = <b className="num">{engineIn == null ? UNKNOWN : fmtInt(engineIn)}</b>
         </span>
+        {outputTotal > 0 ? (
+          <span className="muted">
+            输出 = <b className="num">{fmtInt(outputTotal)}</b>
+            <span title="引擎的 prompt_eval_count 不含生成内容，因此输出段不参与闭合校验">（不计入闭合）</span>
+          </span>
+        ) : null}
         {engineIn != null ? (
           closed ? (
             <span className="badge badge-ok">✓ 归因闭合</span>
           ) : (
             <span className="badge badge-warn" title="分段计数之和与引擎计数不一致：计数档位可能高估或引擎发生截断">
-              ! 未闭合（差 {fmtInt(total - engineIn)}）
+              ! 未闭合（差 {fmtInt(inputTotal - engineIn)}）
             </span>
           )
         ) : null}
