@@ -7,17 +7,10 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
-
 from onyx.core.event import EventType, TraceEvent
+from onyx.core.types import tool_call_fingerprint
 from onyx.obs.state import ToolCallDraft, TraceState
 from onyx.obs.visitors import BaseVisitor
-
-
-def _args_fingerprint(name: str, args: dict | None, args_raw: str) -> str:
-    payload = json.dumps(args, ensure_ascii=False, sort_keys=True) if args is not None else args_raw
-    return hashlib.sha256(f"{name}|{payload}".encode()).hexdigest()[:16]
 
 
 class ToolVisitor(BaseVisitor):
@@ -91,7 +84,7 @@ class ToolVisitor(BaseVisitor):
                     "tool": draft.name, "status": draft.result_status,
                     "error": draft.extra.get("error", ""),
                 })
-            fingerprint = _args_fingerprint(draft.name, draft.args, draft.args_raw)
+            fingerprint = tool_call_fingerprint(draft.name, draft.args, draft.args_raw)
             seen[fingerprint] = seen.get(fingerprint, 0) + 1
 
         repeated = {k: v for k, v in seen.items() if v > 1}

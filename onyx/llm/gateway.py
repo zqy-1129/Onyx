@@ -36,13 +36,54 @@ from onyx.llm.measurement.fidelity import Counter, CounterContext, default_count
 from onyx.llm.measurement.parts import attribute
 from onyx.llm.params import dropped_by_openai
 from onyx.llm.providers.base import EventCB, LlmProvider
+from onyx.obs.anomalies import severity_of
 from onyx.obs.engine import ObserverEngine
 from onyx.obs.state import TraceState
+
+
+class TraceEmitter:
+    """绑定到单条 trace 的事件发射口。
+
+    这是 gateway 之外唯一能把事件写进某条 trace 的合法途径——工具循环用它在
+    **请求该工具的那一步**里记录 `TOOL_EXEC_START/END`。
+
+    时机是硬约束：必须在该 trace 的 `TRACE_END` 之前用完。observer 在 TRACE_END
+    就会 pop 状态并落库，之后再发事件只会得到一条 ORPHAN 或被静默丢弃。
+    所以它只能由 `generate(before_trace_end=...)` 拿到，不能长期持有。
+    """
+
+    __slots__ = ("_gateway", "_trace_id")
+
+    def __init__(self, gateway: Gateway, trace_id: str) -> None:
+        self._gateway = gateway
+        self._trace_id = trace_id
+
+    @property
+    def trace_id(self) -> str:
+        return self._trace_id
+
+    @property
+    def blobs(self) -> BlobStore:
+        """原始证据存储。工具结果/参数应落 blob，事件里只放 `sha256:` 引用——
+        否则一个大响应会把事件流和看板一起撑爆（UI_DESIGN R7：必须能下钻到原文）。"""
+        return self._gateway.blobs
+
+    def emit(self, event_type: EventType | str, payload: dict[str, Any] | None = None) -> None:
+        self._gateway._emit(
+            make_event(event_type, self._trace_id, payload or {}, clock=self._gateway.clock)
+        )
+
+    def anomaly(self, code: str, detail: dict[str, Any] | None = None, *, severity: str = "") -> None:
+        """注入一条异常码。severity 留空则由码表决定（不许各处自拟级别）。"""
+        self.emit(EventType.ANOMALY, {
+            "code": code, "severity": severity or severity_of(code), "detail": detail or {},
+        })
 
 
 @dataclass(frozen=True, slots=True)
 class GatewayResult:
     trace_id: str
+
     generation: Generation
     usage: ReconciledUsage | None
     anomalies: tuple[tuple[str, str, dict[str, Any]], ...]
@@ -97,7 +138,14 @@ class Gateway:
         purpose: TracePurpose | str | None = None,
         trace_id: str | None = None,
         context: TraceContext | None = None,
+        before_trace_end: Callable[[Generation, TraceEmitter], None] | None = None,
     ) -> GatewayResult:
+        """跑一次生成。
+
+        `before_trace_end` 是给工具循环用的钩子：在 TRACE_END 之前拿到本条 trace 的
+        发射口，好把工具执行记在**发起该调用的那一步**里。钩子抛异常时仍然会关 trace
+        （否则观测库里会留下一条永远不结束的 trace），异常照常向上传播。
+        """
         tid = trace_id or new_trace_id()
         ctx = context or req.context
         if purpose is not None:
@@ -142,11 +190,24 @@ class Gateway:
         self._measure(req, gen, tid)
         if self.sample_gpu:
             self._emit_gpu_sample(tid, req.model)
+
+        # 钩子里跑的是真实工具执行，它崩了也必须先关 trace：留下一条永不结束的
+        # trace 会污染所有按 trace 聚合的统计。所以先记下异常，发完 TRACE_END 再抛。
+        hook_error: Exception | None = None
+        if before_trace_end is not None:
+            try:
+                before_trace_end(gen, TraceEmitter(self, tid))
+            except Exception as exc:  # noqa: BLE001 - 见上，延迟到 TRACE_END 之后再抛
+                hook_error = exc
+
         state = self._emit(make_event(EventType.TRACE_END, tid, {
             "status": str(gen.status), "wall_ms": wall_ms, "error": gen.error,
             "finish_reason": str(gen.finish_reason), "output_ref": output_ref,
             "text_chars": len(gen.text), "thinking_chars": len(gen.thinking),
         }, clock=self.clock))
+
+        if hook_error is not None:
+            raise hook_error
 
         return GatewayResult(
             trace_id=tid,
@@ -287,5 +348,6 @@ def _tool_call_dict(call: Any) -> dict[str, Any]:
 def _context_dict(ctx: TraceContext) -> dict[str, Any]:
     return {
         "eval_run_id": ctx.eval_run_id, "case_id": ctx.case_id, "sample_seq": ctx.sample_seq,
-        "parent_trace_id": ctx.parent_trace_id, "extra": ctx.extra,
+        "parent_trace_id": ctx.parent_trace_id, "root_trace_id": ctx.root_trace_id,
+        "extra": ctx.extra,
     }

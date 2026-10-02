@@ -239,3 +239,97 @@ def test_cost_reports_the_template_share_warning():
     assert result.exit_code == 0, result.output
     assert "每次请求实付" in result.output
     assert "模板占比" in result.output
+
+
+# ── fire（模型侧 fire-and-verify）─────────────────────────────────
+FIRE = ["tools", "fire", "把 hello 原样回显一次", "--model", "mock/echo",
+        "--provider", "mock", "--tools", "echo"]
+
+
+def test_fire_derives_the_expectation_from_the_tool_examples():
+    _import_builtin()
+    result = _run(*FIRE)
+    assert result.exit_code == 1, result.output
+    # 期望参数来自 examples[0]，不需要用户再手抄一遍
+    assert '{"text": "hello", "times": 1}' in result.output
+    # mock provider 的默认剧本不调工具，所以判定必须是 NO_CALL 而不是 PASS
+    assert "NO_CALL" in result.output
+    assert "没有发起任何工具调用" in result.output
+    assert "停止原因: final" in result.output
+
+
+def test_fire_accepts_an_explicit_expectation():
+    _import_builtin()
+    result = _run(*FIRE, "--expect", "echo", "--expect-args", '{"text": "x"}')
+    assert result.exit_code == 1
+    assert '{"text": "x"}' in result.output
+
+
+def test_fire_rejects_an_expectation_outside_the_tool_set():
+    _import_builtin()
+    result = _run(*FIRE, "--expect", "calculator")
+    assert result.exit_code == 2
+    assert "不在本次工具集里" in result.output
+
+
+def test_fire_requires_examples_or_explicit_args(tmp_path):
+    """没有 examples 又没有 --expect-args 时必须说清楚怎么修，而不是给个空期望。"""
+    bare = tmp_path / "bare.yaml"
+    bare.write_text(
+        """
+tools:
+  - name: bare_tool
+    description: 一个没有 examples 的工具，用来验证 fire 的错误提示是否可行动。
+    kind: python_fn
+    side_effect: read
+    impl_ref: onyx.tools.builtin.echo:echo
+    parameters:
+      type: object
+      properties:
+        text:
+          type: string
+          description: 需要回显的文本内容，这里只是为了让 schema 合法。
+      required: [text]
+      additionalProperties: false
+""",
+        encoding="utf-8",
+    )
+    assert _run("tools", "import", str(bare)).exit_code == 0
+    result = _run("tools", "fire", "随便说点什么", "--model", "mock/echo",
+                  "--provider", "mock", "--tools", "bare_tool")
+    assert result.exit_code == 2
+    assert "NO_EXAMPLE" in result.output
+    assert "--expect-args" in result.output
+
+
+def test_fire_needs_at_least_one_tool():
+    result = _run("tools", "fire", "回显", "--model", "mock/echo", "--provider", "mock")
+    assert result.exit_code == 2
+    assert "tools import --builtin" in result.output
+
+
+def test_fire_json_output_is_machine_readable():
+    _import_builtin()
+    result = _run(*FIRE, "--json")
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["verdict"] == "no_call"
+    assert payload["expected"] == {"tool": "echo", "arguments": {"text": "hello", "times": 1},
+                                  "exact": False}
+    assert payload["called"] == []
+    assert payload["stop_reason"] == "final"
+    assert payload["mocked"] is None
+
+
+def test_fire_runs_under_deny_policy_without_touching_real_tools():
+    """deny 是纯观测档：即使模型真要调工具，也只记 skipped，不产生任何副作用。
+
+    mock provider 的默认剧本不发起调用，所以这里断言的是"命令能跑通且判定明确"；
+    "用桩跑出的 PASS 必须标 mocked"由 tests/unit/test_verify.py 覆盖。
+    """
+    _import_builtin()
+    result = _run(*FIRE, "--mock", "deny", "--json")
+    assert result.exit_code == 1
+    payload = json.loads(result.output)
+    assert payload["verdict"] == "no_call"
+    assert payload["called"] == []

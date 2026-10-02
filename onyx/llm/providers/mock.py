@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -127,7 +128,7 @@ class MockProvider:
         self,
         id: str = "mock",
         base_url: str = "mock://",
-        scripts: dict[str, MockScript] | None = None,
+        scripts: dict[str, MockScript | Sequence[MockScript]] | None = None,
         *,
         default: MockScript = DEFAULT_SCRIPT,
         clock: Clock = SYSTEM_CLOCK,
@@ -140,6 +141,8 @@ class MockProvider:
         self.clock = clock
         self.models = models
         self.calls: list[GenerationRequest] = []
+        #: 序列脚本的消费游标：model → 已消费条数
+        self._cursors: dict[str, int] = {}
 
     # ── 元信息 ────────────────────────────────────────────────────
     def info(self) -> ProviderInfo:
@@ -165,7 +168,22 @@ class MockProvider:
         return [LoadedModel(name=self.models[0], size=1, size_vram=1, context_length=4096)]
 
     def script_for(self, req: GenerationRequest) -> MockScript:
-        return self.scripts.get(req.model, self.default)
+        """取本次调用该用的脚本。
+
+        值可以是单个脚本，也可以是**脚本序列**：多步工具循环的测试必须让同一个模型
+        在连续几次调用里返回不同结果（第 1 步要工具、第 2 步给答案），
+        否则只能靠"每步换一个模型名"来绕，那样测的就不是真实形态了。
+        序列耗尽后停在最后一条——多要一次和真要一次得到同样的响应，便于断言循环已收敛。
+        """
+        entry = self.scripts.get(req.model, self.default)
+        if isinstance(entry, MockScript):
+            return entry
+        items = list(entry)
+        if not items:
+            return self.default
+        cursor = self._cursors.get(req.model, 0)
+        self._cursors[req.model] = cursor + 1
+        return items[min(cursor, len(items) - 1)]
 
     # ── 数据面 ────────────────────────────────────────────────────
     def generate(

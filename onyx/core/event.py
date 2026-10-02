@@ -79,7 +79,7 @@ PAYLOAD_OPTIONAL: dict[EventType, frozenset[str]] = {
                                       "confidence", "ok", "note"}),
     EventType.USAGE_ATTRIBUTION: frozenset({"parts", "attribution", "count_source"}),
     EventType.RECONCILED: frozenset({"in_tokens", "out_tokens", "drift_pct", "alts"}),
-    EventType.TOOL_EXEC_START: frozenset({"args_ref", "tool_id", "executed_by"}),
+    EventType.TOOL_EXEC_START: frozenset({"args_ref", "tool_id", "tool_def_hash", "executed_by"}),
     EventType.TOOL_EXEC_END: frozenset(
         {"latency_ms", "result_ref", "result_bytes", "error", "executed_by", "mocked"}
     ),

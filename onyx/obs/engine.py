@@ -114,6 +114,7 @@ class ObserverEngine:
         state.case_id = context.get("case_id")
         state.sample_seq = context.get("sample_seq")
         state.parent_id = context.get("parent_trace_id") or payload.get("trace_parent")
+        state.root_id = context.get("root_trace_id")
 
     def _apply_trace_end(self, event: TraceEvent, state: TraceState) -> None:
         payload = event.payload

@@ -569,33 +569,83 @@ UnguardedExecutor（绕过 guarded_call 直接返回成功）→ 3 条断言同�
 
 ---
 
-## S12 — 工具循环 + 模型侧 fire-and-verify（M3 出口）
+## S12 — 工具循环 + 模型侧 fire-and-verify（M3 出口）✅
 
 **产出文件**
 ```
 onyx/tools/loop.py       # 多步循环 / 预算 / 循环检测 / 孤儿调用补齐 / 停止词（DESIGN §8.3）
-onyx/tools/verify.py     # 指令→期望工具→实际调用 的差异报告
-tests/unit/test_loop.py  # 用 mock provider 驱动，含全部边界
-tests/integration/test_fire_verify.py  (@live)
+onyx/tools/verify.py     # 指令→期望工具→实际调用 的差异报告（六种判定）
+tests/unit/test_loop.py         # 31 条，用 MockProvider 驱动，含全部边界
+tests/unit/test_verify.py       # 25 条
+tests/integration/test_fire_verify.py  (@live，8 条，真机 qwen3.5:9b)
 ```
-必须实现并单测的边界（每条一个用例）：
-`max_steps` 截断 · token 预算耗尽 · `(name,args)` 重复 → `TOOL_LOOP` 熔断 · 模型返回不存在的工具名 · `finish_reason=tool_calls` 但无 tool_calls（本地模型高频）· 工具异常后能继续对话 · 孤儿调用补齐占位（断言下一条请求 messages 结构合法，无悬空 tool 消息）· 截断 JSON 进 `args_raw`。
+
+**为此改动的既有代码（都是必要的，不是顺手重构）**
+- `Gateway.generate(before_trace_end=...)` + `TraceEmitter`：工具执行必须记在**发起该调用的
+  那一步**的 trace 里，而 TRACE_END 由 gateway 发出，所以需要一个在关 trace 之前的回调口子。
+  顺带把一直没人发的 `TOOL_EXEC_START/END` 事件用起来——`tool_call` 表的
+  `result_status / latency_ms / executed_by / result_ref / result_bytes / tool_def_hash`
+  六列此前永远是空的。钩子抛异常时仍然先关 trace 再抛，否则库里会留下永不结束的 trace。
+- `TraceContext.root_trace_id`（新）与 `parent_trace_id` 分开：循环的 root 是**分组键**，
+  没有对应的 trace 行。一开始塞进 `parent_trace_id`，结果撞 `FOREIGN KEY constraint failed`，
+  整条记录写不进去，而表面上只是日志里一行警告——这是本步最容易踩、也最难发现的坑。
+- `tool_call_fingerprint` 上移到 `core/types.py`：循环靠它熔断 TOOL_LOOP，tool visitor
+  靠它聚合重复调用，两处必须算出同一个值。各写一份必然漂移，漂移之后一边报循环、
+  一边报正常，这种矛盾比没有检测更难查。
+- `MockProvider.scripts` 支持**脚本序列**：多步循环的测试必须让同一个模型在连续几次调用里
+  返回不同结果。否则只能靠"每步换一个模型名"来绕，那样测的就不是真实形态了。
+
+**与原计划的偏差**
+- `--mock weather`（按工具名选择性打桩）改为 `--mock <策略>` + `--fixture <JSON>`：
+  一个参数同时表示"策略"和"工具名"会有歧义，而策略是全局的、桩是按工具的，两者不该挤在一起。
+- DoD 写的"5 个模型"按本机实际装的 3 个跑（`ONYX_TEST_MODEL` 可换）。
+
+**必须实现并单测的边界**（每条至少一个用例，全部落地）：
+`max_steps` 截断 · token 预算耗尽 · 墙钟预算 · `(name,args)` 重复 → `TOOL_LOOP` 熔断 ·
+模型返回不存在的工具名 → `UNKNOWN_TOOL` · `finish_reason=tool_calls` 但无 tool_calls →
+`ORPHAN_TOOL_CALL` · 工具异常后能继续对话 · 孤儿调用补齐占位（断言下一条请求 messages
+结构合法，无悬空 tool 消息）· 截断 JSON 进 `args_raw` 且**原文参与指纹** ·
+并行多调用 · 引擎故障 · 工具超时不带走循环。
+
+**核心不变式**（有专门的断言函数，出现在 6 个用例里）：
+> 一条带 N 个 `tool_calls` 的 assistant 消息，后面必须紧跟**恰好 N 条** `role=tool` 消息。
+
+少一条，之后每次请求的上下文都永久错位，而引擎通常不报错——只是开始答非所问。
+所以即使中途熔断，剩下的调用也要补占位结果。
+
+**六种判定的分工**（`verify.py` 文档里有完整的"该改什么"对照表）：
+`PASS` / `NO_CALL`（改提示词与工具描述）/ `WRONG_TOOL`（改工具之间的区分度）/
+`BAD_ARGS`（改参数描述或加 max_tokens）/ **`TOOL_FAILED`（改工具，不是改模型）** /
+`LOOP_BROKEN`（改工具返回值）/ `ERROR`（先跑 doctor）。
+判定顺序即归因优先级：先看这一轮**有没有收敛**，再看调没调、调得对不对——
+顺序反了会把"循环熔断"记成 PASS，因为第一次调用的参数往往是对的。
+汇总的 `pass_rate` 分母排除 `TOOL_FAILED` 与 `ERROR`：否则模型要替坏掉的工具和挂掉的引擎背锅。
 
 **自测**
 ```bash
-uv run pytest tests/unit/test_loop.py -q
-uv run onyx tools fire "北京明天天气怎么样" --tools weather,search --model qwen3:8b --mock weather
-uv run onyx traces show <id> --tree
-uv run onyx chat --model qwen3:8b "查一下 3 月销售额然后换算成百分比" --tools db,calc --fixture db.yaml
+uv run pytest tests/unit/test_loop.py tests/unit/test_verify.py -q          # 56 passed
+uv run pytest -m live tests/integration/test_fire_verify.py -q              # 8 passed
+uv run onyx tools import --builtin
+uv run onyx tools fire "把 hello 原样回显一次" --model mock/echo --provider mock --tools echo
+uv run onyx tools fire "把 hello 原样回显一次" --model qwen3.5:9b --tools echo,calculator --mock live
+uv run onyx traces ls --limit 3        # 每一步都是独立 trace，靠 root_id 聚合
 ```
-`tools fire` 预期：
+真机实测输出（qwen3.5:9b，2026-10-03，`--mock live`）：
 ```
-expected weather.now  actual weather.now          ✓  args: city=北京(date 缺省→今天) ✓
-tool_call#1 latency 412ms  executed_by=client(mocked)
-parse_status=ok  steps=1  tokens in=1502 out=47
-verdict: PASS
+期望      : echo {"text": "hello", "times": 1}
+实际      : echo {"text": "hello", "times": 1}
+参数差异  : {"ok": true, "missing": [], "unexpected": [], "mismatched": {}, "subset_ok": true}
+步数      : 2   停止原因: final
+判定      : PASS      真实执行
 ```
-**验收 DoD**：同一指令在 5 个模型上跑，能明确区分三种失败：`NO_CALL`(不调) / `WRONG_TOOL`(调错) / `BAD_ARGS`(参数错)；且 `--mock` 时零真实网络请求（respx 断言）。
+> 同一次运行里 `TOKEN_DRIFT` 报 32–37%：因为用的是**全新的空数据目录**，模型没有标定
+> （`usage_ratio IS NULL`），本地复算退回 heuristic 档，而它按 ~1.0 token/字估中文、
+> 该模型实际 ~0.679（P21）。采信值仍是 `engine/high`，异常码报得对——这不是缺陷，
+> 是"未标定"这件事被如实标出来了。跑一次 `onyx calibrate` 即归零（P21）。
+
+**验收 DoD**：NO_CALL / WRONG_TOOL / BAD_ARGS / TOOL_FAILED / LOOP_BROKEN / ERROR
+六种判定互不相同且各有用例；`--mock fixture|deny` 时零真实工具执行（canary 断言）；
+上下文不变式在真机与离线两侧都被验证；真机端到端跑出 PASS。
 
 **提交**：`feat(tools): client-side tool loop + fire-and-verify harness`
 
@@ -743,7 +793,7 @@ uv run pytest tests/contract -q
 | S9 | `pytest -m e2e` | 对话→trace→归因→转 case 全链路 |
 | S10 | `onyx tools cost` | 与 `token explain` 的 `tool_defs` 同源一致 |
 | S11 | `onyx tools contract` | 8 条断言 × 3 executor 全过；n/a 均带原因；注入缺陷能检出 |
-| S12 | `onyx tools fire --mock` | NO_CALL/WRONG_TOOL/BAD_ARGS 可区分；零真实网络 |
+| S12 | `onyx tools fire --provider mock` | 六种判定可区分；fixture/deny 档零真实执行；上下文不变式成立 |
 | S13 | `onyx eval run --task intent_classification` | macro_f1 + CI + 混淆对；mock 也能跑 |
 | S14 | `onyx eval run --task tool_selection --k 3` | skip 带原因；resume 不重复计费 |
 | S15 | `onyx eval compare A B` | 配对净变化 + CI；n 小有警告 |

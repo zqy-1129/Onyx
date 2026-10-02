@@ -9,6 +9,8 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import json
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Literal
@@ -195,8 +197,23 @@ class ToolCall:
     parse_source: Literal["native_head", "text_template", "heuristic", "fixture"] = "native_head"
 
 
+def tool_call_fingerprint(name: str, args: dict[str, Any] | None, args_raw: str = "") -> str:
+    """(工具名, 参数) 的稳定指纹，用于重复调用检测与去重。
+
+    放在 core 是因为**两处必须算出同一个值**：工具循环靠它熔断 TOOL_LOOP，
+    tool visitor 靠它聚合重复调用。各写一份必然漂移，漂移之后一边报循环、
+    一边报正常，这种矛盾比没有检测更难查。
+
+    解析失败时退回 `args_raw` 原文——截断的 JSON 也是身份的一部分，
+    两次都截在同一个位置就该算重复。
+    """
+    payload = json.dumps(args, ensure_ascii=False, sort_keys=True) if args is not None else args_raw
+    return hashlib.sha256(f"{name}|{payload}".encode()).hexdigest()[:16]
+
+
 @dataclass(frozen=True, slots=True)
 class Message:
+
     role: Role
     content: str = ""
     name: str | None = None
@@ -261,7 +278,12 @@ class TraceContext:
     eval_run_id: str | None = None
     case_id: str | None = None
     sample_seq: int | None = None
+    #: 真实存在的父 trace（落库时是外键，指向 trace.id）
     parent_trace_id: str | None = None
+    #: 分组键：多步工具循环的 root。**没有对应的 trace 行**，所以不是外键，
+    #: 也不能塞进 parent_trace_id——那会触发 FOREIGN KEY constraint failed，
+    #: 整条记录写不进去，而且现象只是日志里一行警告
+    root_trace_id: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
     @property

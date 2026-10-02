@@ -53,6 +53,8 @@ class TraceState:
     model_id: str | None = None
     model_name: str | None = None
     parent_id: str | None = None
+    #: 分组键，可以指向一条**不存在**的 trace（多步工具循环的 root），所以不参与外键
+    root_id: str | None = None
     eval_run_id: str | None = None
     case_id: str | None = None
     sample_seq: int | None = None
@@ -116,7 +118,8 @@ class TraceState:
     def to_trace_record(self) -> TraceRecord:
         return TraceRecord(
             id=self.trace_id, kind=self.kind, purpose=self.purpose, started_at=self.started_at,
-            status=self.status, parent_id=self.parent_id, root_id=self.parent_id or self.trace_id,
+            status=self.status, parent_id=self.parent_id,
+            root_id=self.root_id or self.parent_id or self.trace_id,
             eval_run_id=self.eval_run_id, case_id=self.case_id, sample_seq=self.sample_seq,
             provider_id=self.provider_id, model_id=self.model_id, model_name=self.model_name,
             first_token_at=self.first_token_at, finished_at=self.finished_at,

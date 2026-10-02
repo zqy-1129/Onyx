@@ -379,7 +379,42 @@ class ToolExecutor(Protocol):
 - **循环检测**：`(name, hash(args))` 重复 → 熔断 `anomaly(TOOL_LOOP)`
 - **畸形参数保留原文**：`json.loads` 失败绝不丢弃，落 `args_raw` + `parse_status`
 - **孤儿调用补齐**：`finish_reason=tool_calls` 但结果缺失/超时时补占位 tool 消息，否则后续上下文永久错位
-- 停止词配置化：文本模板类模型常需注入 `` 等，由 `model.tool_format` 驱动而非硬编码
+- 停止词配置化：文本模板类模型常需注入 `<tool_response>` / `<|im_end|>` 这类标记，由 `model.tool_format` 驱动而非硬编码——原生 tool_calls 头的模型加了反而会截断正文
+
+**上下文不变式（实现里由专门的断言函数守着）**：
+> 一条带 N 个 `tool_calls` 的 assistant 消息，后面必须紧跟**恰好 N 条** `role=tool` 消息。
+
+少一条，之后每次请求的上下文都永久错位，而引擎通常**不报错**——只是开始答非所问。
+所以即使中途熔断，同一轮里剩下的调用也必须补占位结果。
+
+**两个实现决定，都是踩出来的**：
+1. 工具执行事件必须落在**发起该调用的那一步**的 trace 里，而 TRACE_END 由 gateway 发出，
+   所以 `Gateway.generate` 提供 `before_trace_end` 钩子 + `TraceEmitter`（含 blob 写入口）。
+   钩子抛异常时先关 trace 再抛，否则库里会留下永不结束的 trace，污染所有按 trace 聚合的统计。
+2. 多步循环用 `TraceContext.root_trace_id` 分组，**不用** `parent_trace_id`：
+   root 是循环自己造的分组键，没有对应的 trace 行，而 `trace.parent_id` 是外键。
+   塞进 parent 会撞 `FOREIGN KEY constraint failed`，整条记录写不进去，
+   而表面上只是日志里一行警告。
+
+`tool_call_fingerprint` 放在 `core/types.py`：循环靠它熔断，tool visitor 靠它聚合重复调用，
+两处必须算出同一个值。各写一份必然漂移，漂移之后一边报循环、一边报正常，
+这种自相矛盾比没有检测更难查。
+
+### 8.3.1 fire-and-verify 的六种判定
+`tools/verify.py` 把"工具调用得分低"拆开。**判定顺序即归因优先级**：先看这一轮有没有收敛，
+再看调没调、调得对不对——顺序反了会把"循环熔断"记成 PASS，因为第一次调用的参数往往是对的。
+
+| verdict | 该改什么 |
+|---|---|
+| `NO_CALL` | 系统提示词 / 工具的 description（"什么时候该用"） |
+| `WRONG_TOOL` | 工具之间的描述区分度；名字太像就改名 |
+| `BAD_ARGS` | 参数 description、required、max_tokens（截断与填错字段修法不同，detail 里分开说） |
+| `TOOL_FAILED` | **工具**，不是模型——先跑 `onyx tools contract` |
+| `LOOP_BROKEN` | 工具返回值没给模型新信息，或提示词没让它换策略 |
+| `ERROR` | 先跑 `onyx doctor` |
+
+汇总的 `pass_rate` 分母**排除** `TOOL_FAILED` 与 `ERROR`：把工具缺陷和环境故障算进模型得分，
+等于让模型替它们背锅，然后你会去调一个本来没问题的提示词。
 
 ### 8.4 可复现性：fixture 优先
 评测**默认不执行真实工具**：`case.fixture_json` 提供工具返回值桩，产出 `tool_run(status='mocked')`。只有 `--live` 且工具 `side_effect='read'` 才真跑。理由：真实搜索结果/天气会让评测不可复现，把模型误差和数据漂移混为一谈。

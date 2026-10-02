@@ -256,11 +256,18 @@ traces_app = typer.Typer(help="trace：列表、详情、重放", no_args_is_hel
 app.add_typer(traces_app, name="traces")
 
 
-def _runtime(url: str, db: Path | None, *, sample_gpu: bool = True):
+def _runtime(url: str, db: Path | None, *, sample_gpu: bool = True, provider_kind: str = "ollama"):
+    """构造运行时。
+
+    `provider_kind` 是 DESIGN §13 的扩展点在 CLI 上的出口：换成 `mock` 就能在没有
+    引擎的机器上跑通整条链路（含工具循环与评测），这也是离线测试的依据。
+    """
     from onyx.runtime import build_runtime
 
     return build_runtime(
-        base_url=url, db_path=str(db) if db else None, sample_gpu=sample_gpu, event_log=False
+        provider_kind=provider_kind, base_url=url,
+        db_path=str(db) if db else None,
+        sample_gpu=sample_gpu and provider_kind == "ollama", event_log=False,
     )
 
 
@@ -1142,7 +1149,185 @@ def tools_run(
             database.close()
 
 
+@tools_app.command("fire")
+def tools_fire(
+    instruction: str = typer.Argument(..., help="给模型的指令"),
+    model: str = typer.Option(..., "--model"),
+    url: str = typer.Option("http://127.0.0.1:11434", "--url"),
+    db: Path = typer.Option(None, "--db"),
+    provider: str = typer.Option("ollama", "--provider", help="ollama | mock（离线跑通整条链路）"),
+    tools: str = typer.Option(None, "--tools", help="逗号分隔的工具名；不给就用全部已启用的"),
+    expect: str = typer.Option(None, "--expect", help="期望调用的工具名；默认取 --tools 的第一个"),
+    expect_args: str = typer.Option(None, "--expect-args", help="期望参数 JSON；默认取该工具 examples[0]"),
+    exact: bool = typer.Option(False, "--exact", help="严格档：不允许多余字段"),
+    mock: str = typer.Option(
+        "fixture", "--mock", help="live | fixture | replay | deny。默认 fixture：评测期零真实副作用"
+    ),
+    fixture: str = typer.Option(None, "--fixture", help='桩返回值 JSON：{"工具名": {...}}'),
+    max_steps: int = typer.Option(6, "--max-steps"),
+    total_tokens: int = typer.Option(None, "--max-total-tokens", help="各步 in+out 之和的上限"),
+    deadline: int = typer.Option(None, "--deadline-ms", help="单次工具调用的超时"),
+    allow: str = typer.Option(None, "--allow", help="额外放开的副作用：write,network,exec"),
+    thinking: bool = typer.Option(False, "--thinking/--no-thinking"),
+    max_new_tokens: int = typer.Option(512, "--max-new-tokens"),
+    json_out: bool = typer.Option(False, "--json"),
+) -> None:
+    """模型侧 fire-and-verify：一条指令 → 期望的调用 → 实际发生的调用。
+
+    判定分六种，因为它们的修法完全不同（详见 verify.py 的表）：
+    NO_CALL 改提示词/工具描述 · WRONG_TOOL 改工具之间的区分度 ·
+    BAD_ARGS 改参数描述或加 max_tokens · **TOOL_FAILED 改工具，不是改模型** ·
+    LOOP_BROKEN 改工具返回值 · ERROR 先跑 onyx doctor。
+
+    默认 `--mock fixture`：不给桩就不执行真实工具（报 skipped），
+    这样同一条指令重跑多少次都可复现。要真跑加 `--mock live`。
+    """
+    import json as _json
+
+    from rich.console import Console
+
+    from onyx.core.types import GenerationRequest, GenParams, TraceContext, TracePurpose
+    from onyx.runtime import sync_models
+    from onyx.store.repos import ToolRepo
+    from onyx.tools.executor import MockPolicy, ToolCtx
+    from onyx.tools.loop import LoopBudget, ToolLoop
+    from onyx.tools.registry import ToolRegistry
+    from onyx.tools.verify import Verdict, verify_case
+
+    console = Console()
+    runtime = _runtime(url, db, provider_kind=provider)
+    try:
+        sync_models(runtime)
+        registry = ToolRegistry(ToolRepo(runtime.db))
+        wanted = [t.strip() for t in tools.split(",")] if tools else None
+        definitions = _fire_definitions(registry, wanted)
+        if not definitions:
+            typer.echo(
+                "没有可用的工具定义。先跑 `onyx tools import --builtin`，"
+                "或用 --tools 指定已注册的名字。", err=True,
+            )
+            raise typer.Exit(2)
+
+        expected_tool = expect or (wanted[0] if wanted else definitions[0].name)
+        definition = next((d for d in definitions if d.name == expected_tool), None)
+        expectation = _fire_expectation(definition, expected_tool, expect_args, exact)
+        if expectation is None:
+            raise typer.Exit(2)
+
+        stubs = _json.loads(fixture) if fixture else {}
+        ctx = ToolCtx(
+            mock_policy=MockPolicy(mock), deadline_ms=deadline,
+            fixtures=stubs, replay=stubs, policy=_policy_from_cli(allow),
+        )
+        loop = ToolLoop(
+            runtime.gateway, definitions,
+            budget=LoopBudget(max_steps=max_steps, max_total_tokens=total_tokens),
+            ctx=ctx,
+        )
+        request = GenerationRequest.of(
+            model, instruction,
+            params=GenParams(max_tokens=max_new_tokens, temperature=0.0),
+            thinking=thinking, tools=tuple(d.to_spec() for d in definitions),
+            context=TraceContext(purpose=TracePurpose.TOOL_TEST),
+        )
+        result = verify_case(loop, expectation, request)
+        runtime.flush()
+
+        if json_out:
+            typer.echo(_json.dumps({
+                "instruction": instruction, "model": model,
+                "expected": {"tool": expectation.tool, "arguments": dict(expectation.arguments),
+                             "exact": expectation.exact},
+                "verdict": str(result.verdict), "detail": result.detail,
+                "called": list(result.called), "actual_args": result.actual_args,
+                "args_diff": result.args_diff, "steps": result.steps,
+                "stop_reason": result.stop_reason, "codes": list(result.codes),
+                "mocked": result.mocked,
+            }, ensure_ascii=False, indent=2, default=str))
+            raise typer.Exit(0 if result.ok else 1)
+
+        typer.echo(f"指令      : {instruction}")
+        typer.echo(f"模型      : {model}   工具: {', '.join(d.name for d in definitions)}")
+        typer.echo(f"期望      : {expectation.tool} "
+                   f"{_json.dumps(dict(expectation.arguments), ensure_ascii=False)}"
+                   f"{'（严格档）' if expectation.exact else ''}")
+        typer.echo(f"实际      : {', '.join(result.called) or '（无调用）'}"
+                   f"{'' if result.actual_args is None else ' ' + _json.dumps(result.actual_args, ensure_ascii=False)}")
+        if result.args_diff:
+            typer.echo(f"参数差异  : {_json.dumps(result.args_diff, ensure_ascii=False, default=str)}")
+        typer.echo(f"步数      : {result.steps}   停止原因: {result.stop_reason}")
+        if result.codes:
+            typer.echo(f"异常码    : {', '.join(result.codes)}")
+        label = {
+            Verdict.PASS: "[green]PASS[/green]",
+            Verdict.TOOL_FAILED: "[yellow]TOOL_FAILED[/yellow]",
+            Verdict.ERROR: "[red]ERROR[/red]",
+        }.get(result.verdict, f"[red]{str(result.verdict).upper()}[/red]")
+        typer.echo(f"判定      : {label}")
+        console.print(f"[dim]{result.detail}[/dim]")
+        if result.mocked:
+            typer.echo("[!] 工具用桩执行（--mock 非 live）：这验证的是模型会不会调，不是工具能不能跑")
+        raise typer.Exit(0 if result.ok else 1)
+    finally:
+        runtime.close()
+
+
+def _fire_definitions(registry, wanted: list[str] | None) -> list:
+    """解析要参与本次验证的工具定义。
+
+    与 `tools run` 同一条规矩：**注册表优先，内置兜底**。内置只是没注册时的便利，
+    一旦用户导入过同名定义，模型看到的和执行的就必须是同一份。
+    """
+    from onyx.tools.builtin.defs import builtin_def
+
+    if not wanted:
+        return registry.list(enabled_only=True)
+    out = []
+    for name in wanted:
+        definition = registry.get(name) or builtin_def(name)
+        if definition is None:
+            typer.echo(f"找不到工具 {name!r}（注册表与内置定义里都没有）", err=True)
+            continue
+        out.append(definition)
+    return out
+
+
+def _fire_expectation(definition, expected_tool: str, expect_args: str | None, exact: bool):
+    """构造期望。没给 --expect-args 时从 `ToolDef.examples[0]` 取。
+
+    examples 本来就是为 fire-and-verify 准备的（审计规则 NO_EXAMPLE 催的就是它），
+    所以这里不需要用户再手抄一遍参数。
+    """
+    import json as _json
+
+    from onyx.tools.verify import Expectation
+
+    if expect_args:
+        return Expectation("", expected_tool, _json.loads(expect_args), exact=exact)
+    if definition is None:
+        typer.echo(
+            f"--expect {expected_tool!r} 不在本次工具集里，且没有 --expect-args 可用", err=True
+        )
+        return None
+    if not definition.examples:
+        typer.echo(
+            f"工具 {expected_tool} 没有 examples，无法自动取期望参数；"
+            "请用 --expect-args 显式给出，或给定义补一条 examples（审计规则 NO_EXAMPLE）",
+            err=True,
+        )
+        return None
+    expectation = Expectation.from_example(definition.examples[0], exact=exact)
+    if expectation.tool != expected_tool:
+        # examples[0] 里写的工具名与 --expect 不一致，说明定义自相矛盾
+        typer.echo(
+            f"[!] {expected_tool} 的 examples[0] 期望调用的是 {expectation.tool!r}，"
+            "以 examples 为准", err=True,
+        )
+    return expectation
+
+
 def _policy_from_cli(allow: str | None):
+
     """默认最严（只允许 read）。`--allow` 是显式的、逐次生效的放开。"""
     from onyx.tools.sandbox import PERMISSIVE_POLICY, SandboxPolicy
     from onyx.tools.spec import SideEffect
