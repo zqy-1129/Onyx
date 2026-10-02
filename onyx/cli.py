@@ -249,6 +249,309 @@ def probe_run(
         typer.echo(f"\n以下探针未得出确定结论（UI 应显示「—」而不是 0）: {unknown}")
 
 
+# ── models ─────────────────────────────────────────────────────────
+models_app = typer.Typer(help="模型资产：同步、清单、载入状态", no_args_is_help=True)
+app.add_typer(models_app, name="models")
+traces_app = typer.Typer(help="trace：列表、详情、重放", no_args_is_help=True)
+app.add_typer(traces_app, name="traces")
+
+
+def _runtime(url: str, db: Path | None, *, sample_gpu: bool = True):
+    from onyx.runtime import build_runtime
+
+    return build_runtime(
+        base_url=url, db_path=str(db) if db else None, sample_gpu=sample_gpu, event_log=False
+    )
+
+
+@models_app.command("sync")
+def models_sync(
+    url: str = typer.Option("http://127.0.0.1:11434", "--url"),
+    db: Path = typer.Option(None, "--db"),
+) -> None:
+    """从引擎拉取模型清单并落库。"""
+    from onyx.runtime import sync_models
+
+    runtime = _runtime(url, db)
+    try:
+        count = sync_models(runtime)
+        runtime.flush()
+        typer.echo(f"已同步 {count} 个模型 → {runtime.settings.db_path}")
+    finally:
+        runtime.close()
+
+
+@models_app.command("ls")
+def models_ls(
+    url: str = typer.Option("http://127.0.0.1:11434", "--url"),
+    db: Path = typer.Option(None, "--db"),
+) -> None:
+    """列出已安装模型与当前载入状态（显存 / 上下文 / keep-alive 剩余）。"""
+    from rich.console import Console
+    from rich.table import Table
+
+    runtime = _runtime(url, db)
+    try:
+        loaded = {m.name: m for m in runtime.provider.running()}
+        table = Table(title="模型", pad_edge=False)
+        for column in ("模型", "参数", "量化", "磁盘", "能力", "状态", "显存", "ctx(载入/训练)"):
+            table.add_column(column)
+        for card in runtime.provider.list_models():
+            live = loaded.get(card.name)
+            table.add_row(
+                card.name, card.parameter_size or "—", card.quantization or "—",
+                f"{card.size_gb}GB", ",".join(card.capabilities) or "—",
+                f"[green]已载入[/] 剩 {_remaining(live.expires_at)}" if live else "[dim]未载入[/]",
+                f"{live.size_vram / 1e9:.2f}GB" if live else "—",
+                f"{live.context_length if live else '—'} / {card.context_length or '—'}",
+            )
+        Console().print(table)
+    finally:
+        runtime.close()
+
+
+def _remaining(expires_at: str) -> str:
+    from datetime import datetime
+
+    try:
+        target = datetime.fromisoformat(expires_at)
+    except ValueError:
+        return "—"
+    seconds = (target - datetime.now(target.tzinfo)).total_seconds()
+    return f"{int(seconds)}s" if seconds > 0 else "已过期"
+
+
+# ── chat ───────────────────────────────────────────────────────────
+DEMO_TOOLS = {
+    "weather": ("get_weather", "查询指定城市当前天气", {"city": "string"}),
+}
+
+
+@app.command()
+def chat(
+    prompt: str = typer.Argument(..., help="用户消息"),
+    model: str = typer.Option(..., "--model", "-m"),
+    url: str = typer.Option("http://127.0.0.1:11434", "--url"),
+    db: Path = typer.Option(None, "--db"),
+    stream: bool = typer.Option(False, "--stream"),
+    max_tokens: int = typer.Option(512, "--max-tokens"),
+    thinking: bool = typer.Option(None, "--thinking/--no-thinking"),
+    tool: str = typer.Option("", "--tool", help="逗号分隔的演示工具名，如 weather"),
+) -> None:
+    """发一次真实对话并把它完整落库（token / 延迟 / 工具 / 原始证据）。"""
+    from rich.console import Console
+    from rich.table import Table
+
+    from onyx.core.types import GenerationRequest, GenParams, ToolSpec
+    from onyx.runtime import sync_models
+
+    console = Console()
+    runtime = _runtime(url, db)
+    try:
+        sync_models(runtime)
+        tools = tuple(
+            ToolSpec(
+                name=DEMO_TOOLS[name][0], description=DEMO_TOOLS[name][1],
+                parameters={
+                    "type": "object",
+                    "properties": {k: {"type": v} for k, v in DEMO_TOOLS[name][2].items()},
+                    "required": list(DEMO_TOOLS[name][2]),
+                },
+            )
+            for name in (t.strip() for t in tool.split(",")) if name in DEMO_TOOLS
+        )
+        req = GenerationRequest.of(
+            model, prompt,
+            params=GenParams(max_tokens=max_tokens, temperature=0.0),
+            thinking=thinking, stream=stream, tools=tools,
+        )
+        result = runtime.gateway.generate(req)
+        runtime.flush()
+
+        gen = result.generation
+        if gen.thinking:
+            console.print(f"[dim]💭 thinking ({len(gen.thinking)} 字符)[/dim]")
+            console.print(gen.thinking[:400] + ("…" if len(gen.thinking) > 400 else ""))
+        console.print(gen.text or "[yellow]（正文为空）[/yellow]")
+        for call in gen.tool_calls:
+            console.print(f"[cyan]→ 工具调用[/cyan] {call.name} {call.arguments} "
+                          f"[dim]({call.parse_status})[/dim]")
+
+        usage = result.usage
+        table = Table(title=f"trace {result.trace_id}", pad_edge=False)
+        table.add_column("指标")
+        table.add_column("值", justify="right")
+        if usage:
+            rows = [
+                ("输入 token", usage.in_tokens), ("输出 token", usage.out_tokens),
+                ("来源 / 置信度", f"{usage.source} / {usage.confidence}"),
+                ("drift", None if usage.drift_pct is None else f"{usage.drift_pct:.2%}"),
+                ("工具定义 token", sum(p.tokens for p in usage.parts if p.part == "tool_defs") or "—"),
+                ("模板控制符", sum(p.tokens for p in usage.parts if p.part == "template_ctl") or "—"),
+            ]
+        else:
+            rows = [("usage", "无")]
+        rows += [
+            ("TTFT", f"{result.latency.get('ttft_ms'):.1f}ms" if result.latency.get("ttft_ms") else "—"),
+            ("prefill 模式", result.latency.get("prefill_mode") or "—"),
+            ("prefill TPS", _fmt(result.latency.get("prefill_tps"))),
+            ("decode TPS", _fmt(result.latency.get("decode_tps"))),
+            ("wall", _fmt(result.latency.get("wall_ms"), "ms")),
+            ("异常", ", ".join(sorted({c for c, _, _ in result.anomalies})) or "无"),
+        ]
+        for name, value in rows:
+            table.add_row(str(name), str(value))
+        console.print(table)
+        console.print(f"[dim]onyx traces show {result.trace_id}[/dim]")
+    finally:
+        runtime.close()
+
+
+def _fmt(value: object, suffix: str = "") -> str:
+    return f"{value:.1f}{suffix}" if isinstance(value, int | float) else "—"
+
+
+# ── traces ─────────────────────────────────────────────────────────
+@traces_app.command("ls")
+def traces_ls(
+    limit: int = typer.Option(20, "--limit"),
+    db: Path = typer.Option(None, "--db"),
+    purpose: str = typer.Option(None, "--purpose"),
+) -> None:
+    """最近的 trace 列表。"""
+    from rich.console import Console
+    from rich.table import Table
+
+    from onyx.store.repos import TraceRepo, UsageRepo
+
+    settings = _settings()
+    with Database(_db_path(settings, db)) as database:
+        traces, usage_repo = TraceRepo(database), UsageRepo(database)
+        rows = traces.list(limit=limit, purpose=purpose)
+        # 一次性取出相关异常再分组，避免每行一次查询
+        wanted = {r.id for r in rows}
+        anomaly_counts: dict[str, int] = {}
+        for item in traces.list_anomalies(limit=1000):
+            if item.trace_id in wanted:
+                anomaly_counts[item.trace_id] = anomaly_counts.get(item.trace_id, 0) + 1
+        table = Table(title=f"最近 {limit} 条 trace", pad_edge=False)
+        for column in ("id", "purpose", "model", "in", "out", "src", "prefill", "tps", "状态", "工具", "异常"):
+            table.add_column(column)
+        for record in rows:
+            bundle = usage_repo.fetch(record.id)
+            u = bundle.usage
+            table.add_row(
+                record.id[-8:], record.purpose, record.model_name or "—",
+                str(u.in_tokens) if u and u.in_tokens else "—",
+                str(u.out_tokens) if u and u.out_tokens else "—",
+                u.source if u else "—", (u.prefill_mode or "—") if u else "—",
+                _fmt(u.decode_tps) if u else "—", record.status,
+                str(len(traces.list_tool_calls(record.id))),
+                str(anomaly_counts.get(record.id, 0)),
+            )
+        Console().print(table)
+
+
+@traces_app.command("show")
+def traces_show(
+    trace_id: str = typer.Argument(...),
+    db: Path = typer.Option(None, "--db"),
+) -> None:
+    """一条 trace 的完整证据：多来源计数、分段归因、工具调用、异常、原始 body。"""
+    from rich.console import Console
+    from rich.table import Table
+
+    from onyx.store.repos import TraceRepo, UsageRepo
+
+    console = Console()
+    settings = _settings()
+    with Database(_db_path(settings, db)) as database:
+        record = TraceRepo(database).get(trace_id)
+        if record is None:
+            typer.echo(f"trace 不存在: {trace_id}", err=True)
+            raise typer.Exit(1)
+        bundle = UsageRepo(database).fetch(trace_id)
+        calls = TraceRepo(database).list_tool_calls(trace_id)
+        anomalies = [a for a in TraceRepo(database).list_anomalies(limit=500) if a.trace_id == trace_id]
+
+        console.print(f"[bold]trace[/bold] {record.id}  [{record.status}] {record.purpose}")
+        console.print(f"model={record.model_name} provider={record.provider_id} "
+                      f"started={record.started_at} finish={record.finish_reason}")
+        if record.error:
+            console.print(f"[red]error: {record.error}[/red]")
+
+        if bundle.usage:
+            u = bundle.usage
+            console.print(f"\n[bold]采信[/bold] in={u.in_tokens} out={u.out_tokens} "
+                          f"thinking={u.thinking_tokens} source={u.source} conf={u.confidence} "
+                          f"drift={u.drift_pct}")
+            console.print(f"[bold]延迟[/bold] ttft={_fmt(u.ttft_ms, 'ms')} prefill={u.prefill_mode} "
+                          f"({_fmt(u.prefill_ms_per_token, 'ms/tok')}) "
+                          f"prefill_tps={_fmt(u.prefill_tps)} decode_tps={_fmt(u.decode_tps)}")
+        alt_table = Table(title="各来源计数（对账）", pad_edge=False)
+        for column in ("source", "in", "out", "thinking", "cached", "ok", "note"):
+            alt_table.add_column(column)
+        for alt in bundle.alts:
+            alt_table.add_row(str(alt.source), str(alt.in_tokens), str(alt.out_tokens),
+                              str(alt.thinking_tokens), str(alt.cached_tokens),
+                              "✓" if alt.ok else "✗", alt.note[:40])
+        console.print(alt_table)
+
+        if bundle.parts:
+            part_table = Table(title="分段归因（Σ分段 + template_ctl = 引擎计数）", pad_edge=False)
+            for column in ("part", "tokens", "bytes"):
+                part_table.add_column(column)
+            for part in bundle.parts:
+                part_table.add_row(part.part, str(part.tokens), str(part.bytes if part.bytes else "—"))
+            console.print(part_table)
+
+        if calls:
+            call_table = Table(title="工具调用", pad_edge=False)
+            for column in ("step", "name", "parse", "args", "result", "ms"):
+                call_table.add_column(column)
+            for call in calls:
+                call_table.add_row(str(call.step), call.name or "—", call.parse_status,
+                                   (call.args_raw or str(call.args or ""))[:60],
+                                   call.result_status or "未执行", _fmt(call.latency_ms))
+            console.print(call_table)
+
+        if anomalies:
+            for item in anomalies:
+                color = {"error": "red", "warn": "yellow"}.get(item.severity, "dim")
+                console.print(f"[{color}]⚠ {item.code}[/{color}] {item.detail}")
+
+        console.print(f"\n[dim]messages={record.messages_ref}\noutput={record.output_ref}[/dim]")
+
+
+@traces_app.command("replay")
+def traces_replay(
+    trace_id: str = typer.Argument(...),
+    db: Path = typer.Option(None, "--db"),
+    dry_run: bool = typer.Option(True, "--dry-run/--send"),
+) -> None:
+    """从原始证据重建请求。默认只打印不发送——重放会真实占用 GPU。"""
+    import json as _json
+
+    from onyx.core.content import FileBlobStore
+    from onyx.store.repos import TraceRepo
+
+    settings = _settings()
+    with Database(_db_path(settings, db)) as database:
+        record = TraceRepo(database).get(trace_id)
+        if record is None:
+            typer.echo(f"trace 不存在: {trace_id}", err=True)
+            raise typer.Exit(1)
+        blobs = FileBlobStore(settings.blob_dir)
+        messages = blobs.get_json(record.messages_ref) if record.messages_ref else []
+        tools = blobs.get_json(record.tools_ref) if record.tools_ref else []
+    payload = {"model": record.model_name, "messages": messages, "params": record.params}
+    if tools:
+        payload["tools"] = tools
+    typer.echo(_json.dumps(payload, ensure_ascii=False, indent=2))
+    if dry_run:
+        typer.echo("[dry-run] 未发送。加 --send 才会真的打引擎。")
+
+
 def main() -> None:
     app()
 

@@ -212,6 +212,31 @@ def test_reconcile_detects_drift():
     assert codes["TOKEN_DRIFT"]["drift_pct"] == pytest.approx(0.4, abs=1e-3)
 
 
+def test_reconcile_ignores_small_absolute_drift():
+    """真机实测：19 token 的短 prompt 上启发式给 16，百分比 16% 纯噪声。
+
+    报警必须同时满足"相对偏差超阈值"和"绝对差够大"，否则每条短请求都告警，
+    真正的口径分裂反而被淹没（告警疲劳）。偏差值本身仍然记录，只是不报警。
+    """
+    samples = (
+        TokenSample(source=TokenSource.ENGINE, in_tokens=19),
+        TokenSample(source=TokenSource.HEURISTIC, in_tokens=16),
+    )
+    result = reconcile(samples)
+    assert "TOKEN_DRIFT" not in [c for c, _ in result.anomalies]
+    assert result.usage.drift_pct == pytest.approx(3 / 19, abs=1e-3)
+
+
+def test_reconcile_drift_fires_on_real_gap():
+    samples = (
+        TokenSample(source=TokenSource.ENGINE, in_tokens=301),
+        TokenSample(source=TokenSource.HEURISTIC, in_tokens=90),
+    )
+    result = reconcile(samples)
+    detail = dict(result.anomalies)["TOKEN_DRIFT"]
+    assert detail["abs_diff"] == 211
+
+
 def test_compat_is_never_chosen():
     """P14：兼容层与原生不一致 ⇒ 永不采信，哪怕它是唯一来源。"""
     result = reconcile((TokenSample(source=TokenSource.COMPAT, in_tokens=20),))

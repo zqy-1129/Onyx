@@ -166,6 +166,33 @@ def test_openai_usage_absent_without_include_usage():
     assert gen.text == "hi"
 
 
+def test_native_parallel_tool_calls_do_not_overwrite_each_other():
+    """回归：原生 tool_calls 不带 index，曾全部落到 0 号累加器只剩最后一个。"""
+    asm = StreamAssembler(style="native")
+    asm.feed(_native_chunk(tool_calls=[
+        {"function": {"name": "get_weather", "arguments": {"city": "北京"}}},
+        {"function": {"name": "get_weather", "arguments": {"city": "上海"}}},
+        {"function": {"name": "calc", "arguments": {"expr": "1+1"}}},
+    ]))
+    asm.feed(_native_final(done_reason="tool_calls"))
+    calls = asm.build().tool_calls
+    assert len(calls) == 3, f"并行调用被吞了: {[c.name for c in calls]}"
+    assert [c.index for c in calls] == [0, 1, 2]
+    assert {c.arguments["city"] for c in calls[:2]} == {"北京", "上海"}
+
+
+def test_openai_fragments_still_merge_by_index():
+    """OpenAI 风格带 index，同一 index 的分片必须合并而不是各成一个调用。"""
+    asm = StreamAssembler(style="openai")
+    for frag in ('{"ci', 'ty": "北京"}'):
+        asm.feed({"choices": [{"delta": {"tool_calls": [
+            {"index": 0, "function": {"name": "w", "arguments": frag}}]}}]})
+    asm.feed({"choices": [{"delta": {}, "finish_reason": "tool_calls"}]})
+    calls = asm.build().tool_calls
+    assert len(calls) == 1
+    assert calls[0].arguments == {"city": "北京"}
+
+
 def test_raw_chunk_count_recorded():
     asm = StreamAssembler(style="native")
     asm.feed(_native_chunk("a"))

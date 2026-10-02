@@ -142,6 +142,36 @@
 `wants_tool_call` 派生信号为 True。工具定义使该请求 `in` 从 ~20 涨到 **280** token
 （≈260 token 的工具 schema 开销，这正是 DESIGN §6.2 要量化的东西）。
 
+### P17 · 工具定义的上下文成本，大部分是**模板脚手架**而不是 JSON 本身 ⚠️
+真机跑通 gateway 后实测（`qwen3.5:9b`，一个 `get_weather` 工具）：
+
+| 项 | token |
+|---|---|
+| 引擎计数 `prompt_eval_count` | **301** |
+| 用户消息 `msg:0` | 12 |
+| 工具 JSON 文本 `tool_defs` | 78 |
+| **残差 `template_ctl`** | **213** |
+
+即：一个只有 78 token JSON 的工具，实际吃掉约 **291 token** 上下文，
+其中 **73% 是模板注入的说明性脚手架**（"You have access to the following functions…" 之类）。
+
+**影响（会直接误导优化决策）**：如果看板只报 `tool_defs=78`，
+用户会以为"精简工具描述能省下大头"，而实际上真正的大头是模板固定开销——
+**换模型/换模板比删描述有效得多**。所以 UI 必须把工具成本报成
+`tool_defs + 该请求的 template_ctl`，并注明后者是"每请求固定成本"。
+
+**同时暴露的口径要求**：`template_ctl` 残差是用当前档位的 count_fn 算出来的，
+本例是 heuristic（该模型没有可用 chat template，见 P9），所以 78/213 这个**拆分**是低置信的，
+但 301 这个**总量**来自引擎、是高置信的。UI 必须分别标注，不能整体打一个置信度。
+
+### P18 · 短 prompt 上的 drift 百分比是噪声，报警需要绝对差门槛 ✅
+同一次真机运行：19 token 的请求，启发式估 16 → drift 15.8% 超阈值报警。
+但 3 个 token 的差毫无意义。**报警条件改为「相对偏差 > 10% 且绝对差 ≥ 24 token」**，
+偏差值本身仍然记录（`usage.drift_pct`），只是不触发告警——否则告警疲劳会淹掉真正的口径分裂。
+
+另：19 token 时 `prefill_ms_per_token = 6.98`（≈143 t/s），远低于 644 token 时的 0.60 ms/token（1675 t/s）。
+**极短 prompt 的 prefill 吞吐没有意义**（固定开销占主导），UI 在 in_tokens 过小时应显示「—」而不是一个看起来很慢的数字。
+
 ---
 
 ## 3. 仍未定 / 待测

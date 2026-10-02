@@ -15,6 +15,7 @@ from .fidelity import (
     FittedCounter,
     HeuristicCounter,
     default_counters,
+    text_counter,
 )
 from .heuristic import estimate_tokens
 from .parts import AttributionReport, Segment, attribute, input_segments, part_totals
@@ -41,4 +42,5 @@ __all__ = [
     "part_totals",
     "prefill_mode",
     "reconcile",
+    "text_counter",
 ]

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Protocol, runtime_checkable
 
@@ -136,3 +137,22 @@ class HeuristicCounter:
 def default_counters() -> tuple[Counter, ...]:
     """默认阶梯。T1(hf_tokenizer)/T2(gguf_vocab) 在具备条件时由调用方插入。"""
     return (EngineCounter(), FittedCounter(), HeuristicCounter(), CompatCounter())
+
+
+def text_counter(ctx: CounterContext) -> Callable[[str], int] | None:
+    """返回"文本 → token 数"的函数，供分段归因使用。
+
+    精度取决于该模型当前具备哪一档能力：
+    - 有 tokenizer（T1/T2）⇒ 用它，归因可信度高
+    - 只有标定比值（T3）  ⇒ 按比值折算，medium
+    - 都没有              ⇒ 启发式，low
+    返回 None 表示连启发式都不可用（不会发生，但接口上允许）。
+    """
+    tokenizer = getattr(ctx, "tokenizer", None)
+    if tokenizer is not None and hasattr(tokenizer, "encode"):
+        return lambda text: len(tokenizer.encode(text))
+    if ctx.fitted_ratio and ctx.fitted_n >= 30:
+        ratio = ctx.fitted_ratio
+        return lambda text: round(len(text) * ratio)
+    cjk = ctx.cjk_tokens_per_char
+    return lambda text: estimate_tokens(text, cjk_tokens_per_char=cjk)

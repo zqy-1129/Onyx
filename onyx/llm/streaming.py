@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from dataclasses import dataclass, field
 from typing import Any
@@ -70,15 +71,18 @@ class StreamAssembler:
     _finish: FinishReason = FinishReason.UNKNOWN
     _usage: list[TokenSample] = field(default_factory=list)
     _latency: dict[str, int] = field(default_factory=dict)
-    _raw: list[dict[str, Any]] = field(default_factory=list)
+    _raw_count: int = 0
+    _last_raw: dict[str, Any] = field(default_factory=dict)
     _done: bool = False
     _error: str = ""
     _first_token_seen: bool = False
+    _auto_index: int = 0
 
     # ── 喂入 ──────────────────────────────────────────────────────
     def feed(self, chunk: dict[str, Any]) -> bool:
         """处理一个 chunk；返回 True 表示这是首个内容分片（用于 TTFT）。"""
-        self._raw.append(chunk)
+        self._raw_count += 1
+        self._last_raw = chunk
         if self.style == "openai":
             self._feed_openai(chunk)
         else:
@@ -149,7 +153,14 @@ class StreamAssembler:
             self._done = True
 
     def _absorb_tool_call(self, raw: dict[str, Any], *, style: str) -> None:
-        index = int(raw.get("index") or 0)
+        # OpenAI 风格用 index 标识分片归属；原生风格的 tool_calls 不带 index，
+        # 若一律落到 0 号累加器，**并行工具调用会互相覆盖**（只剩最后一个）。
+        raw_index = raw.get("index")
+        if raw_index is None:
+            index = self._auto_index
+            self._auto_index += 1
+        else:
+            index = int(raw_index)
         acc = self._tools.setdefault(index, _ToolAcc(index=index))
         if raw.get("id"):
             acc.id = str(raw["id"])
@@ -191,7 +202,7 @@ class StreamAssembler:
             usage=tuple(self._usage),
             latency=self._build_latency(),
             model=model or self.model,
-            extra={"raw_chunks": len(self._raw), "style": self.style, "saw_done": self._done},
+            extra={"raw_chunks": self._raw_count, "style": self.style, "saw_done": self._done},
         )
 
     def _build_tool_call(self, acc: _ToolAcc) -> ToolCall:
@@ -238,8 +249,9 @@ class StreamAssembler:
             eval_ns=self._latency.get("eval_duration"),
         )
 
-    def raw_chunks(self) -> list[dict[str, Any]]:
-        return list(self._raw)
+    @property
+    def last_raw(self) -> dict[str, Any]:
+        return self._last_raw
 
 
 def _looks_truncated(raw: str, exc: json.JSONDecodeError) -> bool:
@@ -252,3 +264,126 @@ def _looks_truncated(raw: str, exc: json.JSONDecodeError) -> bool:
 
 def _int_or_none(value: Any) -> int | None:
     return int(value) if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+# ── chunk 流 → Generation + 事件 ───────────────────────────────────
+# 真实适配器与 MockProvider 共用这一段：mock 只有在"产出同样的事件"时，
+# 用它测出来的观测管道才等价于真实管道。
+def emit_final_events(
+    gen: Generation,
+    raw: dict[str, Any],
+    *,
+    trace_id: str,
+    clock: Any,
+    on_event: Any = None,
+    ttft_ms: float | None = None,
+) -> None:
+    from onyx.core.event import EventType, make_event
+    from onyx.llm.providers.base import emit
+
+    if gen.latency and gen.latency.load_ns:
+        emit(on_event, make_event(
+            EventType.MODEL_LOAD, trace_id,
+            {"cold": gen.latency.is_cold, "load_duration_ns": gen.latency.load_ns, "model": gen.model},
+            clock=clock,
+        ))
+    if ttft_ms is None and gen.latency and gen.latency.prompt_eval_ns:
+        # 非流式没有真实 TTFT：用 prompt_eval 时长做代理，并显式标注这是代理值
+        ttft_ms = gen.latency.prompt_eval_ns / 1e6
+        emit(on_event, make_event(
+            EventType.FIRST_TOKEN, trace_id,
+            {"ttft_ms": ttft_ms, "proxy": "prompt_eval_duration"}, clock=clock,
+        ))
+    elif ttft_ms is not None:
+        emit(on_event, make_event(EventType.FIRST_TOKEN, trace_id, {"ttft_ms": ttft_ms}, clock=clock))
+
+    engine = gen.usage_from(TokenSource.ENGINE)
+    if engine is not None:
+        emit(on_event, make_event(
+            EventType.USAGE_ENGINE, trace_id,
+            {
+                "in_tokens": engine.in_tokens, "out_tokens": engine.out_tokens,
+                "thinking_tokens": engine.thinking_tokens, "cached_tokens": engine.cached_tokens,
+                "ok": engine.ok, "note": engine.note,
+                "latency_ns": {
+                    "total": gen.latency.total_ns if gen.latency else None,
+                    "load": gen.latency.load_ns if gen.latency else None,
+                    "prompt_eval": gen.latency.prompt_eval_ns if gen.latency else None,
+                    "eval": gen.latency.eval_ns if gen.latency else None,
+                },
+                "raw_keys": sorted(k for k in raw if k.endswith(("_count", "_duration"))),
+            },
+            clock=clock,
+        ))
+    emit(on_event, make_event(
+        EventType.GENERATION_END, trace_id,
+        {
+            "finish_reason": str(gen.finish_reason), "done_reason": raw.get("done_reason"),
+            "text_chars": len(gen.text), "thinking_chars": len(gen.thinking),
+            "tool_calls": [
+                {
+                    "step": c.index + 1, "name": c.name, "call_id": c.id, "args": c.arguments,
+                    "args_raw": c.arguments_raw, "parse_status": str(c.parse_status),
+                    "parse_source": c.parse_source,
+                }
+                for c in gen.tool_calls
+            ],
+        },
+        clock=clock,
+    ))
+
+
+def consume_chunks(
+    chunks: Any,
+    *,
+    trace_id: str,
+    clock: Any,
+    style: str = "native",
+    model: str = "",
+    on_event: Any = None,
+) -> Generation:
+    """消费 ndjson chunk 流，边缝合边发事件，返回最终 Generation。"""
+    from onyx.core.event import EventType, make_event
+    from onyx.llm.providers.base import emit
+
+    assembler = StreamAssembler(style=style, model=model)
+    start = clock.monotonic_ns()
+    ttft_ms: float | None = None
+    seq = 0
+    last_raw: dict[str, Any] = {}
+    for chunk in chunks:
+        last_raw = chunk
+        if chunk.get("_unparsed"):
+            emit(on_event, make_event(
+                EventType.ANOMALY, trace_id,
+                {"code": "UNPARSED_STREAM_LINE", "severity": "warn",
+                 "detail": {"line": str(chunk["_unparsed"])[:500]}},
+                clock=clock,
+            ))
+            continue
+        if assembler.feed(chunk) and ttft_ms is None:
+            ttft_ms = (clock.monotonic_ns() - start) / 1e6
+        message = chunk.get("message") or (chunk.get("choices") or [{}])[0].get("delta") or {}
+        if text := message.get("content"):
+            emit(on_event, make_event(
+                EventType.TEXT_DELTA, trace_id, {"seq": seq, "text": str(text)}, clock=clock))
+            seq += 1
+        if thinking := message.get("thinking") or message.get("reasoning_content"):
+            emit(on_event, make_event(
+                EventType.THINKING_DELTA, trace_id, {"seq": seq, "text": str(thinking)}, clock=clock))
+            seq += 1
+        for idx, raw_call in enumerate(message.get("tool_calls") or []):
+            function = raw_call.get("function") or {}
+            emit(on_event, make_event(
+                EventType.TOOL_CALL_DELTA, trace_id,
+                {"idx": idx, "name_fragment": function.get("name", ""),
+                 "args_fragment": function.get("arguments")},
+                clock=clock,
+            ))
+    gen = dataclasses.replace(
+        assembler.build(model=model, status=Status.OK),
+        ttft_ms=ttft_ms,
+        wall_ms=(clock.monotonic_ns() - start) / 1e6,
+    )
+    emit_final_events(gen, last_raw, trace_id=trace_id, clock=clock, on_event=on_event, ttft_ms=ttft_ms)
+    return gen

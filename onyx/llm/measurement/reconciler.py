@@ -22,6 +22,9 @@ from onyx.core.types import (
 )
 
 DEFAULT_DRIFT_THRESHOLD = 0.10
+#: 短 prompt 上百分比全是噪声（16 vs 19 就是 16%），会淹掉真正的口径分裂。
+#: 只有绝对差也超过这个门槛才报警 —— 否则告警疲劳会让真问题被忽略。
+DEFAULT_DRIFT_MIN_TOKENS = 24
 
 _CONFIDENCE_BY_SOURCE: dict[TokenSource, Confidence] = {
     TokenSource.ENGINE: Confidence.HIGH,
@@ -53,6 +56,7 @@ def reconcile(
     samples: Sequence[TokenSample],
     *,
     drift_threshold: float = DEFAULT_DRIFT_THRESHOLD,
+    drift_min_tokens: int = DEFAULT_DRIFT_MIN_TOKENS,
     parts: Sequence[Any] = (),
 ) -> ReconcileResult:
     ok_samples = [s for s in samples if s.ok and s.in_tokens is not None]
@@ -81,11 +85,14 @@ def reconcile(
     if chosen.confidence and _rank(chosen.confidence) > _rank(confidence):
         confidence = chosen.confidence  # Counter 可以主动降级（例如 fitted 样本不足）
 
-    drift = _drift(chosen, by_source)
-    if drift is not None and drift > drift_threshold:
+    drift_info = _drift(chosen, by_source)
+    drift = drift_info[0] if drift_info else None
+    abs_diff = drift_info[1] if drift_info else 0
+    if drift is not None and drift > drift_threshold and abs_diff >= drift_min_tokens:
         anomalies.append(("TOKEN_DRIFT", {
             "chosen_source": str(chosen.source), "chosen_in": chosen.in_tokens,
-            "drift_pct": round(drift, 4), "threshold": drift_threshold,
+            "drift_pct": round(drift, 4), "abs_diff": abs_diff, "threshold": drift_threshold,
+            "min_tokens": drift_min_tokens,
         }))
     if confidence is Confidence.LOW:
         anomalies.append(("LOW_CONFIDENCE_USAGE", {"source": str(chosen.source)}))
@@ -119,15 +126,16 @@ def reconcile(
     )
 
 
-def _drift(chosen: TokenSample, by_source: dict[TokenSource, TokenSample]) -> float | None:
-    """采信值与最优独立复算值的相对偏差。没有独立来源就返回 None（不猜）。"""
+def _drift(chosen: TokenSample, by_source: dict[TokenSource, TokenSample]) -> tuple[float, int] | None:
+    """采信值与最优独立复算值的 (相对偏差, 绝对差)。没有独立来源就返回 None（不猜）。"""
     for source in _ATTRIBUTION_SOURCES:
         other = by_source.get(source)
         if other is None or other is chosen or not other.in_tokens:
             continue
         if not chosen.in_tokens:
             return None
-        return abs(chosen.in_tokens - other.in_tokens) / chosen.in_tokens
+        abs_diff = abs(chosen.in_tokens - other.in_tokens)
+        return abs_diff / chosen.in_tokens, abs_diff
     return None
 
 

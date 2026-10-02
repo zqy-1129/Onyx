@@ -31,6 +31,7 @@ class EventType(StrEnum):
     USAGE_ENGINE = "usage_engine"
     USAGE_COMPAT = "usage_compat"
     USAGE_LOCAL = "usage_local"
+    USAGE_ATTRIBUTION = "usage_attribution"
     RECONCILED = "reconciled"
     TOOL_EXEC_START = "tool_exec_start"
     TOOL_EXEC_END = "tool_exec_end"
@@ -52,6 +53,7 @@ PAYLOAD_REQUIRED: dict[EventType, frozenset[str]] = {
     EventType.USAGE_ENGINE: frozenset(),  # 计数可能全缺（引擎没报），缺即是信息
     EventType.USAGE_COMPAT: frozenset(),
     EventType.USAGE_LOCAL: frozenset({"source"}),
+    EventType.USAGE_ATTRIBUTION: frozenset(),
     EventType.RECONCILED: frozenset({"chosen_source", "confidence"}),
     EventType.TOOL_EXEC_START: frozenset({"name", "step"}),
     EventType.TOOL_EXEC_END: frozenset({"name", "step", "status"}),
@@ -73,7 +75,9 @@ PAYLOAD_OPTIONAL: dict[EventType, frozenset[str]] = {
         {"in_tokens", "out_tokens", "thinking_tokens", "cached_tokens", "latency_ns"}
     ),
     EventType.USAGE_COMPAT: frozenset({"in_tokens", "out_tokens", "total_tokens"}),
-    EventType.USAGE_LOCAL: frozenset({"in_tokens", "out_tokens", "tool_defs_tokens", "parts", "confidence"}),
+    EventType.USAGE_LOCAL: frozenset({"in_tokens", "out_tokens", "thinking_tokens", "cached_tokens",
+                                      "confidence", "ok", "note"}),
+    EventType.USAGE_ATTRIBUTION: frozenset({"parts", "attribution", "count_source"}),
     EventType.RECONCILED: frozenset({"in_tokens", "out_tokens", "drift_pct", "alts"}),
     EventType.TOOL_EXEC_START: frozenset({"args_ref", "tool_id", "executed_by"}),
     EventType.TOOL_EXEC_END: frozenset(
