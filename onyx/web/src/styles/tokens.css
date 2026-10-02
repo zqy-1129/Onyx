@@ -1,0 +1,100 @@
+/* Onyx 设计 token —— 见 docs/UI_DESIGN.md §2
+   改这里就是改设计系统；组件里不许出现裸颜色值。 */
+
+:root,
+.onyx-theme-dark {
+  /* 背景三层：越靠前越亮，层级差刻意压小（大屏看板不该有强对比块） */
+  --bg-base: #0b0e14;
+  --bg-panel: #11151d;
+  --bg-elevated: #171c26;
+  --bg-inset: #0e1219;
+  --border: #1f2733;
+  --border-strong: #2c3644;
+
+  --text-primary: #e6e9ef;
+  --text-secondary: #9aa4b2;
+  --text-muted: #626c7a;
+
+  --ok: #3fb950;
+  --ok-dim: #1f3a28;
+  --warn: #d29922;
+  --warn-dim: #3a2f14;
+  --error: #f85149;
+  --error-dim: #3e1d1c;
+  --info: #58a6ff;
+  --info-dim: #16283d;
+  --accent: #a371f7;
+  --accent-dim: #2a1f3d;
+
+  /* 计量出处（R1）：不同来源不同底色，一眼能分辨数字可不可信 */
+  --src-engine: #3fb950;
+  --src-hf: #58a6ff;
+  --src-gguf: #58a6ff;
+  --src-fitted: #d29922;
+  --src-heuristic: #626c7a;
+  --src-compat: #a371f7;
+
+  /* prefill 冷/热（R3）：必须同屏可辨，且不能只靠颜色（R4） */
+  --cold: #58a6ff;
+  --warm: #f0883e;
+
+  --font-ui: Inter, system-ui, -apple-system, 'Segoe UI', 'PingFang SC',
+    'Microsoft YaHei', sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, 'Cascadia Mono', Consolas,
+    'Courier New', monospace;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-6: 24px;
+
+  --radius-panel: 4px;
+  --radius-chip: 3px;
+
+  --row-h: 28px; /* 表格行高：数据密度的核心参数 */
+  --panel-title-h: 32px;
+  --rail-w: 56px;
+  --rail-w-expanded: 200px;
+  --topbar-h: 48px;
+
+  --fs-xs: 11px;
+  --fs-sm: 12px;
+  --fs-md: 13px;
+  --fs-lg: 15px;
+  --fs-xl: 20px;
+  --fs-2xl: 26px;
+
+  --dur-fast: 90ms;
+  --dur-base: 150ms; /* R: 动画不超过 150ms，否则会掩盖数据变化 */
+}
+
+.onyx-theme-light {
+  --bg-base: #f6f7f9;
+  --bg-panel: #ffffff;
+  --bg-elevated: #f0f2f5;
+  --bg-inset: #f7f8fa;
+  --border: #dfe3e8;
+  --border-strong: #c6ccd4;
+  --text-primary: #14181f;
+  --text-secondary: #4c5561;
+  --text-muted: #7c8794;
+  --ok: #1a7f37;
+  --warn: #9a6700;
+  --error: #cf222e;
+  --info: #0969da;
+  --accent: #8250df;
+  --ok-dim: #dafbe1;
+  --warn-dim: #fff8c5;
+  --error-dim: #ffebe9;
+  --info-dim: #ddf4ff;
+  --accent-dim: #fbefff;
+  --src-engine: #1a7f37;
+  --src-fitted: #9a6700;
+  --src-heuristic: #7c8794;
+  --src-compat: #8250df;
+  --src-hf: #0969da;
+  --src-gguf: #0969da;
+  --cold: #0969da;
+  --warm: #bc4c00;
+}

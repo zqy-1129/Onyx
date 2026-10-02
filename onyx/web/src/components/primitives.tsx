@@ -1,0 +1,228 @@
+/** 设计系统基元。见 docs/UI_DESIGN.md §4。
+ *  规则：R1 数字必须带出处 · R2 未知显示「—」 · R4 色+符号+文字三重编码 · R5 红只表示错误 */
+import type { ReactNode } from 'react'
+import { UNKNOWN } from '../format'
+import type { AnomalyView, Confidence, PrefillMode } from '../api/types'
+
+/* ── Panel ─────────────────────────────────────────────── */
+export function Panel({
+  title,
+  note,
+  actions,
+  children,
+  flush,
+  className = '',
+}: {
+  title: ReactNode
+  note?: ReactNode
+  actions?: ReactNode
+  children: ReactNode
+  flush?: boolean
+  className?: string
+}) {
+  return (
+    <section className={`panel ${className}`}>
+      <header className="panel-head">
+        <span className="panel-title">{title}</span>
+        {/* 口径说明常驻标题栏：面板必须自述"这个数字怎么来的" */}
+        {note ? <span className="panel-note">{note}</span> : null}
+        <span className="panel-head-spacer" />
+        {actions}
+      </header>
+      <div className={`panel-body${flush ? ' flush' : ''}`}>{children}</div>
+    </section>
+  )
+}
+
+/* ── StatCard ──────────────────────────────────────────── */
+export function StatCard({
+  label,
+  value,
+  unit,
+  sub,
+  badge,
+  unknown,
+}: {
+  label: string
+  value: ReactNode
+  unit?: string
+  sub?: ReactNode
+  badge?: ReactNode
+  /** true ⇒ 明确表达"没测出来"，值渲染为「—」并置灰（R2） */
+  unknown?: boolean
+}) {
+  return (
+    <div className="stat">
+      <div className="stat-label" title={label}>{label}</div>
+      <div className={`stat-value num${unknown ? ' is-unknown' : ''}`}>
+        {unknown ? UNKNOWN : value}
+        {unit && !unknown ? <span className="stat-unit">{unit}</span> : null}
+      </div>
+      <div className="stat-foot">
+        {sub ? <span className="stat-sub">{sub}</span> : null}
+        {badge}
+      </div>
+    </div>
+  )
+}
+
+/* ── 出处与置信度（R1）────────────────────────────────── */
+export function ConfidenceDot({ level }: { level: Confidence | string | null }) {
+  const normalized = (level ?? 'low') as string
+  const label = { high: '高置信', medium: '中等置信', low: '低置信（估计值）' }[normalized] ?? normalized
+  return <span className={`conf-dot conf-${normalized}`} title={`置信度：${label}`} aria-label={label} />
+}
+
+export function SourceBadge({
+  source,
+  confidence,
+  note,
+}: {
+  source: string | null
+  confidence?: Confidence | string | null
+  note?: string
+}) {
+  if (!source) {
+    // 没有出处的数字不上看板（R1）——这里明确显示"无来源"而不是留白
+    return <span className="badge badge-unknown" title="该数字没有计量来源">no source</span>
+  }
+  const conf = (confidence ?? 'low') as string
+  const tip = [
+    `计量来源：${source}`,
+    `置信度：${conf}`,
+    note ? `说明：${note}` : '',
+    conf === 'low' ? '低置信度：估计值，不可用于计费或容量决策' : '',
+  ]
+    .filter(Boolean)
+    .join('\n')
+  return (
+    <span className={conf === 'low' ? 'conf-low-wrap' : undefined} title={tip}>
+      <span className={`badge badge-src-${source}`}>
+        <ConfidenceDot level={conf} />
+        {source}
+      </span>
+    </span>
+  )
+}
+
+/* ── prefill 冷/热（R3）───────────────────────────────── */
+export function PrefillTag({ mode, msPerToken }: { mode: PrefillMode | string | null; msPerToken?: number | null }) {
+  const normalized = (mode ?? 'unknown') as string
+  const symbol = { cold: '❄', warm: '♨', unknown: '?' }[normalized] ?? '?'
+  const tip =
+    normalized === 'warm'
+      ? 'KV 缓存命中：prefill 吞吐是等效值而非真实计算吞吐，实测比冷启动高约 4.65 倍，不可与 cold 合并聚合'
+      : normalized === 'cold'
+        ? '冷 prefill：完整计算了 prompt'
+        : '无法判定冷/热（缺少 in_tokens 或 prompt_eval 时长）'
+  return (
+    <span
+      className={`badge badge-${normalized}`}
+      title={msPerToken ? `${tip}\n${msPerToken.toFixed(3)} ms/token` : tip}
+    >
+      {symbol} {normalized}
+    </span>
+  )
+}
+
+/* ── 严重度 / 状态 ─────────────────────────────────────── */
+export function SeverityBadge({ severity, children }: { severity: string; children?: ReactNode }) {
+  const symbol = { error: '✕', warn: '!', info: 'i' }[severity] ?? '?'
+  return <span className={`badge badge-${severity}`}>{symbol} {children}</span>
+}
+
+export function StatusBadge({ status }: { status: string }) {
+  const map: Record<string, string> = { ok: 'ok', error: 'error', timeout: 'warn', cancelled: 'neutral' }
+  const symbol = { ok: '✓', error: '✕', timeout: '⏱', cancelled: '⊘' }[status] ?? '?'
+  return <span className={`badge badge-${map[status] ?? 'neutral'}`}>{symbol} {status}</span>
+}
+
+export function AnomalyChip({ anomaly }: { anomaly: AnomalyView }) {
+  const tip = [anomaly.meaning, anomaly.action ? `处置：${anomaly.action}` : '']
+    .filter(Boolean)
+    .join('\n')
+  return (
+    <span title={tip}>
+      <SeverityBadge severity={anomaly.severity}>{anomaly.code}</SeverityBadge>
+    </span>
+  )
+}
+
+/* ── 能力位三态（✗ 与 ? 必须可区分）────────────────────── */
+export function CapSymbol({ state, cap, reason }: { state: string; cap: string; reason?: string }) {
+  const symbol = { confirmed: '✓', missing: '✗', unknown: '?' }[state] ?? '?'
+  const label = { confirmed: '确认支持', missing: '确认不支持（评测应 skip）', unknown: '未实测（≠不支持，先跑探针）' }[
+    state
+  ] ?? state
+  return (
+    <span className={`cap cap-${state}`} title={`${cap}: ${label}${reason ? `\n依据：${reason}` : ''}`}>
+      {symbol}
+    </span>
+  )
+}
+
+export function StatusDot({ ok }: { ok: boolean }) {
+  return <span className={`status-dot ${ok ? 'status-ok' : 'status-err'}`} title={ok ? '可达' : '不可达'} />
+}
+
+/* ── 空态 / 骨架 ───────────────────────────────────────── */
+export function EmptyState({ title, hint, children }: { title: string; hint?: string; children?: ReactNode }) {
+  return (
+    <div className="empty">
+      <div className="empty-title">{title}</div>
+      {children}
+      {hint ? <div className="empty-hint">{hint}</div> : null}
+    </div>
+  )
+}
+
+export function Skeleton({ rows = 3 }: { rows?: number }) {
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+      {Array.from({ length: rows }, (_, i) => (
+        <div key={i} className="skeleton" style={{ width: `${70 + ((i * 13) % 30)}%` }} />
+      ))}
+    </div>
+  )
+}
+
+export function ErrorState({ error }: { error: unknown }) {
+  const err = error as { code?: string; message?: string; detail?: { hint?: string } }
+  return (
+    <div className="empty">
+      <div className="empty-title" style={{ color: 'var(--error)' }}>
+        ✕ {err?.message ?? String(error)}
+      </div>
+      {err?.code ? <div className="empty-hint">code: {err.code}</div> : null}
+      {err?.detail?.hint ? <div className="empty-hint">{err.detail.hint}</div> : null}
+    </div>
+  )
+}
+
+/* ── Sparkline：纯 SVG，无图表库 ───────────────────────── */
+export function Sparkline({
+  values,
+  width = 96,
+  height = 20,
+  color = 'var(--info)',
+}: {
+  values: number[]
+  width?: number
+  height?: number
+  color?: string
+}) {
+  const points = values.filter((v) => Number.isFinite(v))
+  if (points.length < 2) return <span className="muted small">{UNKNOWN}</span>
+  const max = Math.max(...points)
+  const min = Math.min(...points)
+  const span = max - min || 1
+  const step = width / (points.length - 1)
+  const path = points
+    .map((v, i) => `${i === 0 ? 'M' : 'L'}${(i * step).toFixed(1)},${(height - ((v - min) / span) * height).toFixed(1)}`)
+    .join(' ')
+  return (
+    <svg width={width} height={height} role="img" aria-label="趋势">
+      <path d={path} fill="none" stroke={color} strokeWidth={1.5} />
+    </svg>
+  )
+}

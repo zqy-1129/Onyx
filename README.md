@@ -34,7 +34,7 @@ uv run onyx db init         # 初始化 .data/onyx.sqlite
 |---|---|---|
 | M0 环境 | ✅ | uv + Python 3.12 + git（Ollama 0.35.0 / Node 24 已就绪） |
 | M1 计量 | ✅ | `core/` 领域层 · `store/` 存储层 · Ollama 适配器 · token 保真阶梯与双特征标定 · gateway 单一咽喉点 · 观测引擎与 visitors · 能力矩阵 · CLI（chat / traces / models / probe / calibrate / doctor） |
-| M2 看板 | ⬜ | REST + SSE + React 看板（Grafana / Datadog 风格） |
+| M2 看板 | 🚧 S8 完成 · S9 进行中 | REST + SSE 已就绪；看板已实现 Fleet / Models / Traces / TraceDetail 四页并在浏览器实测通过，Playground 与 Token Ledger 页待补 |
 | M3 工具 | ⬜ | 注册表 / 执行器 / 契约测试 / 工具循环 |
 | M4 评测 | ⬜ | 评测内核 / 意图识别 / 工具调用 |
 | M5 对比 | ⬜ | 矩阵、回归 diff、报告导出 |
@@ -46,7 +46,23 @@ source=engine，confidence=high）、分段归因（`msg:0=8 + template_ctl=11 =
 
 实测结论见 [`docs/PROBES.md`](docs/PROBES.md)（P1–P21，每条带证据与引擎版本）。
 
-下一步（S8–S9）：REST + SSE + React 看板，设计语言对标 Grafana / Datadog。
+下一步（S9 收尾）：Playground 页（多模型并排、thinking 分栏、工具面板、SSE 实时增量）与 Token Ledger 页。
+
+## 前端
+
+设计语言见 [`docs/UI_DESIGN.md`](docs/UI_DESIGN.md)（对标 Grafana / Datadog）。七条硬规则里最关键的两条：
+**R1 每个数字必须带出处徽标**（`engine/high` 与 `heuristic/low` 的 1842 是两个完全不同的东西）、
+**R2 未知显示「—」绝不显示 0**（0 是测量值，「没测出来」不是）。
+
+```bash
+cd onyx/web && npm install
+npm run dev        # http://localhost:5173（/api 代理到后端，默认 8787）
+npm run test       # vitest：格式化与徽标语义
+npm run build      # tsc + vite build
+```
+技术选型：Vite + React + TS + **手写 CSS 设计 token**，不引 Tailwind / 组件库 / 图表库。
+高密度看板的价值在像素级控制（28px 行高、tabular-nums、1px 分隔线），
+而图表形态固定，手写 SVG 比引 400KB 图表库更可控。产物 172KB JS / 12KB CSS。
 
 ## 目录
 
