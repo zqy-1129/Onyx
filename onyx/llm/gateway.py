@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -62,6 +63,7 @@ class Gateway:
         blobs: BlobStore,
         counters: tuple[Counter, ...] | None = None,
         counter_ctx: CounterContext | None = None,
+        counter_ctx_factory: Callable[[str], CounterContext] | None = None,
         clock: Clock = SYSTEM_CLOCK,
         event_sink: EventCB | None = None,
         sample_gpu: bool = False,
@@ -72,10 +74,20 @@ class Gateway:
         self.blobs = blobs
         self.counters: tuple[Counter, ...] = counters if counters is not None else default_counters()
         self.counter_ctx = counter_ctx or CounterContext()
+        #: 按模型取标定参数（每个模型的 tokens/char 不同）。缺省则用全局 counter_ctx。
+        self.counter_ctx_factory = counter_ctx_factory
         self.clock = clock
         self.event_sink = event_sink
         self.sample_gpu = sample_gpu
         self.model_id = model_id
+
+    def _ctx_for(self, model: str) -> CounterContext:
+        if self.counter_ctx_factory is None:
+            return self.counter_ctx
+        try:
+            return self.counter_ctx_factory(model) or self.counter_ctx
+        except Exception:  # noqa: BLE001 - 取标定失败退回全局配置，不许让请求失败
+            return self.counter_ctx
 
     # ── 主入口 ────────────────────────────────────────────────────
     def generate(
@@ -147,10 +159,11 @@ class Gateway:
 
     # ── 内部 ──────────────────────────────────────────────────────
     def _measure(self, req: GenerationRequest, gen: Generation, tid: str) -> list[TokenSample]:
+        ctx = self._ctx_for(req.model)
         samples: list[TokenSample] = []
         for counter in self.counters:
             try:
-                sample = counter.count(req, gen, self.counter_ctx)
+                sample = counter.count(req, gen, ctx)
             except Exception as exc:  # noqa: BLE001 - 计量档位失败只降级，不许打断请求
                 sample = TokenSample(
                     source=counter.name, ok=False, note=f"{type(exc).__name__}: {exc}"[:200]
@@ -163,15 +176,15 @@ class Gateway:
             self._emit_usage_local(tid, sample)
 
         engine = gen.usage_from(TokenSource.ENGINE)
-        count_fn = text_counter(self.counter_ctx)
+        count_fn = text_counter(ctx)
         if count_fn is not None:
             parts, report = attribute(
                 req, count_fn=count_fn, engine_in=engine.in_tokens if engine else None,
-                has_template=bool(self.counter_ctx.chat_template), gen_text=gen.text + gen.thinking,
+                has_template=bool(ctx.chat_template), gen_text=gen.text + gen.thinking,
             )
             if parts:
                 self._emit(make_event(EventType.USAGE_ATTRIBUTION, tid, {
-                    "count_source": _attribution_source(self.counter_ctx),
+                    "count_source": _attribution_source(ctx),
                     "parts": [
                         {"part": p.part, "ord": p.ord, "tokens": p.tokens, "bytes": p.bytes}
                         for p in parts

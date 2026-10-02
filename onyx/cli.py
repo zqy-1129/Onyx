@@ -552,6 +552,187 @@ def traces_replay(
         typer.echo("[dry-run] 未发送。加 --send 才会真的打引擎。")
 
 
+@probe_app.command("matrix")
+def probe_matrix(
+    url: str = typer.Option("http://127.0.0.1:11434", "--url"),
+    db: Path = typer.Option(None, "--db"),
+    markdown: Path = typer.Option(None, "--markdown", help="把矩阵追加到该 markdown 文件"),
+) -> None:
+    """逐模型输出能力矩阵：✓ 确认 / ✗ 不支持 / ? 未实测（三者必须可区分）。"""
+    from onyx.llm.caps import CapReport, infer_caps
+    from onyx.probe.report import MatrixRow, render_console, render_markdown
+    from onyx.runtime import sync_models
+    from onyx.store.repos import ModelRepo
+
+    runtime = _runtime(url, db, sample_gpu=False)
+    try:
+        sync_models(runtime)
+        info = runtime.provider.info()
+        repo = ModelRepo(runtime.db)
+        loaded = {m.name: m for m in runtime.provider.running()}
+        rows: list[MatrixRow] = []
+        for card in runtime.provider.list_models():
+            record = repo.find_by_name(info.id, card.name)
+            findings = (record.probe if record else {}) or {}
+            caps = CapReport.from_dict(record.extra.get("caps") if record else None) \
+                if record and record.extra.get("caps") else \
+                infer_caps(engine_capabilities=card.capabilities, probe_findings=findings,
+                           api_style=info.api_style, provider_kind=info.kind)
+            live = loaded.get(card.name)
+            rows.append(MatrixRow(
+                name=card.name, caps=caps, parameter_size=card.parameter_size,
+                quantization=card.quantization, size_gb=card.size_gb,
+                tool_format=(record.tool_format if record else "unknown"),
+                ctx_train=card.context_length, ctx_loaded=live.context_length if live else None,
+                probed=bool(findings),
+                usage_ratio=record.usage_ratio if record else None,
+                usage_ratio_n=record.usage_ratio_n or 0 if record else 0,
+            ))
+        render_console(rows, provider_version=info.version, provider_id=info.id)
+        if markdown:
+            text = render_markdown(rows, provider_version=info.version, provider_id=info.id)
+            existing = markdown.read_text(encoding="utf-8") if markdown.exists() else ""
+            markdown.write_text(existing.rstrip() + "\n\n" + text, encoding="utf-8")
+            typer.echo(f"已追加到 {markdown}")
+    finally:
+        runtime.close()
+
+
+@probe_app.command("write-back")
+def probe_write_back(
+    model: str = typer.Option(..., "--model"),
+    suite: str = typer.Option("all", "--suite"),
+    url: str = typer.Option("http://127.0.0.1:11434", "--url"),
+    db: Path = typer.Option(None, "--db"),
+) -> None:
+    """跑探针并把结论回灌到模型档案（tool_format / capabilities / 三态能力位）。"""
+    from onyx.llm.caps import infer_caps
+    from onyx.probe import registered_probes, run_suite
+    from onyx.runtime import sync_models
+    from onyx.store.repos import ModelRepo
+
+    runtime = _runtime(url, db, sample_gpu=False)
+    try:
+        sync_models(runtime)
+        info = runtime.provider.info()
+        names = registered_probes() if suite == "all" else [s.strip() for s in suite.split(",") if s]
+        report, _ = run_suite(runtime.provider, model, names, provider_version=info.version)
+        findings = {f.probe: f.verdict for f in report.findings}
+        card = next((c for c in runtime.provider.list_models() if c.name == model), None)
+        caps = infer_caps(
+            engine_capabilities=card.capabilities if card else (),
+            probe_findings=findings, api_style=info.api_style, provider_kind=info.kind,
+        )
+        repo = ModelRepo(runtime.db)
+        record = repo.find_by_name(info.id, model)
+        if record is None:
+            typer.echo(f"模型未落库: {model}", err=True)
+            raise typer.Exit(1)
+        tool_format = findings.get("tool_format", "unknown").split("_")[0]
+        repo.update_model(
+            record.id,
+            probe_json=findings,
+            tool_format=tool_format if tool_format in {"native", "xml", "json", "chat"} else "unknown",
+            capabilities_json=list(caps.confirmed | caps.missing | caps.unknown),
+            extra_json={**record.extra, "caps": caps.as_dict(),
+                        "probe_version": info.version},
+        )
+        runtime.flush()
+        typer.echo(f"已回灌 {model}: tool_format={tool_format}")
+        for name, verdict in findings.items():
+            typer.echo(f"  {name:<16} {verdict}")
+        typer.echo(f"  能力位 ✓{len(caps.confirmed)} ✗{len(caps.missing)} ?{len(caps.unknown)}")
+    finally:
+        runtime.close()
+
+
+# ── calibrate ──────────────────────────────────────────────────────
+@app.command()
+def calibrate(
+    model: str = typer.Option(..., "--model"),
+    n: int = typer.Option(40, "--n", help="样本数（不同长度的 prompt）"),
+    url: str = typer.Option("http://127.0.0.1:11434", "--url"),
+    db: Path = typer.Option(None, "--db"),
+    write: bool = typer.Option(True, "--write/--no-write", help="把标定结果写回模型档案"),
+) -> None:
+    """标定该模型的 tokens/char 比值与模板固定开销（fitted 档）。
+
+    用引擎自报的 `prompt_eval_count` 作真值反推——这样即使模型没有可用的
+    chat template（PROBES P9：3 个模型里 2 个没有），也能把估计误差压到个位数百分比。
+    """
+    from onyx.core.types import GenerationRequest, GenParams, TokenSource
+    from onyx.llm.measurement.calibrate import CalibrationSample, fit_by_script
+    from onyx.runtime import sync_models
+    from onyx.store.repos import ModelRepo
+
+    # 中英文交替拼接：**任何长度的前缀都保持相同的语系比例**。
+    # 若把中文段与英文段分开排布，按长度截断就会让短样本几乎纯中文、长样本含大量英文，
+    # 拟合出的"比值"反映的是采样方式而不是模型属性（实测 R²=0.94 但最大相对误差 66%）。
+    zh = "本地大模型推理需要精确的 token 计量，缓存命中会让吞吐数字虚高。"
+    en = "Accurate token accounting requires the engine's own counts. "
+    corpus = (zh + en) * 8
+    runtime = _runtime(url, db, sample_gpu=False)
+    try:
+        sync_models(runtime)
+        provider = runtime.provider
+        provider.generate(GenerationRequest.of(  # 预热：把冷启动载入排除在样本外
+            model, "hi", params=GenParams(max_tokens=1), thinking=False
+        ))
+        samples: list[CalibrationSample] = []
+        lengths = [max(8, int(len(corpus) * (i + 1) / max(1, n))) for i in range(n)]
+        for index, length in enumerate(lengths):
+            prompt = corpus[:length]
+            gen = provider.generate(GenerationRequest.of(
+                model, prompt, params=GenParams(max_tokens=1, temperature=0.0), thinking=False,
+                keep_alive="10m",
+            ))
+            engine = gen.usage_from(TokenSource.ENGINE)
+            if engine is None or engine.in_tokens is None:
+                typer.echo(f"样本 {index} 无引擎计数，跳过", err=True)
+                continue
+            samples.append(CalibrationSample(
+                chars=len(prompt), tokens=engine.in_tokens, text=prompt,
+                prompt_eval_ms=gen.latency.ms("prompt_eval") if gen.latency else None,
+                cold=gen.latency.is_cold if gen.latency else None,
+            ))
+            if (index + 1) % 10 == 0:
+                typer.echo(f"  已采集 {index + 1}/{n}")
+
+        result = fit_by_script(samples)
+        typer.echo(f"\n模型 {model} 标定结果（n={result.n}）")
+        typer.echo(f"  中文 token/字    : {result.cjk_ratio if result.cjk_ratio is not None else '—'}")
+        typer.echo(f"  其他 token/字    : "
+                   f"{result.other_ratio if result.other_ratio is not None else result.ratio}")
+        typer.echo(f"  模板固定开销     : {result.intercept} token/请求")
+        typer.echo(f"  R²               : {result.r2}")
+        typer.echo(f"  最大相对误差     : {result.max_rel_error:.2%}")
+        typer.echo(f"  冷 prefill       : {result.cold_ms_per_token} ms/token")
+        typer.echo(f"  热 prefill       : {result.warm_ms_per_token} ms/token")
+        if not result.usable:
+            typer.echo("  [!] 未达可用门槛（n≥30 且 R²≥0.90 且最大相对误差≤20%）⇒ 不写回。"
+                       "fitted 档保持失效，而不是用一个看起来可信的坏标定")
+        if write and result.usable:
+            repo = ModelRepo(runtime.db)
+            info = provider.info()
+            record = repo.find_by_name(info.id, model)
+            if record:
+                repo.update_model(
+                    record.id, usage_ratio=result.ratio, usage_ratio_n=result.n,
+                    extra_json={**record.extra,
+                                "fitted_intercept": result.intercept,
+                                "fitted_cjk_ratio": result.cjk_ratio,
+                                "fitted_other_ratio": result.other_ratio,
+                                "fitted_r2": result.r2,
+                                "fitted_max_rel_error": result.max_rel_error,
+                                "cold_ms_per_token": result.cold_ms_per_token,
+                                "warm_ms_per_token": result.warm_ms_per_token},
+                )
+                runtime.flush()
+                typer.echo("  已写回模型档案（fitted 档生效）")
+    finally:
+        runtime.close()
+
+
 def main() -> None:
     app()
 

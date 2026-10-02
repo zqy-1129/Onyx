@@ -54,6 +54,41 @@ class Runtime:
         self.close()
 
 
+def counter_ctx_factory(db: Database, provider_id: str) -> Any:
+    """按模型名取标定参数（每个模型的 tokens/char 密度不同，不能共用一份）。
+
+    未标定的模型返回默认 ctx ⇒ fitted 档自动失效、退回 heuristic 并标 low confidence。
+    这是"测量必须带出处"在装配层的体现。
+    """
+    from onyx.llm.measurement.fidelity import CounterContext
+    from onyx.store.repos import ModelRepo
+
+    repo = ModelRepo(db)
+
+    def factory(model_name: str) -> CounterContext:
+        record = repo.find_by_name(provider_id, model_name)
+        if record is None:
+            return CounterContext()
+        extra = record.extra or {}
+        return CounterContext(
+            fitted_ratio=record.usage_ratio,
+            fitted_n=record.usage_ratio_n or 0,
+            fitted_intercept=float(extra.get("fitted_intercept") or 0.0),
+            fitted_cjk_ratio=_float_or_none(extra.get("fitted_cjk_ratio")),
+            fitted_other_ratio=_float_or_none(extra.get("fitted_other_ratio")),
+            chat_template=record.template or "",
+        )
+
+    return factory
+
+
+def _float_or_none(value: Any) -> float | None:
+    try:
+        return float(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def build_runtime(
     *,
     provider_kind: str = "ollama",
@@ -85,6 +120,8 @@ def build_runtime(
         observer=observer,
         blobs=blobs,
         counter_ctx=counter_ctx or CounterContext(),
+        # 显式传入的 counter_ctx 优先（测试与实验用）；否则按模型查标定
+        counter_ctx_factory=None if counter_ctx else counter_ctx_factory(db, provider_id),
         sample_gpu=sample_gpu,
         event_sink=events.emit,
     )

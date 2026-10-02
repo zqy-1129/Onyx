@@ -27,10 +27,15 @@ class CounterContext:
 
     fitted_ratio: float | None = None
     fitted_n: int = 0
+    #: 每请求固定的模板开销（带截距拟合得到，见 calibrate.fit_linear）
+    fitted_intercept: float = 0.0
+    #: 双特征标定的两个密度（见 calibrate.fit_by_script）；缺省则退回单比值
+    fitted_cjk_ratio: float | None = None
+    fitted_other_ratio: float | None = None
     tokenizer: Any | None = None
     chat_template: str = ""
     cjk_tokens_per_char: float = 1.0
-    per_message_tokens: int = 4  # ChatML 类模板每条消息的角色标记开销
+    per_message_tokens: int = 4  # ChatML 类模板每条消息的角色标记开销（未标定时的粗略值）
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -60,6 +65,16 @@ def visible_input_chars(req: GenerationRequest) -> int:
 
 def visible_output_chars(gen: Generation) -> int:
     return len(gen.text or "") + len(gen.thinking or "")
+
+
+def visible_input_split(req: GenerationRequest) -> tuple[int, int]:
+    """输入的中文字符数与其他字符数——双特征标定要用（中英 token 密度差 3 倍以上）。"""
+    from onyx.llm.measurement.heuristic import split_cjk
+
+    text = "".join((m.content or "") + (m.thinking or "") for m in req.messages)
+    if req.tools:
+        text += json.dumps([t.as_openai_tool() for t in req.tools], ensure_ascii=False)
+    return split_cjk(text)
 
 
 class EngineCounter:
@@ -97,15 +112,26 @@ class FittedCounter:
                 source=self.name, ok=False, confidence=Confidence.LOW,
                 note=f"未标定或样本不足(n={ctx.fitted_n}，需≥30)",
             )
-        in_chars = visible_input_chars(req)
-        overhead = ctx.per_message_tokens * len(req.messages)
+        out_text = (gen.text or "") + (gen.thinking or "")
+        if ctx.fitted_cjk_ratio is not None and ctx.fitted_other_ratio is not None:
+            from onyx.llm.measurement.heuristic import split_cjk
+
+            cjk, other = visible_input_split(req)
+            out_cjk, out_other = split_cjk(out_text)
+            in_tokens = round(
+                ctx.fitted_intercept + ctx.fitted_cjk_ratio * cjk + ctx.fitted_other_ratio * other
+            )
+            out_tokens = round(ctx.fitted_cjk_ratio * out_cjk + ctx.fitted_other_ratio * out_other)
+            note = (f"cjk={ctx.fitted_cjk_ratio} other={ctx.fitted_other_ratio} "
+                    f"intercept={ctx.fitted_intercept} (n={ctx.fitted_n})")
+        else:
+            # 单比值退化路径：只在语料没有中文、双特征拟合不可用时才会走到这里
+            in_tokens = round(visible_input_chars(req) * ctx.fitted_ratio + ctx.fitted_intercept)
+            out_tokens = round(len(out_text) * ctx.fitted_ratio)
+            note = f"ratio={ctx.fitted_ratio} intercept={ctx.fitted_intercept} (n={ctx.fitted_n})"
         return TokenSample(
-            source=self.name,
-            in_tokens=round(in_chars * ctx.fitted_ratio) + overhead,
-            out_tokens=round(visible_output_chars(gen) * ctx.fitted_ratio),
-            ok=True,
-            confidence=self.default_confidence,
-            note=f"ratio={ctx.fitted_ratio} (n={ctx.fitted_n})",
+            source=self.name, in_tokens=in_tokens, out_tokens=out_tokens, ok=True,
+            confidence=self.default_confidence, note=note,
         )
 
 
@@ -144,13 +170,27 @@ def text_counter(ctx: CounterContext) -> Callable[[str], int] | None:
 
     精度取决于该模型当前具备哪一档能力：
     - 有 tokenizer（T1/T2）⇒ 用它，归因可信度高
-    - 只有标定比值（T3）  ⇒ 按比值折算，medium
+    - 有双特征标定（T3）  ⇒ 按中文/其他两种密度分别折算，medium
+    - 只有单比值          ⇒ 按比值折算（退化路径）
     - 都没有              ⇒ 启发式，low
-    返回 None 表示连启发式都不可用（不会发生，但接口上允许）。
+
+    **分段计数一律不含截距**：模板固定开销是"每请求一次"的量，
+    摊到每个分段会重复计算。它应当作为 `template_ctl` 残差出现，
+    这样残差才有物理意义（= 模板控制符成本），而不是变成误差的垃圾桶。
     """
     tokenizer = getattr(ctx, "tokenizer", None)
     if tokenizer is not None and hasattr(tokenizer, "encode"):
         return lambda text: len(tokenizer.encode(text))
+    if ctx.fitted_cjk_ratio is not None and ctx.fitted_other_ratio is not None:
+        from onyx.llm.measurement.heuristic import split_cjk
+
+        cjk_ratio, other_ratio = ctx.fitted_cjk_ratio, ctx.fitted_other_ratio
+
+        def count_split(text: str) -> int:
+            cjk, other = split_cjk(text)
+            return round(cjk_ratio * cjk + other_ratio * other)
+
+        return count_split
     if ctx.fitted_ratio and ctx.fitted_n >= 30:
         ratio = ctx.fitted_ratio
         return lambda text: round(len(text) * ratio)

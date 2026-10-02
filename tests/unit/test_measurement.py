@@ -21,6 +21,7 @@ from onyx.core.types import (
     ToolSpec,
 )
 from onyx.llm.measurement import (
+    CalibrationResult,
     CalibrationSample,
     CompatCounter,
     CounterContext,
@@ -34,8 +35,8 @@ from onyx.llm.measurement import (
     prefill_mode,
     reconcile,
 )
-from onyx.llm.measurement.calibrate import estimate_with_ratio
-from onyx.llm.measurement.fidelity import visible_input_chars, visible_output_chars
+from onyx.llm.measurement.calibrate import estimate_with_ratio, fit_by_script, fit_linear
+from onyx.llm.measurement.fidelity import text_counter, visible_input_chars, visible_output_chars
 from onyx.llm.measurement.parts import input_segments, part_totals
 from onyx.llm.measurement.reconciler import latency_summary
 
@@ -146,12 +147,28 @@ def test_fitted_counter_refuses_when_uncalibrated():
     assert few.ok is False
 
 
-def test_fitted_counter_uses_ratio():
-    ctx = CounterContext(fitted_ratio=0.5, fitted_n=200)
+def test_fitted_counter_uses_ratio_and_intercept():
+    ctx = CounterContext(fitted_ratio=0.5, fitted_n=200, fitted_intercept=7.0)
     sample = FittedCounter().count(_req(user="a" * 100), _gen(text="b" * 40), ctx)
     assert sample.ok and sample.confidence is Confidence.MEDIUM
-    assert sample.in_tokens == 50 + ctx.per_message_tokens
+    assert sample.in_tokens == 57, "100 字符 × 0.5 + 截距 7（模板固定开销）"
     assert sample.out_tokens == 20
+    assert "intercept" in sample.note
+
+
+def test_fit_linear_separates_ratio_from_template_overhead():
+    """真机形态：12 字符的消息引擎报 19 token ⇒ 固定开销 7。过原点拟合会把它摊进比值。"""
+    samples = [
+        CalibrationSample(chars=c, tokens=round(c * 0.66) + 7) for c in (12, 100, 400, 1200, 3000)
+    ]
+    result = fit_linear(samples)
+    assert result.ratio == pytest.approx(0.66, abs=0.02)
+    assert result.intercept == pytest.approx(7.0, abs=1.0)
+    assert result.r2 > 0.99
+    assert result.predict(1200) == pytest.approx(1200 * 0.66 + 7, abs=2)
+
+    through_origin = fit_ratio(samples)
+    assert through_origin.ratio > result.ratio, "过原点拟合会把固定开销摊进比值 ⇒ 长 prompt 高估"
 
 
 def test_compat_counter_only_present_when_reported():
@@ -235,6 +252,102 @@ def test_reconcile_drift_fires_on_real_gap():
     result = reconcile(samples)
     detail = dict(result.anomalies)["TOKEN_DRIFT"]
     assert detail["abs_diff"] == 211
+
+
+def test_fit_by_script_separates_cjk_and_latin_density():
+    """中英密度差 3 倍，必须分开拟合（真机教训见下）。"""
+    samples = []
+    for cjk, other in ((0, 100), (100, 0), (50, 50), (200, 100), (30, 300), (400, 20)):
+        tokens = round(7 + 0.7 * cjk + 0.25 * other)
+        samples.append(CalibrationSample(
+            chars=cjk + other, tokens=tokens, cjk_chars=cjk, other_chars=other,
+        ))
+    result = fit_by_script(samples)
+    assert result.cjk_ratio == pytest.approx(0.7, abs=0.03)
+    assert result.other_ratio == pytest.approx(0.25, abs=0.03)
+    assert result.intercept == pytest.approx(7.0, abs=1.5)
+    assert result.max_rel_error < 0.10
+    assert result.predict_split(100, 0) == pytest.approx(77, abs=3)
+    assert result.predict_split(0, 100) == pytest.approx(32, abs=3)
+
+
+def test_fit_by_script_degrades_when_corpus_has_no_cjk():
+    """语料没有中文时 3×3 正规方程奇异 ⇒ 降级到单比值，而不是伪造双特征结果。"""
+    samples = [
+        CalibrationSample(chars=c, tokens=round(c * 0.25 + 7), cjk_chars=0, other_chars=c)
+        for c in (50, 100, 200, 400, 800)
+    ]
+    result = fit_by_script(samples)
+    assert result.cjk_ratio is None
+    assert result.ratio == pytest.approx(0.25, abs=0.02)
+    assert result.intercept == pytest.approx(7.0, abs=1.5)
+
+
+def test_single_ratio_fit_is_misled_by_mixed_corpus():
+    """复现真机现象：R² 看着很好，最大相对误差却离谱 ⇒ 单比值不可用。"""
+    samples = []
+    for length in range(20, 660, 20):  # 32 个样本：usable 门槛要求 n≥30
+        cjk = length if length < 300 else 300 - (length - 300) // 2  # 短样本偏中文
+        other = max(0, length - cjk)
+        tokens = round(7 + 0.7 * cjk + 0.25 * other)
+        samples.append(CalibrationSample(
+            chars=length, tokens=tokens, cjk_chars=cjk, other_chars=other,
+        ))
+    single = fit_linear(samples)
+    both = fit_by_script(samples)
+    assert both.r2 > single.r2, "双特征拟合必须显著更好"
+    assert single.max_rel_error > both.max_rel_error * 2, "但最坏样本差得多"
+    assert both.usable and not single.usable
+    # 真机那次更隐蔽：单比值 R²=0.94（看着可用）但最大相对误差 66%。
+    # 所以 usable 门槛必须同时看 R² 和 max_rel_error，只看 R² 会放过坏标定。
+
+
+def test_usable_rejects_high_max_error_even_with_good_r2():
+    """真机实测：R²=0.94 但最大相对误差 66% —— 这种标定有害，必须拒绝。"""
+    assert CalibrationResult(ratio=0.25, n=40, r2=0.94, max_rel_error=0.66).usable is False
+    assert CalibrationResult(ratio=0.25, n=40, r2=0.95, max_rel_error=0.08).usable is True
+    assert CalibrationResult(ratio=0.25, n=10, r2=0.99, max_rel_error=0.02).usable is False
+
+
+def test_fitted_counter_uses_split_ratios():
+    ctx = CounterContext(
+        fitted_ratio=0.25, fitted_n=100, fitted_intercept=7.0,
+        fitted_cjk_ratio=0.7, fitted_other_ratio=0.25,
+    )
+    sample = FittedCounter().count(_req(user="中文字符十个测试"), _gen(text=""), ctx)
+    assert sample.in_tokens == round(7 + 0.7 * 8), "8 个中文字符 × 0.7 + 截距 7"
+    assert "cjk=" in sample.note
+
+
+def test_text_counter_uses_split_densities_for_attribution():
+    """分段计数必须按语系分别折算。
+
+    真机教训：用单一比值（0.178）折算中文分段会把它低估 4 倍，
+    误差全部被推进 template_ctl 残差里（实测 7 → 16），
+    于是"模板开销"这个指标变成了误差垃圾桶，失去物理意义。
+    """
+    from onyx.llm.measurement.fidelity import text_counter
+
+    split_ctx = CounterContext(fitted_ratio=0.178, fitted_n=100, fitted_intercept=11.0,
+                               fitted_cjk_ratio=0.679, fitted_other_ratio=0.178)
+    single_ctx = CounterContext(fitted_ratio=0.178, fitted_n=100, fitted_intercept=11.0)
+    chinese = "用一句话解释什么是 KV 缓存"
+    assert text_counter(split_ctx)(chinese) > text_counter(single_ctx)(chinese) * 2
+    # 分段计数不含截距：截距是"每请求一次"，摊到每段会重复计算
+    assert text_counter(split_ctx)("") == 0
+
+
+def test_attribution_uses_split_counter_end_to_end():
+    """中文消息 + 标定后的 ctx ⇒ 残差应回到"模板控制符"的真实量级，而不是吸收误差。"""
+    ctx = CounterContext(fitted_ratio=0.178, fitted_n=100, fitted_intercept=11.0,
+                         fitted_cjk_ratio=0.679, fitted_other_ratio=0.178)
+    count_fn = text_counter(ctx)
+    req = _req(user="用一句话解释什么是 KV 缓存")
+    parts, report = attribute(req, count_fn=count_fn, engine_in=19)
+    msg_tokens = next(p.tokens for p in parts if p.part == "msg:0")
+    assert msg_tokens >= 8, f"中文分段被低估: {msg_tokens}"
+    assert report.template_ctl_tokens == 19 - msg_tokens
+    assert report.template_ctl_tokens < 12, "残差不该超过标定的模板固定开销量级"
 
 
 def test_compat_is_never_chosen():
