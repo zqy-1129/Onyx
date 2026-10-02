@@ -381,6 +381,16 @@ class Generation:
         return next((s for s in self.usage if s.source == source), None)
 
     @property
+    def wants_tool_call(self) -> bool:
+        """是否该执行工具。
+
+        刻意与 `finish_reason` 分开：实测中引擎可能返回 tool_calls 却把 done_reason
+        报成 `stop`。**引擎报的事实原样保留**，工具循环按这个派生信号决策——
+        既不篡改原始数据，也不会漏执行工具。
+        """
+        return bool(self.tool_calls) or self.finish_reason is FinishReason.TOOL_CALLS
+
+    @property
     def decode_tps(self) -> float | None:
         sample = self.usage_from(TokenSource.ENGINE)
         if not sample or sample.out_tokens is None or not self.latency or not self.latency.eval_ns:
@@ -413,6 +423,11 @@ class ModelCard:
     parameter_size: str = ""
     quantization: str = ""
     format: str = ""
+    #: 实测发现：Ollama 0.35 的 /api/tags 就带 capabilities 与 details.context_length
+    #: （官方文档未列出）。文档不可信，以实测为准 → 见 docs/PROBES.md
+    capabilities: tuple[str, ...] = ()
+    context_length: int | None = None
+    embedding_length: int | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
     @property
