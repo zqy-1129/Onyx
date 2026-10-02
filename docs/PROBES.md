@@ -81,12 +81,38 @@
 |---|---|---|
 | U1 | warm 缓存下 `prompt_eval_count` 数的是**整个 prompt** 还是**只有未缓存后缀** | 决定输入 token 汇总是否系统性偏低（DESIGN R1） |
 | U2 | thinking token 是否计入 `eval_count` | 决定输出成本口径；P5 显示 256 上限被 thinking 占满，强烈提示**是计入的**，但需专门实验 |
-| U3 | `qwen3.5:9b` 的 `/api/show.template` 只有 `{{ .Prompt }}`、`model_info` 仅 10 个 tokenizer 键、family=`gpt2` | **该模型无法离线复算 token**：没有真实 chat template，也拿不到完整 vocab ⇒ T1/T2 档不可用，只能退到 `fitted`/`heuristic` 并标 `confidence=low`。需逐个模型确认，不能一概而论 |
+| U3 | ~~各模型能否离线复算 token~~ **已测，见 P9** | — |
 | U4 | 原生流是否**只在**最后一个 ndjson 事件给计数 | 决定流式 TTFT/计数的采集点 |
 | U5 | `/v1` 的 `usage` 与原生 `prompt_eval_count` 是否一致 | T4 交叉验证是否有意义 |
 | U6 | `format: json_schema` 是否强制生效、失败是否静默降级 | 结构化抽取评测的前提 |
 | U7 | `qwen3.8:27b`(17.7GB > 16GB VRAM) 的 offload 行为与吞吐落差 | 验证 `offloaded` 判定与"必须分开聚合"的规则（DESIGN R5） |
 
-> U3 是本轮最重要的负面发现：**不是所有模型都能做 token 归因**。
-> 保真阶梯（DESIGN §6.1）的价值正在于此——它允许"这个模型只能给出低置信估计"成为
-> 一个**显式、可见、可解释**的状态，而不是悄悄显示一个看起来很精确的错误数字。
+---
+
+## 3. P9 · tokenizer 元数据与 chat template 的可用性（决定 S4 实现顺序）✅
+
+逐模型实测 `/api/show`：
+
+| 模型 | `template` | `tokenizer.chat_template` | `tokenizer.ggml.tokens` | `.merges` | family |
+|---|---|---|---|---|---|
+| `qwen3.8:27b` | `{{ .Prompt }}`（13 字符，占位） | **无** | ✅ | ✅ | gpt2 |
+| `gpt-oss:20b` | **7216 字符真模板**（`<|start|>system<|message|>…`） | 无 | ✅ | ✅ | gpt2 |
+| `qwen3.5:9b` | `{{ .Prompt }}`（13 字符，占位） | **无** | ✅ | ✅ | gpt2 |
+
+### 结论与对 S4 的影响
+1. **T1 档（HF tokenizer + minja 渲染）不能作为主路径**：3 个模型里 2 个根本没有 chat template
+   （`template` 只是 Go 占位符 `{{ .Prompt }}`，`tokenizer.chat_template` 键不存在）。
+   没有模板就无法复现引擎真正喂进去的字符串。
+2. **T2 档（用 GGUF 的 tokens+merges 自建 BPE）对 3 个模型全部可行** ⇒ 应把它提前为 S4 的主实现，
+   而不是 DESIGN 原计划的"M2 后选做"。离线、无需网络、无需 HF 仓库对应关系。
+3. **归因方式随之改变**（重要的设计修正）：不要求"渲染出完整 prompt 再数"，而是
+   `Σ(各分段真实 token 数) + template_ctl 残差`，其中
+   `template_ctl = engine.prompt_eval_count − Σ分段`。
+   残差是**可测量且诚实**的：它正是模板控制符（角色标记、生成提示符、工具 schema 包装）的成本。
+   有真模板时（如 `gpt-oss:20b`）残差应趋近 0，这本身就是一个校验信号。
+4. **工具定义开销（DESIGN §6.2 的核心指标）在 qwen 系上只能给出"分段和 + 残差"口径**，
+   UI 必须标明该模型的归因是 `medium` 置信度而非 `high`，不能显示成精确值。
+
+> 这条发现推翻了原计划的一个假设，也正好验证了"保真阶梯 + 置信度标注"这个设计的必要性：
+> 如果没有它，看板会对 2/3 的模型显示一个看起来精确、实际无从复算的数字。
+
