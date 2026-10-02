@@ -197,6 +197,14 @@ def audit(
     else:
         findings.extend(_audit_schema(definition, add, count_fn, token_budget))
 
+    # ToolDef.side_effect 有默认值，所以"没标注"只能由载入层显式记下来。
+    # 这条不能省：沙箱靠它决策，默认当成只读等于把 write/exec 工具放行。
+    if definition.extra.get("side_effect_untagged"):
+        add("SIDE_EFFECT_UNTAGGED", Severity.ERROR,
+            f"未标注 side_effect，当前按默认值 {definition.side_effect} 处理",
+            path="side_effect",
+            fix="显式写 read/write/network/exec 之一——沙箱据此决定是否拒绝或要审批")
+
     if not definition.examples:
         add("NO_EXAMPLE", Severity.INFO, "没有 examples", path="examples",
             fix="至少给 1 个 (指令 → 期望调用) 样本，才能做 fire-and-verify")

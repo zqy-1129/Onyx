@@ -72,3 +72,61 @@ tools:
         expect:
           name: db_query
           arguments: { sql: "SELECT COUNT(*) FROM orders WHERE month = 3" }
+
+  # constants 是「定义级、模型不可覆盖」的可信参数：它不出现在 properties 里，
+  # 所以模型无法通过多写一个字段把 root 改成 /。若同名出现在 schema 中，
+  # python_fn 执行器会直接报 error（constant_exposed），而不是静默覆盖。
+  - name: fs_read
+    description: 读取项目内一个文本文件的内容。只能读 root 目录之下的文件，越界会被拒绝。
+    kind: python_fn
+    side_effect: read
+    impl_ref: onyx.tools.builtin.fs_read:read_file
+    timeout_ms: 3000
+    owner: platform
+    tags: [demo, fs]
+    constants:
+      root: ./examples
+    parameters:
+      type: object
+      properties:
+        path:
+          type: string
+          description: 相对 root 的文件路径，例如「tools.yaml」。不接受绝对路径或 ../ 越界。
+        max_bytes:
+          type: integer
+          description: 最多返回多少字节，默认 262144。超出会被截断并在结果里标 truncated。
+      required: [path]
+      additionalProperties: false
+    examples:
+      - instruction: 把 tools.yaml 读出来看看
+        expect:
+          name: fs_read
+          arguments: { path: tools.yaml }
+
+  # http 类工具不需要写 Python：端点写死在定义里（人工审核过），
+  # 模型给的参数只能进 query 或 body，因此无法把请求指向别的主机。
+  - name: http_demo
+    description: 演示 http 执行器的定义写法。真实部署时把 url 换成你自己的服务端点。
+    kind: http
+    side_effect: network
+    timeout_ms: 8000
+    owner: platform
+    tags: [demo, http]
+    http:
+      url: http://127.0.0.1:9/health
+      method: GET
+      body: query
+      timeout_ms: 5000
+    parameters:
+      type: object
+      properties:
+        verbose:
+          type: boolean
+          description: 是否返回详细健康信息。默认 false，只在排查时才需要打开。
+      required: []
+      additionalProperties: false
+    examples:
+      - instruction: 检查一下服务健康状态
+        expect:
+          name: http_demo
+          arguments: { verbose: false }

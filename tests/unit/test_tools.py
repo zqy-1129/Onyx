@@ -251,8 +251,17 @@ def test_defs_from_payload_requires_name():
 
 
 def test_defs_from_payload_keeps_unknown_keys_in_extra():
-    defs = defs_from_payload([{"name": "t", "description": "d", "mcp_server": "weather-srv"}])
+    defs = defs_from_payload([
+        {"name": "t", "description": "d", "side_effect": "read", "mcp_server": "weather-srv"},
+    ])
     assert defs[0].extra == {"mcp_server": "weather-srv"}, "新字段不许丢（原则 6）"
+
+
+def test_defs_from_payload_marks_missing_side_effect():
+    """缺 side_effect 不能静默取默认 read——沙箱靠它决定要不要拒绝或审批。"""
+    defs = defs_from_payload([{"name": "t", "description": "d"}])
+    assert defs[0].side_effect is SideEffect.READ
+    assert defs[0].extra["side_effect_untagged"] is True
 
 
 def test_example_yaml_file_is_importable(tmp_path):
@@ -266,11 +275,20 @@ def test_example_yaml_file_is_importable(tmp_path):
     assert path.exists(), f"缺少示例文件: {path}"
     payload = yaml.safe_load(path.read_text(encoding="utf-8"))
     defs = defs_from_payload(payload)
-    assert {d.name for d in defs} == {"get_weather", "calculator", "db_query"}
+    assert {d.name for d in defs} == {
+        "get_weather", "calculator", "db_query", "fs_read", "http_demo",
+    }
     for definition in defs:
         errors = [f for f in audit(definition, count_fn=len) if f.severity is Severity.ERROR]
         assert not errors, f"{definition.name} 有 error 级问题: {errors}"
     assert json.loads(openai_json(defs[0]))["function"]["name"] == "get_weather"
+
+    by_name = {d.name: d for d in defs}
+    # constants / http 是执行器配置，不进 schema，所以必须落在 extra 里
+    assert by_name["fs_read"].extra["constants"] == {"root": "./examples"}
+    assert "root" not in by_name["fs_read"].parameters["properties"]
+    assert by_name["http_demo"].extra["http"]["url"].startswith("http://")
+    assert by_name["http_demo"].side_effect is SideEffect.NETWORK
 
 
 def test_tool_kind_coverage():

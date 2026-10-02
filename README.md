@@ -34,11 +34,17 @@ uv run onyx db init         # 初始化 .data/onyx.sqlite
 |---|---|---|
 | M0 环境 | ✅ | uv + Python 3.12 + git（Ollama 0.35.0 / Node 24 已就绪） |
 | M1 计量 | ✅ | `core/` 领域层 · `store/` 存储层 · Ollama 适配器 · token 保真阶梯与双特征标定 · gateway 单一咽喉点 · 观测引擎与 visitors · 能力矩阵 · CLI（chat / traces / models / probe / calibrate / doctor） |
-| M2 看板 | 🚧 S8 完成 · S9 进行中 | REST + SSE 已就绪；看板已实现 Fleet / Models / Traces / TraceDetail 四页并在浏览器实测通过，Playground 与 Token Ledger 页待补 |
-| M3 工具 | ⬜ | 注册表 / 执行器 / 契约测试 / 工具循环 |
+| M2 看板 | ✅ | REST + SSE · Fleet / Models / Traces / TraceDetail / Token Ledger / Playground 六页，已在真实浏览器实测（真机发送到 qwen3.5:9b，引擎计数与冷启动标注齐全，零 console 错误） |
+| M3 工具 | 🚧 S10–S11 完成 · S12 待做 | 注册表（内容 hash 版本化 + 契约审计 + 上下文开销核算）· 执行层（python_fn / mock_replay / http 三种执行器 + 沙箱 + 契约矩阵）· 剩工具循环与 fire-and-verify |
 | M4 评测 | ⬜ | 评测内核 / 意图识别 / 工具调用 |
 | M5 对比 | ⬜ | 矩阵、回归 diff、报告导出 |
-| M6 扩展 | ⬜ | 插件 entry points、第二 provider、MCP |
+| M6 扩展 | ⬜ | 插件 entry points、第二 provider、MCP 执行器 |
+
+**M3 执行层的核心保证**（`onyx tools contract`，离线、零真实网络）：
+8 条契约断言在 3 个执行器上全部适用并通过（各列的 n/a 都写明原因）；
+失败被强制分成 6 种互不相同的 kind —— `arg_error`（模型的错）/ `rejected`（策略）/
+`timeout` / `unknown_tool`（路由）/ `skipped`（mock 配置）/ `error`（工具坏了），
+因为种类一旦混淆，"工具调不对"就再也无法归因。
 
 **M1 已在真机达成**：`onyx chat` 一次对话即落库完整 trace —— 引擎计数（in=19/out=47，
 source=engine，confidence=high）、分段归因（`msg:0=8 + template_ctl=11 == 19`，

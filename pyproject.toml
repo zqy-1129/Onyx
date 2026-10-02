@@ -66,7 +66,16 @@ forbidden_modules = [
 ]
 
 [[tool.importlinter.contracts]]
-name = "only llm layer performs network IO"
+name = "network IO confined to llm and the http tool executor"
 type = "forbidden"
-source_modules = ["onyx.store", "onyx.core"]
+source_modules = ["onyx.store", "onyx.core", "onyx.obs"]
 forbidden_modules = ["httpx", "requests", "urllib3"]
+
+# tools 层默认也不许碰网络：只有 executors.http 这一个模块可以，
+# 且必须显式登记在下面。新增一个"顺手发个请求"的模块会立刻让 lint 失败。
+[[tool.importlinter.contracts]]
+name = "tools layer: only executors.http may touch the network"
+type = "forbidden"
+source_modules = ["onyx.tools"]
+forbidden_modules = ["httpx", "requests", "urllib3"]
+ignore_imports = ["onyx.tools.executors.http -> httpx"]

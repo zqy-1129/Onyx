@@ -57,7 +57,7 @@
 | `store` | `core` |
 | `llm` | `core` `store` + `httpx/minja/tokenizers/gguf` |
 | `obs` | `core` `llm` `store` |
-| `tools` | `core` `llm`(仅接口) `store` |
+| `tools` | `core` `llm`(仅接口) `store`；**只有 `tools/executors/http.py` 可以 import httpx** |
 | `eval` | `core` `llm` `tools` `store` |
 | `api/web/report` | 除 `core` 外全部（`core` 亦可） |
 
@@ -347,8 +347,31 @@ class ToolExecutor(Protocol):
     def spec(self) -> ToolDef: ...
     def call(self, name: str, args: dict, ctx: ToolCtx) -> ToolResult: ...
 # ToolCtx = trace_id, deadline, dry_run, mock_policy ∈ {live, fixture, replay, deny}
-# ToolError 族: ToolUnknown / ToolArgError / ToolTimeout / ToolSandboxDenied / ToolRuntime
+# ToolError 族: ToolUnknown / ToolArgError / ToolTimeout / ToolSandboxDenied / ToolSkipped / ToolRuntime
 ```
+
+**执行器只有 `guarded_call` 一个入口**（`tools/executor.py`），顺序不可调换：
+参数校验 → 沙箱策略 → mock 短路 → deadline 内执行 → 错误归一。
+校验排在 mock 之前，否则给了桩就等于放过畸形参数；策略排在 mock 之前，
+否则 mock 模式能绕过沙箱。每个执行器自己再实现一遍这两步，必然漏。
+
+**失败必须分成 6 种互不相同的 kind**，这是整个执行层存在的理由：
+
+| kind | 含义 | 归因 |
+|---|---|---|
+| `arg_error` | 参数缺字段/类型错/枚举越界/多余字段 | **模型**的输出问题 |
+| `rejected` | 沙箱策略拒绝（副作用未放开、未审批、dry-run、impl_ref 不在白名单、路径越界） | **配置**问题 |
+| `timeout` | 超过 deadline | 可重试；对 http 还必须证明 deadline 传到了 socket |
+| `unknown_tool` | 请求的工具名与执行器绑定的定义不符 | **模型**选错工具（路由） |
+| `skipped` | mock 策略主动不执行（deny / 缺桩） | 评测配置，不是失败 |
+| `error` | 实现崩了、签名与 schema 脱节、上游 5xx | **工具**坏了 |
+
+`ToolUnknown` 从 `resolve_impl`/签名不匹配抛出时归到 `error` 而**不是** `unknown_tool`：
+那是定义与实现脱节，记成路由错会让评测把修法的方向指错（该改定义，不是改提示词）。
+
+`extra.constants` 是定义级、**模型不可覆盖**的可信参数（如 `fs_read` 的允许根目录）。
+它不出现在 `parameters.properties` 里；一旦同名出现，执行器直接报 `constant_exposed`，
+而不是静默让常量覆盖参数——静默覆盖会把配置错误藏到运行时。
 
 ### 8.3 客户端工具循环
 `tools/loop.py` 由**本地实现**（Ollama 只返回 `tool_calls`，不会替你执行工具；若某内置工具由服务端执行，需标 `executed_by='server'` 并单列延迟，待 probe 确认）。职责：

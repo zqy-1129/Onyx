@@ -781,24 +781,36 @@ def _tool_registry(db: Path | None, model: str | None):
 
 @tools_app.command("import")
 def tools_import(
-    file: Path = typer.Argument(..., exists=True, dir_okay=False, readable=True),
+    file: Path = typer.Argument(None, exists=True, dir_okay=False, readable=True),
     db: Path = typer.Option(None, "--db"),
+    builtin: bool = typer.Option(
+        False, "--builtin", help="导入内置参照工具（echo/calculator/time_now），不需要文件"
+    ),
 ) -> None:
     """从 YAML/JSON 导入工具定义（内容 hash 变化即版本递增）。"""
     import json as _json
 
     from onyx.tools.registry import defs_from_payload
 
-    text = file.read_text(encoding="utf-8")
-    if file.suffix.lower() in {".yaml", ".yml"}:
-        import yaml
+    if builtin:
+        from onyx.tools.builtin.defs import BUILTIN_DEFS
 
-        payload = yaml.safe_load(text)
+        definitions = list(BUILTIN_DEFS)
     else:
-        payload = _json.loads(text)
+        if file is None:
+            typer.echo("要么给出定义文件，要么用 --builtin 导入内置工具", err=True)
+            raise typer.Exit(2)
+        text = file.read_text(encoding="utf-8")
+        if file.suffix.lower() in {".yaml", ".yml"}:
+            import yaml
+
+            payload = yaml.safe_load(text)
+        else:
+            payload = _json.loads(text)
+        definitions = defs_from_payload(payload)
     registry, database = _tool_registry(db, None)
     try:
-        records = registry.register_many(defs_from_payload(payload))
+        records = registry.register_many(definitions)
         for record in records:
             typer.echo(f"  {record.name:<24} v{record.version} {record.kind} "
                        f"{record.side_effect} tokens={record.tokens} hash={record.hash}")
@@ -896,7 +908,281 @@ def tools_cost(
         database.close()
 
 
+#: mock 执行器结构上不触达真实实现，deadline 无从生效——豁免必须写明原因（不许静默跳过）
+_MOCK_CONTRACT_EXEMPTIONS = {
+    "timeout_is_reported": (
+        "mock 执行器不导入也不调用真实实现，deadline 无从生效；"
+        "这条保证由 python_fn 上的同名断言覆盖"
+    )
+}
+
+
+def _http_contract_target():
+    """http 列的离线契约样本（MockTransport + `.invalid` 域名，零真实网络）。
+
+    惰性导入：httpx 属于 `runtime` extra，没装时这一列必须显示"未安装"，
+    而不是让整个 `tools contract` 命令崩掉。
+    """
+    try:
+        from onyx.tools.executors.http import contract_target
+    except ImportError:  # pragma: no cover - 取决于安装的 extras
+        return None
+    return contract_target()
+
+
+def _resolve_tool_def(tool: str, db: Path | None):
+    """查定义：**注册表优先，内置兜底**。返回 (定义, 出处, 需要关闭的 Database 或 None)。
+
+    顺序不能反。用户显式 `tools import` 进来的定义才是模型实际会看到的那一份；
+    若内置定义抢先命中，`tools run` 就会执行与注册版本不同的实现——
+    这正是本项目要避免的"数字对不上出处"。
+    """
+    from onyx.tools.builtin.defs import builtin_def
+
+    registry, database = _tool_registry(db, None)
+    registered = registry.get(tool)
+    if registered is not None:
+        return registered, "registry", database
+    database.close()
+    return builtin_def(tool), "builtin", None
+
+
+@tools_app.command("contract")
+def tools_contract(
+    tool: str = typer.Option("echo", "--tool", help="python_fn/mock 两列用的样本工具"),
+    args: str = typer.Option(None, "--args", help="JSON 对象，覆盖自动构造的合法参数"),
+    db: Path = typer.Option(None, "--db"),
+    json_out: bool = typer.Option(False, "--json", help="输出机器可读结果"),
+) -> None:
+    """执行器契约矩阵：同一套断言跑在所有已实现的执行器上。
+
+    "可替换"不是文档里的一句话，而是这张矩阵逼出来的。
+    断言比对的是**失败的种类**（arg_error/rejected/timeout/unknown_tool/skipped/error），
+    种类混淆就等于放弃归因能力。
+
+    http 列始终用离线 MockTransport 样本（`contract.invalid` 是 RFC 2606 保留的
+    永不解析域名），所以这条命令不发任何真实网络请求。
+    """
+    import json as _json
+
+    from rich.console import Console
+    from rich.table import Table
+
+    from onyx.tools.builtin.defs import BUILTIN_DEFS, CONTRACT_SAMPLE_ARGS
+    from onyx.tools.contract import CONTRACT_NAMES, run_contracts, sample_args, summarize
+    from onyx.tools.executors import MockReplayExecutor, PythonFnExecutor
+
+    definition, source, database = _resolve_tool_def(tool, db)
+    try:
+        if definition is None:
+            names = ", ".join(item.name for item in BUILTIN_DEFS)
+            typer.echo(f"找不到工具 {tool!r}；内置可选: {names}，或用 tools import 先注册", err=True)
+            raise typer.Exit(2)
+        if args:
+            valid_args = _json.loads(args)
+        elif definition.name == "echo" and source == "builtin":
+            valid_args = dict(CONTRACT_SAMPLE_ARGS)
+        else:
+            valid_args = sample_args(definition)
+
+        # 每一列是 (标签, 样本定义, 工厂, 合法参数, fixtures, 豁免, synth)
+        targets: list[tuple] = [
+            ("python_fn", definition, PythonFnExecutor, valid_args, None, {}, None),
+            ("mock", definition, MockReplayExecutor, valid_args,
+             {definition.name: {"__contract_mock__": True, "tool": definition.name}},
+             _MOCK_CONTRACT_EXEMPTIONS, None),
+        ]
+        http = _http_contract_target()
+        unavailable: dict[str, str] = {}
+        if http is None:
+            unavailable["http"] = "未安装 httpx（uv sync --extra runtime）——未知，不是通过"
+        else:
+            http_sample, http_factory, http_args, http_synth = http
+            targets.append(("http", http_sample, http_factory, http_args, None, {}, http_synth))
+        pending = {"mcp": "S16", "ollama_builtin": "S16"}
+
+        matrix: dict[str, dict[str, object]] = {}
+        samples: dict[str, str] = {}
+        for name, sample, factory, target_args, fixtures, exemptions, synth in targets:
+            results = run_contracts(
+                factory, sample, valid_args=target_args,
+                fixtures=fixtures, exemptions=exemptions, synth=synth,
+            )
+            matrix[name] = {item.name: item for item in results}
+            samples[name] = sample.name
+
+        if json_out:
+            typer.echo(_json.dumps({
+                "tool": definition.name, "source": source, "valid_args": valid_args,
+                "assertions": list(CONTRACT_NAMES),
+                "samples": samples,
+                "executors": {
+                    name: {
+                        item: {
+                            "passed": matrix[name][item].passed,
+                            "applicable": matrix[name][item].applicable,
+                            "detail": matrix[name][item].detail,
+                        }
+                        for item in CONTRACT_NAMES
+                    }
+                    for name in matrix
+                },
+                "unavailable": unavailable,
+                "pending": pending,
+                "summary": {name: summarize(list(matrix[name].values())) for name in matrix},
+            }, ensure_ascii=False, indent=2, default=str))
+            return
+
+        console = Console()
+        table = Table(title="执行器契约矩阵", pad_edge=False)
+        table.add_column("断言", style="bold")
+        for name in matrix:
+            table.add_column(name, justify="center")
+        for name in (*unavailable, *pending):
+            table.add_column(name, justify="center", style="dim")
+        for item in CONTRACT_NAMES:
+            row = [item]
+            for name in matrix:
+                result = matrix[name][item]
+                row.append("✓" if result.passed else ("n/a" if not result.applicable else "✗"))
+            row.extend("—" for _ in range(len(unavailable) + len(pending)))
+            table.add_row(*row)
+        console.print(table)
+
+        typer.echo("样本出处（每一列测的定义可能不同，必须写清楚）：")
+        for name, sample_name in samples.items():
+            note = "（注册表/内置）" if name in {"python_fn", "mock"} else "（离线 MockTransport）"
+            typer.echo(f"  {name:<12} {sample_name} {note}")
+
+        failed = 0
+        for name in matrix:
+            counts = summarize(list(matrix[name].values()))
+            failed += counts["failed"]
+            typer.echo(
+                f"{name:<12} 通过 {counts['passed']} · 失败 {counts['failed']} · "
+                f"不适用 {counts['not_applicable']}"
+            )
+        for name in matrix:
+            for item in CONTRACT_NAMES:
+                result = matrix[name][item]
+                if not result.passed:
+                    prefix = "不适用" if not result.applicable else "失败"
+                    typer.echo(f"  [{name}] {prefix} {item}: {result.detail}")
+        for name, reason in unavailable.items():
+            typer.echo(f"  [{name}] {reason}")
+        for name, milestone in pending.items():
+            typer.echo(f"  [{name}] 未实现，计划在 {milestone}")
+        if failed:
+            raise typer.Exit(1)
+    finally:
+        if database is not None:
+            database.close()
+
+
+@tools_app.command("run")
+def tools_run(
+    tool: str = typer.Argument(..., help="工具名（内置或已注册）"),
+    args: str = typer.Option("{}", "--args", help="JSON 对象形式的调用参数"),
+    db: Path = typer.Option(None, "--db"),
+    mock: str = typer.Option("live", "--mock", help="live | fixture | replay | deny"),
+    dry_run: bool = typer.Option(False, "--dry-run", help="只允许 read 类工具"),
+    deadline: int = typer.Option(None, "--deadline-ms", help="覆盖定义里的超时"),
+    allow: str = typer.Option(
+        None, "--allow", help="额外放开的副作用，逗号分隔：write,network,exec"
+    ),
+    fixture: str = typer.Option(None, "--fixture", help="mock=fixture 时的返回值 JSON"),
+) -> None:
+    """不经模型直接调用一次工具，打印结构化结果。
+
+    走的是与模型调用**完全相同**的 `guarded_call` 管线，所以这里能看到
+    模型触发时会得到的同一种 error_kind——排查"工具调不对"时先看这条，
+    能立刻分开是工具的问题还是模型的问题。
+    """
+    import json as _json
+
+    from onyx.tools.executor import MockPolicy, ToolCtx
+    from onyx.tools.executors import executor_for
+
+    definition, source, database = _resolve_tool_def(tool, db)
+    try:
+        if definition is None:
+            typer.echo(f"找不到工具 {tool!r}（注册表与内置定义里都没有）", err=True)
+            raise typer.Exit(2)
+        call_args = _json.loads(args)
+        policy = _policy_from_cli(allow)
+        stubs = {tool: _json.loads(fixture)} if fixture else {}
+        mock_policy = MockPolicy(mock)
+        ctx = ToolCtx(
+            mock_policy=mock_policy, dry_run=dry_run, deadline_ms=deadline,
+            fixtures=stubs, replay=stubs, policy=policy,
+        )
+        # 非 live 一律走 mock 执行器：它结构上不可能触达真实实现，
+        # 比"相信 python_fn 会短路"要可靠得多
+        kind = None if mock_policy is MockPolicy.LIVE else "fixture"
+        executor = executor_for(definition, kind=kind, responses=stubs or None)
+        result = executor.call(tool, call_args, ctx)
+
+        typer.echo(f"工具      : {definition.name} v{definition.version} "
+                   f"({definition.kind}, {definition.side_effect}) 出处={source}")
+        typer.echo(f"执行器    : {type(executor).__name__} mock={mock} dry_run={dry_run}")
+        typer.echo(f"结果      : {'✓ ok' if result.ok else '✗ ' + (result.error_kind or 'error')}"
+                   f"{'（mocked）' if result.mocked else ''}")
+        if result.ok:
+            typer.echo(f"输出      : {_json.dumps(result.output, ensure_ascii=False, default=str)[:800]}")
+            typer.echo(f"字节      : {result.bytes}")
+        else:
+            typer.echo(f"错误      : {result.error}")
+            if result.extra.get("detail"):
+                typer.echo(f"细节      : {_json.dumps(result.extra['detail'], ensure_ascii=False, default=str)}")
+        typer.echo(f"耗时      : {result.extra.get('latency_ms', '—')} ms")
+        if not result.ok:
+            raise typer.Exit(1)
+    finally:
+        if database is not None:
+            database.close()
+
+
+def _policy_from_cli(allow: str | None):
+    """默认最严（只允许 read）。`--allow` 是显式的、逐次生效的放开。"""
+    from onyx.tools.sandbox import PERMISSIVE_POLICY, SandboxPolicy
+    from onyx.tools.spec import SideEffect
+
+    if not allow:
+        return SandboxPolicy()
+    wanted = {piece.strip() for piece in allow.split(",") if piece.strip()}
+    try:
+        effects = {SideEffect(piece) for piece in wanted}
+    except ValueError:
+        typer.echo("--allow 取值非法（可选 read/write/network/exec）", err=True)
+        raise typer.Exit(2) from None
+    return SandboxPolicy(
+        allowed_side_effects=frozenset({SideEffect.READ, *effects}),
+        # CLI 是人在操作，--allow 本身就是审批动作；不再二次弹窗
+        require_approval=frozenset(),
+        allowed_impl_prefixes=PERMISSIVE_POLICY.allowed_impl_prefixes,
+    )
+
+
+def _force_utf8_stdio() -> None:
+    """Windows 中文环境下 stdout 默认 gbk，`✓ ✗ —` 这类字符会直接抛 UnicodeEncodeError。
+
+    看板与 CLI 大量使用这些符号（UI_DESIGN R2：未知必须显示「—」而不是 0），
+    所以在入口统一切到 UTF-8。管道重定向时同样生效——否则 `onyx tools contract | head`
+    这种最普通的用法就会崩。
+    """
+    import contextlib
+
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        # 已关闭或被替换成不支持编码的流（例如测试里的替身）时静默跳过
+        with contextlib.suppress(ValueError, OSError):
+            reconfigure(encoding="utf-8")
+
+
 def main() -> None:
+    _force_utf8_stdio()
     app()
 
 

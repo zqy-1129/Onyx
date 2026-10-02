@@ -159,6 +159,8 @@ def defs_from_payload(payload: Any) -> list[ToolDef]:
             kind = ToolKind(str(raw.get("kind") or "python_fn"))
         except ValueError as exc:
             raise ValueError(f"工具 {name} 的 kind 非法: {raw.get('kind')!r}") from exc
+        # 缺 side_effect 不能静默取默认值：记下"未标注"，让审计报 ERROR
+        side_effect_untagged = "side_effect" not in raw
         try:
             side_effect = SideEffect(str(raw.get("side_effect") or "read"))
         except ValueError as exc:
@@ -166,6 +168,11 @@ def defs_from_payload(payload: Any) -> list[ToolDef]:
                 f"工具 {name} 的 side_effect 非法: {raw.get('side_effect')!r}"
                 f"（可选: {[str(s) for s in SideEffect]}）"
             ) from exc
+        extra = {k: v for k, v in raw.items() if k not in {
+            "name", "description", "parameters", "kind", "side_effect", "impl_ref", "impl",
+            "version", "tags", "owner", "enabled", "timeout_ms", "doc", "examples"}}
+        if side_effect_untagged:
+            extra["side_effect_untagged"] = True
         out.append(ToolDef(
             name=name,
             description=str(raw.get("description") or ""),
@@ -177,8 +184,6 @@ def defs_from_payload(payload: Any) -> list[ToolDef]:
             enabled=bool(raw.get("enabled", True)),
             timeout_ms=raw.get("timeout_ms"), doc=str(raw.get("doc") or ""),
             examples=tuple(raw.get("examples") or ()),
-            extra={k: v for k, v in raw.items() if k not in {
-                "name", "description", "parameters", "kind", "side_effect", "impl_ref", "impl",
-                "version", "tags", "owner", "enabled", "timeout_ms", "doc", "examples"}},
+            extra=extra,
         ))
     return out

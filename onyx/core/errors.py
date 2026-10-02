@@ -104,6 +104,12 @@ class ToolRuntime(ToolError):
     code = "TOOL_RUNTIME"
 
 
+class ToolSkipped(ToolError):
+    """按 mock 策略主动不执行。与"执行了但失败"必须区分：前者是配置，后者是缺陷。"""
+
+    code = "TOOL_SKIPPED"
+
+
 # ── 评测 ───────────────────────────────────────────────────────────
 class EvalError(OnyxError):
     code = "EVAL_ERROR"

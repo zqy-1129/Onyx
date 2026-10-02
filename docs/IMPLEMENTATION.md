@@ -486,41 +486,84 @@ TOTAL (24 tools)    1380    5410   62.4% of system+tools context
 
 ---
 
-## S11 — 执行器 + 沙箱 + 契约测试运行器（无模型）
+## S11 — 执行器 + 沙箱 + 契约测试运行器（无模型）✅
 
 **产出文件**
 ```
-onyx/tools/executors/{python_fn,http,mcp,ollama_builtin,mock_replay}.py
-onyx/tools/sandbox.py     # deadline / 审批 / side_effect 白名单 / dry_run / 审计
-onyx/tools/contract.py    # 契约测试运行器
-onyx/tools/builtin/{calculator.py,time_now.py,http_get.py,fs_read.py,echo.py}
-tests/contract/test_executors.py  tests/contract/test_sandbox.py
+onyx/tools/executor.py            # guarded_call：所有执行器的唯一入口
+onyx/tools/args.py                # 参数校验（6 种细分失败）+ diff_args
+onyx/tools/sandbox.py             # 副作用白名单 / 审批 / dry-run / impl_ref 白名单 / deadline
+onyx/tools/contract.py            # 契约运行器：8 条断言 + 豁免机制 + sample_args
+onyx/tools/executors/{python_fn,mock_replay,http}.py
+onyx/tools/builtin/{calculator,time_now,echo,fs_read,defs}.py
+examples/tools.yaml               # 5 个示例定义（含 constants 与 http 两种写法）
+tests/unit/test_tools_executors.py  tests/unit/test_tools_http_fs.py  tests/unit/test_cli_tools.py
 ```
-每个工具可声明 `tool_test`：`args_json` + `checks_json`（`type_of` / `path_exists` / `regex` / `subset_of` / `raises`）。
-契约断言集（**所有 executor 必须全过**）：
-1. 合法参数 → `status=ok`，结果类型符合声明；
-2. 缺 required / 类型错 → `ToolArgError`（**不能崩、不能返回 200**）；
-3. 未知工具名 → `ToolUnknown`；
-4. 超 deadline → `ToolTimeout`，且底层任务真的被取消（不泄漏）；
-5. `side_effect='write'` 且未授权 → `ToolSandboxDenied`，且副作用未发生；
-6. `read` 类工具连调两次结果一致 → `idempotent=1`；
-7. `mock_replay` 用 fixture 时**不发真实网络请求**（`respx` 断言零命中）。
+
+**与原计划的偏差（记录在案，不是悄悄缩水）**
+- `mcp` / `ollama_builtin` 两个执行器推迟到 S16：MCP 在 S16 本来就是交付项；
+  `ollama_builtin` 需要先跑 P21 探针确认引擎内建工具是否真由服务端执行，
+  在测出结论前写实现等于把假设编码进代码。矩阵里这两列显示 `—` 并写明里程碑，
+  **不显示为通过**。
+- 不提供计划里列的 `builtin/http_get.py`：一个"抓任意 URL"的工具，参数来自模型输出，
+  等价于把 SSRF 开放给模型。改为通用 `http` 执行器——URL 写死在人工审核过的定义里，
+  模型给的参数只能进 query/body，因此改不了目标主机。
+- 契约断言从 7 条增加到 8 条：新增 `mock_policy_makes_no_real_call` 的**证据分级**
+  （`counter` = 实测计数，`structural` = 结构性质 + monkeypatch canary 兜底），
+  因为"零真实调用"是整个评测可复现性的地基，不能靠一句声明。
+
+契约断言集（**所有 executor 必须全过，n/a 须写明原因**）：
+1. `valid_args_ok` 合法参数 → ok；
+2. `missing_required_is_arg_error` 缺 required → `arg_error`（**不能崩、不能返回 200**）；
+3. `wrong_type_is_arg_error` 类型错 → `arg_error`；
+4. `unknown_tool_is_distinguished` 工具名不符 → `unknown_tool`，与参数错分开；
+5. `timeout_is_reported` 超 deadline → `timeout`；
+6. `write_denied_without_approval` write 未审批 → `rejected`，且副作用未发生；
+7. `read_is_idempotent` read 类连调两次结果一致（`non-deterministic` 标记的工具判 n/a，
+   因为两次调用落在同一秒就会"通过"——报一个靠运气的 ✓ 比报 n/a 危险）；
+8. `mock_policy_makes_no_real_call` FIXTURE/DENY 下零真实调用，且每个结果都标 `mocked`。
 
 **自测**
 ```bash
-uv run onyx tools contract            # 期望: 24 tools, 61 tests, all passed
-uv run onyx tools run calculator --args '{"expr":"6*7"}'
-uv run onyx tools contract --tool http_get --live
+uv run onyx tools contract                       # 期望: 3 列全绿，n/a 均带原因，exit 0
+uv run onyx tools contract --json                # 机器可读，供看板直接消费
+uv run onyx tools import --builtin && uv run onyx tools audit   # error=0 warn=0 info=0
+uv run onyx tools run calculator --args '{"expr":"(12+8)*3"}'   # ✓ ok, value=60
+uv run onyx tools run echo --args '{}'                          # ✗ arg_error, exit 1
+uv run onyx tools run echo --mock deny                          # ✗ skipped（mocked）, exit 1
+uv run onyx tools import examples/tools.yaml
+uv run onyx tools run fs_read --args '{"path":"../pyproject.toml"}'   # ✗ rejected path_traversal
+uv run onyx tools run http_demo --args '{}'                       # ✗ rejected（默认只放 read）
 ```
-预期（失败形态也要能复现，这是这一步真正要演示的东西）：
+实测输出（节选，2026-10-02）：
 ```
-tool        test                     status   latency  note
-calculator  basic                    PASS     0.4ms
-http_get    timeout_1500ms           FAIL     1501ms ToolTimeout — deadline 未传播到 socket
-fs_read     traversal                PASS     —        blocked as expected (SandboxDenied)
+┌─────────────────────────────┬───────────┬──────┬──────┬─────┬───────────────┐
+│断言                         │ python_fn │ mock │ http │ mcp │ ollama_builtin│
+│valid_args_ok                │     ✓     │  ✓   │  ✓   │  —  │       —       │
+│timeout_is_reported          │     ✓     │ n/a  │  ✓   │  —  │       —       │
+│mock_policy_makes_no_real_c… │    n/a    │  ✓   │  ✓   │  —  │       —       │
+└─────────────────────────────┴───────────┴──────┴──────┴─────┴───────────────┘
+python_fn    通过 7 · 失败 0 · 不适用 1
+mock         通过 7 · 失败 0 · 不适用 1
+http         通过 8 · 失败 0 · 不适用 0
 ```
 
-**验收 DoD**：7 条契约断言在 5 个 executor 上全过（`ollama_builtin` 允许 `not_applicable` 但须写明原因）；故意注入的 timeout 缺陷能被检出并修复。
+**故意注入的缺陷必须能被检出**（`tests/unit/test_tools_http_fs.py`、`test_tools_executors.py`）：
+```
+DeadlineIgnoringHttp（无视 ctx.deadline_ms）
+  → handler 从 request.extensions["timeout"] 读到 read=15.0 > 0.05 → 返回 500
+  → error_kind=error 而非 timeout → 断言变红；对照组（正常执行器）报 timeout
+DeadlineIgnoringExecutor（抹掉 deadline）      → timeout_is_reported 失败且 applicable=True
+UnguardedExecutor（绕过 guarded_call 直接返回成功）→ 3 条断言同时变红
+```
+> httpx 会把有效超时放进 `request.extensions["timeout"]`（已实测，见下），
+> 所以"deadline 有没有传到 socket"是**可观测的**，不必靠一个真实慢服务器去猜。
+> 这一步不传播的后果不是报错，而是线程池 worker 被卡住的请求永久占用——
+> 现象是"越来越慢"，属于最难查的那一类。
+
+**验收 DoD**：8 条契约断言在 3 个已实现执行器上全部适用并通过（`mcp`/`ollama_builtin`
+显示为未实现并写明 S16，`python_fn`/`mock` 各自的 1 条 n/a 都带原因）；
+3 种注入缺陷全部被检出；`ruff` + 3 条 import-linter 契约 + 全量离线测试通过。
 
 **提交**：`feat(tools): executors, sandbox, contract runner`
 
@@ -699,7 +742,7 @@ uv run pytest tests/contract -q
 | S8 | `curl /api/fleet` + `npm run test` | 与 CLI 数字一致；unknown 渲染为 — |
 | S9 | `pytest -m e2e` | 对话→trace→归因→转 case 全链路 |
 | S10 | `onyx tools cost` | 与 `token explain` 的 `tool_defs` 同源一致 |
-| S11 | `onyx tools contract` | 7 条断言 × 5 executor 全过 |
+| S11 | `onyx tools contract` | 8 条断言 × 3 executor 全过；n/a 均带原因；注入缺陷能检出 |
 | S12 | `onyx tools fire --mock` | NO_CALL/WRONG_TOOL/BAD_ARGS 可区分；零真实网络 |
 | S13 | `onyx eval run --task intent_classification` | macro_f1 + CI + 混淆对；mock 也能跑 |
 | S14 | `onyx eval run --task tool_selection --k 3` | skip 带原因；resume 不重复计费 |

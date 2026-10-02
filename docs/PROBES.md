@@ -218,6 +218,29 @@
 heuristic 档对该模型输出估 71 token（引擎 47），因为它按 1.0 token/字 估中文，
 而该模型实际是 0.679 —— **这正是 heuristic 必须标 `confidence=low` 的原因**。
 
+### P22 · httpx 把有效超时暴露在 `request.extensions["timeout"]` ✅（S11 实测）
+
+```python
+with httpx.Client(transport=httpx.MockTransport(handler), timeout=httpx.Timeout(1.234)) as c:
+    c.request("GET", "http://x.invalid/y")
+# handler 里读到：
+# request.extensions == {'timeout': {'connect': 1.234, 'read': 1.234,
+#                                    'write': 1.234, 'pool': 1.234}}
+```
+
+**为什么这条值得单独记**：它让"deadline 有没有传到 socket"变成**可断言的**，
+不必起一个真实慢服务器去猜。`tools/executors/http.py` 的契约 handler 就是靠它自检的——
+若执行器无视 `ctx.deadline_ms`，handler 读到 `read=15.0 > 0.05` 就返回 500，
+契约断言 `timeout_is_reported` 随即变红。
+
+不传播的后果不是报错，而是 `run_with_deadline` 放弃等待后底层请求继续阻塞，
+永久占用 `ThreadPoolExecutor` 的一个 worker；多来几次工具子系统整体变慢，
+现象是"越来越慢"而不是"失败"——最难归因的那一类。
+
+> 附带确认：`MockTransport` **不会**因为 handler 里 `time.sleep()` 而触发超时
+> （它不看真实耗时），所以模拟超时只能由 handler 主动 `raise httpx.ReadTimeout`。
+> 这也说明"用 sleep 测超时"在 mock 传输下是无效测试。
+
 ---
 
 ## 3. 仍未定 / 待测
