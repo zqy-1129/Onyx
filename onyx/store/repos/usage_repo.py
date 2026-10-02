@@ -125,6 +125,43 @@ class UsageRepo:
         )
         return UsageBundle(usage=usage, alts=alts, parts=parts)
 
+    def by_prefill_mode(self, *, since: str | None = None) -> dict[str, int]:
+        """冷/热分布。两者混算会得到一个既不代表冷启动也不代表稳态的数字（PROBES P11）。"""
+        sql = "SELECT COALESCE(prefill_mode,'unknown') AS k, COUNT(*) AS n FROM usage"
+        params: tuple[object, ...] = ()
+        if since:
+            sql = (
+                "SELECT COALESCE(u.prefill_mode,'unknown') AS k, COUNT(*) AS n "
+                "FROM usage u JOIN trace t ON t.id=u.trace_id WHERE t.started_at>=? "
+                "GROUP BY k ORDER BY n DESC"
+            )
+            params = (since,)
+        else:
+            sql += " GROUP BY k ORDER BY n DESC"
+        return {str(r["k"]): int(r["n"]) for r in self.db.query(sql, params)}
+
+    def timeseries(self, *, bucket_minutes: int = 60, since: str | None = None, limit: int = 200) -> list[dict]:
+        """按时间桶聚合，供看板 sparkline / 折线用。桶边界在 SQL 里截断，避免把数据拉到前端再算。"""
+        sql = (
+            "SELECT strftime('%Y-%m-%dT%H:', t.started_at) "
+            f"|| printf('%02d', (CAST(strftime('%M', t.started_at) AS INTEGER) / {max(1, int(bucket_minutes))}) "
+            f"* {max(1, int(bucket_minutes))}) AS bucket, "
+            "COUNT(*) AS traces, "
+            "COALESCE(SUM(u.in_tokens),0) AS in_tokens, "
+            "COALESCE(SUM(u.out_tokens),0) AS out_tokens, "
+            "COALESCE(AVG(u.decode_tps),0) AS decode_tps, "
+            "COALESCE(AVG(CASE WHEN u.prefill_mode='cold' THEN u.prefill_tps END),0) AS cold_prefill_tps, "
+            "COALESCE(AVG(CASE WHEN u.prefill_mode='warm' THEN u.prefill_tps END),0) AS warm_prefill_tps "
+            "FROM usage u JOIN trace t ON t.id=u.trace_id"
+        )
+        params: list[object] = []
+        if since:
+            sql += " WHERE t.started_at>=?"
+            params.append(since)
+        sql += f" GROUP BY bucket ORDER BY bucket DESC LIMIT {max(1, min(int(limit), 2000))}"
+        rows = self.db.query(sql, params)
+        return [dict(r) for r in reversed(rows)]
+
     def summarize(self, *, since: str | None = None, model_id: str | None = None) -> UsageSummary:
         where: list[str] = []
         params: list[object] = []

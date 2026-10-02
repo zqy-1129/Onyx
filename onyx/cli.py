@@ -733,6 +733,24 @@ def calibrate(
         runtime.close()
 
 
+# ── serve ──────────────────────────────────────────────────────────
+@app.command()
+def serve(
+    host: str = typer.Option("127.0.0.1", "--host"),
+    port: int = typer.Option(8000, "--port"),
+    url: str = typer.Option("http://127.0.0.1:11434", "--url", help="Ollama base url"),
+    db: Path = typer.Option(None, "--db"),
+) -> None:
+    """启动 REST + SSE 服务（看板后端）。"""
+    import uvicorn
+
+    from onyx.api.app import create_app
+
+    app_obj = create_app(base_url=url, db_path=str(db) if db else None)
+    typer.echo(f"Onyx API: http://{host}:{port}/api/docs")
+    uvicorn.run(app_obj, host=host, port=port, log_level="info")
+
+
 def main() -> None:
     app()
 

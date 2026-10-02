@@ -126,6 +126,7 @@ class MockProvider:
     def __init__(
         self,
         id: str = "mock",
+        base_url: str = "mock://",
         scripts: dict[str, MockScript] | None = None,
         *,
         default: MockScript = DEFAULT_SCRIPT,
@@ -133,6 +134,7 @@ class MockProvider:
         models: tuple[str, ...] = ("mock/echo",),
     ) -> None:
         self.id = id
+        self.base_url = base_url  # 仅为与真实 provider 的构造签名兼容，不发起任何请求
         self.scripts = dict(scripts or {})
         self.default = default
         self.clock = clock
@@ -142,7 +144,7 @@ class MockProvider:
     # ── 元信息 ────────────────────────────────────────────────────
     def info(self) -> ProviderInfo:
         return ProviderInfo(
-            id=self.id, kind=self.kind, base_url="mock://", api_style=ApiStyle.NATIVE,
+            id=self.id, kind=self.kind, base_url=self.base_url, api_style=ApiStyle.NATIVE,
             version="0.0.0-mock", reachable=True, caps=self.capabilities(),
         )
 

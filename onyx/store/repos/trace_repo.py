@@ -104,10 +104,17 @@ class TraceRepo:
         rows = self.db.query(f"SELECT * FROM trace{where} ORDER BY id DESC LIMIT ?", params)
         return [self._from_row(r) for r in rows]
 
-    def count(self, *, since: str | None = None) -> int:
+    def count(self, *, since: str | None = None, status: str | None = None) -> int:
+        clauses: list[str] = []
+        params: list[object] = []
         if since:
-            return int(self.db.scalar("SELECT COUNT(*) FROM trace WHERE started_at>=?", (since,), 0))
-        return int(self.db.scalar("SELECT COUNT(*) FROM trace", default=0))
+            clauses.append("started_at>=?")
+            params.append(since)
+        if status:
+            clauses.append("status=?")
+            params.append(status)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        return int(self.db.scalar(f"SELECT COUNT(*) FROM trace{where}", params, 0))
 
     # ── tool calls ────────────────────────────────────────────────
     def insert_tool_call(self, rec: ToolCallRecord) -> None:
