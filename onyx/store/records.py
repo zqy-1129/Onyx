@@ -235,3 +235,91 @@ class ToolRunRecord:
     deterministic: bool | None = None
     idempotent: bool | None = None
     extra: dict[str, Any] = field(default_factory=dict)
+
+
+# ── 评测（L5）─────────────────────────────────────────────────────
+@dataclass(frozen=True, slots=True)
+class DatasetRecord:
+    id: str
+    imported_at: str
+    upstream: str = ""
+    revision: str = ""
+    license: str = ""
+    splits: dict[str, int] = field(default_factory=dict)
+    n_cases: int | None = None
+    loader: str = ""
+    notes: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class CaseRecord:
+    """一条评测样本的落库形状。与 `eval.task.Case` 一一对应。"""
+
+    id: str
+    dataset_id: str
+    input: dict[str, Any]
+    expect: dict[str, Any]
+    ord: int = 0
+    kind: str = "single"
+    tools: tuple[dict[str, Any], ...] = ()
+    fixture: dict[str, Any] = field(default_factory=dict)
+    meta: dict[str, Any] = field(default_factory=dict)
+    tags: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class TaskRecord:
+    id: str
+    name: str
+    metrics: tuple[str, ...] = ()
+    grader: dict[str, Any] = field(default_factory=dict)
+    dataset_id: str | None = None
+    sample_params: dict[str, Any] = field(default_factory=dict)
+    k: int = 1
+    budget: dict[str, Any] = field(default_factory=dict)
+    sandbox: bool = False
+    extra: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class RunRecord:
+    id: str
+    task_id: str
+    model_id: str
+    started_at: str
+    status: str = "running"
+    provider_id: str | None = None
+    finished_at: str | None = None
+    seed: int | None = None
+    app_version: str = ""
+    git_rev: str = ""
+    params_snapshot: dict[str, Any] = field(default_factory=dict)
+    config: dict[str, Any] = field(default_factory=dict)
+    n_cases: int = 0
+    n_done: int = 0
+    n_error: int = 0
+    n_skipped: int = 0
+    aggregate: dict[str, Any] = field(default_factory=dict)
+    #: 评测自身的开销。judge 也是本地模型时同样吃 GPU 与时间，必须计入（DESIGN R13）
+    cost: dict[str, Any] = field(default_factory=dict)
+    notes: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class GradeRecord:
+    id: str
+    eval_run_id: str
+    case_id: str
+    score: float
+    verdict: str
+    graded_at: str
+    seq: int = 0
+    trace_id: str | None = None
+    passed: bool | None = None
+    invalid_format: bool = False
+    out_of_set: bool = False
+    metrics: dict[str, Any] = field(default_factory=dict)
+    error: str | None = None
+    judge_model_id: str | None = None
+    judge_usage: dict[str, Any] = field(default_factory=dict)
+    extra: dict[str, Any] = field(default_factory=dict)

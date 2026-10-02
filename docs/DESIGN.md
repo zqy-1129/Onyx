@@ -203,31 +203,38 @@ CREATE TABLE tool_run(
 CREATE TABLE dataset(
   id TEXT PRIMARY KEY, upstream TEXT, revision TEXT, license TEXT,
   split_json TEXT, n_cases INTEGER, loader TEXT, notes TEXT, imported_at TEXT);
-CREATE TABLE case(
+-- 表名是 eval_case / eval_task 而不是 case / task：`CASE` 是 SQL 关键字，
+-- 用裸名会让每条查询都得写引号，而漏写一处的报错信息完全指不到真正的原因。
+CREATE TABLE eval_case(
   id TEXT PRIMARY KEY, dataset_id TEXT NOT NULL REFERENCES dataset(id), ord INTEGER,
   kind TEXT,                             -- single|multi_turn|multi_step|parallel|no_call_needed
   input_json TEXT NOT NULL, tools_json TEXT, expect_json TEXT NOT NULL,
   fixture_json TEXT,                     -- 工具返回值桩：保证评测可复现（§8.4）
   meta_json TEXT, tags TEXT);
-CREATE TABLE task(
+CREATE TABLE eval_task(
   id TEXT PRIMARY KEY, name TEXT NOT NULL, dataset_id TEXT REFERENCES dataset(id),
   metrics_json TEXT NOT NULL, grader_json TEXT NOT NULL,
   sample_params_json TEXT, k INTEGER DEFAULT 1,   -- pass^k 次数（Ollama 不支持 n → 循环采样）
   budget_json TEXT, sandbox INTEGER DEFAULT 0, extra_json TEXT);
 CREATE TABLE eval_run(
-  id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES task(id),
+  id TEXT PRIMARY KEY, task_id TEXT NOT NULL REFERENCES eval_task(id),
   model_id TEXT NOT NULL, provider_id TEXT,
   started_at TEXT, finished_at TEXT, status TEXT,
   seed INTEGER, app_version TEXT, git_rev TEXT,
   params_snapshot_json TEXT, config_json TEXT,
   n_cases INTEGER, n_done INTEGER, n_error INTEGER, aggregate_json TEXT, notes TEXT);
 CREATE TABLE grade(
-  id TEXT PRIMARY KEY, eval_run_id TEXT NOT NULL REFERENCES eval_run(id),
-  case_id TEXT NOT NULL, seq INTEGER NOT NULL DEFAULT 0, trace_id TEXT,
+  id TEXT PRIMARY KEY, eval_run_id TEXT NOT NULL REFERENCES eval_run(id) ON DELETE CASCADE,
+  case_id TEXT NOT NULL, seq INTEGER NOT NULL DEFAULT 0,
+  trace_id TEXT,                             -- 刻意不设 REFERENCES：trace 可能因保留策略被清理，
+                                             -- 而分数必须留着（清理 trace 不该连带抹掉评测历史）
   score REAL NOT NULL, passed INTEGER,
   verdict TEXT,                          -- correct|partial|wrong|invalid_format|hallucinated_tool|timeout|refused
   metrics_json TEXT, error TEXT, judge_model_id TEXT, graded_at TEXT);
-CREATE INDEX idx_grade_run ON grade(eval_run_id, case_id);
+CREATE INDEX idx_grade_run ON grade(eval_run_id, case_id, seq);
+-- 这条唯一约束是 `--resume` 幂等的基础：重跑同一 case 是覆盖而不是追加，
+-- 否则中断后重来会产生两份分数，聚合值被悄悄稀释而报告上看不出来
+CREATE UNIQUE INDEX uq_grade_run_case_seq ON grade(eval_run_id, case_id, seq);
 
 CREATE TABLE anomaly(
   id TEXT PRIMARY KEY, trace_id TEXT, code TEXT NOT NULL, severity TEXT NOT NULL,

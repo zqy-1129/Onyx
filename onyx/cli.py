@@ -1348,6 +1348,400 @@ def _policy_from_cli(allow: str | None):
     )
 
 
+# ── eval ─────────────────────────────────────────────────────────
+eval_app = typer.Typer(help="评测：数据集、任务、运行与分数下钻", no_args_is_help=True)
+app.add_typer(eval_app, name="eval")
+
+
+def _eval_runtime(url: str, db: Path | None, provider_kind: str = "ollama"):
+    """评测跑在真实 runtime 上：分数与 trace 共用同一套存储与观测。"""
+    return _runtime(url, db, sample_gpu=provider_kind == "ollama", provider_kind=provider_kind)
+
+
+@eval_app.command("ls")
+def eval_ls(
+    db: Path = typer.Option(None, "--db"),
+    limit: int = typer.Option(10, "--limit"),
+) -> None:
+    """列出数据集、内置任务与最近的运行。"""
+    from rich.console import Console
+    from rich.table import Table
+
+    from onyx.eval.tasks import task_ids
+    from onyx.store.repos import EvalRepo
+
+    console = Console()
+    settings = _settings()
+    database = Database(_db_path(settings, db))
+    try:
+        repo = EvalRepo(database)
+        datasets = repo.list_datasets()
+        table = Table(title=f"数据集（{len(datasets)}）", pad_edge=False)
+        for column in ("id", "条数", "来源", "revision", "子集"):
+            table.add_column(column)
+        for item in datasets:
+            table.add_row(
+                item.id, str(item.n_cases if item.n_cases is not None else "—"),
+                item.upstream or "—", item.revision or "—",
+                ", ".join(f"{k}:{v}" for k, v in item.splits.items()) or "—",
+            )
+        console.print(table)
+
+        typer.echo(f"内置任务: {', '.join(task_ids())}")
+
+        runs = repo.list_runs(limit=limit)
+        run_table = Table(title=f"最近 {len(runs)} 次运行", pad_edge=False)
+        for column in ("run_id", "任务", "模型", "状态", "n", "主分数", "开始"):
+            run_table.add_column(column)
+        for run in runs:
+            run_table.add_row(
+                run.id, run.task_id, run.model_id, run.status, str(run.n_cases),
+                _headline_score(run.aggregate), run.started_at,
+            )
+        console.print(run_table)
+    finally:
+        database.close()
+
+
+#: 主分数的候选指标，按优先级。**只显示任务声明过的第一个指标**，
+#: 绝不因为它是 None 就悄悄换成另一个——那会让"macro_f1 未知"显示成"得了 0 分"，
+#: 而这两个结论的修法完全相反（前者是根本没有可判定样本，后者是模型不行）
+_HEADLINE_METRICS = ("macro_f1", "accuracy", "must_call_acc", "pass_hat_k", "score")
+
+
+def _headline_score(aggregate: dict) -> str:
+    """列表页只显示一个数，但必须**带上指标名**，且未知就显示「—」。"""
+    if not aggregate:
+        return "—"
+    if aggregate.get("skip"):
+        return "skipped"
+    for key in _HEADLINE_METRICS:
+        if key not in aggregate:
+            continue
+        value = aggregate.get(key)
+        if value is None:
+            return f"{key} —（无可判定样本）"
+        text = f"{key} {_fmt(value)}"
+        if key == "macro_f1":
+            ci = aggregate.get("macro_f1_ci")
+            low, high = _ci_get(ci, "low"), _ci_get(ci, "high")
+            if low is not None and high is not None:
+                text += f" [{_fmt(low)}–{_fmt(high)}]"
+        if aggregate.get("low_confidence"):
+            text += " ⚠低样本"
+        return text
+    return "—"
+
+
+@eval_app.command("import")
+def eval_import(
+    file: Path = typer.Argument(None, exists=True, dir_okay=False, readable=True),
+    id: str = typer.Option(None, "--id", help="数据集 id；默认取文件名 + -v1"),
+    builtin: str = typer.Option(None, "--builtin", help="导入内置数据集，例如 intent_zh"),
+    db: Path = typer.Option(None, "--db"),
+    upstream: str = typer.Option("", "--upstream"),
+    revision: str = typer.Option("", "--revision"),
+    license: str = typer.Option("", "--license", help="上游许可证；转载数据集必须记"),
+) -> None:
+    """导入数据集（JSONL 或内置生成器），并把来历一并落库。
+
+    来历（upstream/revision/license）不是元数据装饰：换了数据集版本之后
+    两次评测的分数不可比，不记 revision 就永远发现不了这件事。
+    """
+    from onyx.eval.datasets.loader import DatasetError, load_builtin, load_jsonl
+    from onyx.store.repos import EvalRepo
+
+    try:
+        if builtin:
+            dataset = load_builtin(builtin, dataset_id=id, upstream=upstream or None,
+                                   revision=revision or None, license=license or None)
+        elif file is not None:
+            dataset = load_jsonl(file, dataset_id=id, upstream=upstream or None,
+                                 revision=revision or None, license=license or None)
+        else:
+            typer.echo("要么给出 JSONL 文件，要么用 --builtin intent_zh", err=True)
+            raise typer.Exit(2)
+    except DatasetError as exc:
+        typer.echo(f"数据集错误: {exc}", err=True)
+        raise typer.Exit(1) from None
+
+    settings = _settings()
+    database = Database(_db_path(settings, db))
+    try:
+        repo = EvalRepo(database)
+        record, cases = dataset.to_records()
+        repo.upsert_dataset(record)
+        repo.upsert_cases(cases)
+        typer.echo(f"已导入 {dataset.id}: {len(cases)} 条 · 来源 {dataset.upstream} · "
+                   f"revision {dataset.revision}")
+        for split, count in sorted(dataset.splits().items()):
+            typer.echo(f"  子集 {split:<12} {count} 条")
+    finally:
+        database.close()
+
+
+@eval_app.command("run")
+def eval_run(
+    task: str = typer.Option("intent_classification", "--task"),
+    model: str = typer.Option(..., "--model"),
+    url: str = typer.Option("http://127.0.0.1:11434", "--url"),
+    db: Path = typer.Option(None, "--db"),
+    provider: str = typer.Option("ollama", "--provider", help="ollama | mock（离线跑通管道）"),
+    dataset: str = typer.Option(None, "--dataset", help="数据集 id 或 file:<路径>；默认用任务自带的"),
+    k: int = typer.Option(1, "--k", help="每条样本采样次数（pass^k / pass@k）"),
+    limit: int = typer.Option(None, "--limit", help="只跑前 N 条"),
+    split: str = typer.Option("default", "--split", help="子集，例如 hard"),
+    seed: int = typer.Option(None, "--seed"),
+    resume: str = typer.Option(None, "--resume", help="续跑指定 run_id，跳过已评过的 case"),
+    max_wall_ms: float = typer.Option(None, "--max-wall-ms"),
+    max_tokens: int = typer.Option(None, "--max-tokens", help="覆盖任务的生成预算"),
+    json_out: bool = typer.Option(False, "--json"),
+    quiet: bool = typer.Option(False, "--quiet", help="不打进度"),
+) -> None:
+    """跑一次评测。请求全部走 gateway，所以**每个分数都能点进一条真实 trace**。
+
+    能力不足时整个任务会被 skip 并写明原因，不做隐式降级：
+    用提示词模拟工具调用得到的分数，无法与原生支持的模型比较，
+    却看不出区别——那比没有分数更糟。
+    """
+    import json as _json
+
+    from rich.console import Console
+
+    from onyx.eval.metrics import jsonable
+    from onyx.eval.runner import EvalRunner, RunConfig, wait_for
+    from onyx.eval.tasks import build_task, load_dataset
+    from onyx.store.repos import EvalRepo
+
+    console = Console()
+    try:
+        loaded = load_dataset(dataset, task_id=task)
+        overrides = {"max_tokens": max_tokens} if max_tokens else {}
+        instance = build_task(task, model=model, dataset=loaded, **overrides)
+    except KeyError as exc:
+        typer.echo(str(exc).strip("'"), err=True)
+        raise typer.Exit(2) from None
+
+    runtime = _eval_runtime(url, db, provider)
+    try:
+        repo = EvalRepo(runtime.db)
+        progress = None
+        if not quiet and not json_out:
+            def progress(done: int, total: int, case_id: str, grade) -> None:
+                typer.echo(f"\r  {done}/{total}  {case_id[:18]}  {grade.verdict}", nl=False)
+
+        runner = EvalRunner(
+            runtime.gateway, repo, instance, dataset=loaded,
+            on_progress=wait_for(progress) if progress else None,
+        )
+        config = RunConfig(
+            model=model, k=k, seed=seed, limit=limit, split=split,
+            resume_run_id=resume, max_wall_ms=max_wall_ms,
+        )
+        report = runner.run(config)
+        runtime.flush()
+        if progress:
+            typer.echo("")
+
+        if json_out:
+            typer.echo(_json.dumps({
+                "run_id": report.run_id, "task": report.task_id, "model": report.model,
+                "status": report.status, "skip_reason": report.skip_reason,
+                "n_cases": report.n_cases, "n_done": report.n_done,
+                "n_error": report.n_error, "cost": report.cost,
+                "aggregate": jsonable(report.aggregate),
+            }, ensure_ascii=False, indent=2, default=str))
+            raise typer.Exit(0 if report.status == "done" else 1)
+
+        _print_run_report(console, report, instance, k=k, seed=seed, split=split)
+        raise typer.Exit(0 if report.status == "done" else 1)
+    finally:
+        runtime.close()
+
+
+def _print_run_report(console, report, task, *, k: int, seed: int | None, split: str) -> None:
+    """人读的报告。
+
+    刻意把**内容维度**与**格式维度**分开打印（DESIGN §9.4）：
+    API-only 只能生成式打分，模型会因为"输出格式不听话"额外掉分，
+    混成一个正确率就会把格式问题误读成能力问题，而两者修法完全相反。
+    """
+
+    aggregate = report.aggregate
+    if report.status == "skipped":
+        console.print(f"[yellow]SKIPPED[/yellow] {report.task_id} · {report.model}")
+        console.print(f"  原因: {report.skip_reason}")
+        return
+
+    header = (
+        f"{report.task_id} · {report.model} · n={report.n_cases} · "
+        f"split={split} · k={k}" + (f" · seed={seed}" if seed is not None else "")
+        + (f" · [yellow]{report.status}[/yellow]" if report.status != "done" else "")
+    )
+    console.print(f"[bold]{header}[/bold]")
+    if aggregate.get("resumed"):
+        console.print(
+            f"[dim]续跑自 {aggregate.get('already_graded_before')} 条已有 grade，"
+            "聚合包含全部样本[/dim]"
+        )
+
+    ci = aggregate.get("macro_f1_ci") or {}
+    console.print(
+        f"  [内容] macro_f1 [bold]{_fmt(aggregate.get('macro_f1'))}[/bold]"
+        + (f" [95% CI {_fmt(_ci_get(ci, 'low'))}–{_fmt(_ci_get(ci, 'high'))}]"
+           if _ci_get(ci, "low") is not None else "")
+        + f"   acc {_fmt(aggregate.get('accuracy'))}"
+        f"   bal_acc {_fmt(aggregate.get('balanced_accuracy'))}"
+    )
+    console.print(
+        f"  [格式] format_valid {_fmt(aggregate.get('format_valid_rate'))}"
+        f"   invalid_format {_fmt(aggregate.get('invalid_format_rate'))}"
+        f"   out_of_label {_fmt(aggregate.get('out_of_label_rate'))}"
+        f"   refused {_fmt(aggregate.get('refusal_rate'))}"
+    )
+    if aggregate.get("low_confidence"):
+        console.print("[yellow]  ⚠ 样本量低于 100，CI 只说明测过了，不足以支撑决策[/yellow]")
+    console.print(f"  [dim]打分口径: {aggregate.get('scoring', '—')}"
+                  "（API-only 拿不到受约束 logprob，分数不可与公开 leaderboard 直接比较）[/dim]")
+
+    per_class = aggregate.get("per_class_f1") or {}
+    if per_class:
+        console.print("  逐类 F1: " + " / ".join(
+            f"{label} {_fmt(value)}" for label, value in sorted(per_class.items())
+        ))
+    confusions = aggregate.get("top_confusions") or []
+    if confusions:
+        console.print("  混淆集中: " + ", ".join(
+            f"{item['expected']}→{item['actual']} ×{item['count']}" for item in confusions
+        ))
+    if k > 1:
+        console.print(
+            f"  [稳定性] pass^{k} {_fmt(aggregate.get('pass_hat_k'))}"
+            f"   pass@{k} {_fmt(aggregate.get('pass_at_k'))}"
+            f"   缺口 {_fmt(aggregate.get('stability_gap'))}"
+            "  ← 缺口大＝可用但不可靠"
+        )
+
+    verdicts = aggregate.get("verdicts") or {}
+    if verdicts:
+        console.print("  判定分布: " + " / ".join(
+            f"{name} {count}" for name, count in sorted(verdicts.items(), key=lambda kv: -kv[1])
+        ))
+    cost = report.cost or {}
+    unknown = cost.get("in_tokens_unknown") or 0
+    console.print(
+        f"  成本: in {cost.get('in_tokens', 0):,} tok · out {cost.get('out_tokens', 0):,} tok · "
+        f"{cost.get('requests', 0)} 请求 · {cost.get('wall_ms', 0):,.0f} ms"
+        + (f" · [yellow]{unknown} 条无计数[/yellow]" if unknown else "")
+    )
+    console.print(
+        f"  run_id [bold]{report.run_id}[/bold]   "
+        f"下钻: onyx eval show {report.run_id}"
+    )
+
+
+def _fmt(value, digits: int = 3) -> str:
+    """未知显示「—」，绝不显示 0（UI_DESIGN R2）。"""
+    if value is None:
+        return "—"
+    if isinstance(value, bool):
+        return "是" if value else "否"
+    if isinstance(value, int | float):
+        return f"{value:.{digits}f}"
+    return str(value)
+
+
+def _ci_get(ci, key: str):
+    """读置信区间的一个端点。
+
+    必须同时接受 `CI` 对象与 dict：刚跑完时它是内存里的 dataclass，
+    经 `eval show` 从库里读回来则是 JSON 解码后的 dict。只支持一种的话，
+    另一条路径会在运行时才炸。
+    """
+    if ci is None:
+        return None
+    if isinstance(ci, dict):
+        return ci.get(key)
+    return getattr(ci, key, None)
+
+
+@eval_app.command("show")
+def eval_show(
+    run_id: str = typer.Argument(..., help="eval run 输出的 run_id"),
+    db: Path = typer.Option(None, "--db"),
+    limit: int = typer.Option(20, "--limit", help="列出多少条 grade"),
+    verdict: str = typer.Option(None, "--verdict", help="只看某个判定，例如 out_of_label"),
+    json_out: bool = typer.Option(False, "--json"),
+) -> None:
+    """看一次运行的汇总与逐条 grade（含 trace_id，可直接跳进那条 trace）。"""
+    import json as _json
+
+    from rich.console import Console
+    from rich.table import Table
+
+    from onyx.store.repos import EvalRepo
+
+    console = Console()
+    settings = _settings()
+    database = Database(_db_path(settings, db))
+    try:
+        repo = EvalRepo(database)
+        run = repo.get_run(run_id)
+        if run is None:
+            typer.echo(f"找不到 run {run_id!r}", err=True)
+            raise typer.Exit(2)
+        grades = repo.list_grades(run_id, verdict=verdict, limit=limit)
+        if json_out:
+            typer.echo(_json.dumps({
+                "run": {
+                    "id": run.id, "task_id": run.task_id, "model_id": run.model_id,
+                    "status": run.status, "started_at": run.started_at,
+                    "finished_at": run.finished_at, "seed": run.seed,
+                    "app_version": run.app_version, "git_rev": run.git_rev,
+                    "params_snapshot": run.params_snapshot, "config": run.config,
+                    "n_cases": run.n_cases, "n_done": run.n_done, "n_error": run.n_error,
+                    "aggregate": run.aggregate, "cost": run.cost,
+                },
+                "grades": [
+                    {"case_id": g.case_id, "seq": g.seq, "verdict": g.verdict,
+                     "score": g.score, "passed": g.passed, "trace_id": g.trace_id,
+                     "invalid_format": g.invalid_format, "out_of_set": g.out_of_set,
+                     "metrics": g.metrics, "error": g.error}
+                    for g in grades
+                ],
+            }, ensure_ascii=False, indent=2, default=str))
+            return
+
+        console.print(
+            f"[bold]{run.task_id}[/bold] · {run.model_id} · {run.status} · "
+            f"n={run.n_cases} done={run.n_done} error={run.n_error}"
+        )
+        console.print(
+            f"[dim]seed={run.seed if run.seed is not None else '—'} "
+            f"app={run.app_version or '—'} git={run.git_rev or '—'} "
+            f"params={run.params_snapshot or '—'}[/dim]"
+        )
+        console.print(f"主分数: {_headline_score(run.aggregate)}")
+        table = Table(title=f"grade（前 {len(grades)} 条）", pad_edge=False)
+        for column in ("case", "seq", "判定", "分", "格式", "期望", "预测", "trace"):
+            table.add_column(column)
+        for grade in grades:
+            metrics = grade.metrics or {}
+            table.add_row(
+                grade.case_id[:20], str(grade.seq), grade.verdict, f"{grade.score:.2f}",
+                "✗" if grade.invalid_format else "✓",
+                str(metrics.get("expected", "—")), str(metrics.get("predicted", "—")),
+                (grade.trace_id or "—")[:12],
+            )
+        console.print(table)
+        if grade_errors := [g for g in grades if g.error]:
+            console.print("[dim]错误样例:[/dim]")
+            for grade in grade_errors[:3]:
+                console.print(f"  {grade.case_id[:20]} [{grade.verdict}] {grade.error[:120]}")
+    finally:
+        database.close()
+
+
 def _force_utf8_stdio() -> None:
     """Windows 中文环境下 stdout 默认 gbk，`✓ ✗ —` 这类字符会直接抛 UnicodeEncodeError。
 

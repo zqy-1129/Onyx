@@ -68,7 +68,7 @@ forbidden_modules = [
 [[tool.importlinter.contracts]]
 name = "network IO confined to llm and the http tool executor"
 type = "forbidden"
-source_modules = ["onyx.store", "onyx.core", "onyx.obs"]
+source_modules = ["onyx.store", "onyx.core", "onyx.obs", "onyx.eval"]
 forbidden_modules = ["httpx", "requests", "urllib3"]
 
 # tools 层默认也不许碰网络：只有 executors.http 这一个模块可以，

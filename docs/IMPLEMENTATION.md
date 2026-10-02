@@ -651,35 +651,88 @@ uv run onyx traces ls --limit 3        # 每一步都是独立 trace，靠 root_
 
 ---
 
-## S13 — 评测内核 + 意图识别任务
+## S13 — 评测内核 + 意图识别任务 ✅
 
 **产出文件**
 ```
-onyx/eval/task.py      # EvalTask/Case/Grade 契约 + capability skip
-onyx/eval/metrics.py   # prf1/macro/balanced-accuracy/confusion/hit@k/pass^k/bootstrap-ci
-onyx/eval/graders/{exact,set_match,regex,json_schema,fuzz}.py
-onyx/eval/datasets/{cache,loader,sources}.py
-onyx/eval/datasets/builtin/intent_zh.jsonl     # ≥200 条，模板生成 + 人工补充
-onyx/eval/tasks/intent_classification.py
-tests/unit/{test_metrics,test_graders,test_intent_task}.py
+onyx/eval/task.py                              # EvalTask/Case/Grade/Skip 契约 + 能力跳过
+onyx/eval/metrics.py                           # prf1/macro/balanced-acc/confusion/hit@k/pass^k/bootstrap-ci/jsonable
+onyx/eval/graders/{normalize,exact,set_match,regex,json_schema,fuzz}.py
+onyx/eval/datasets/loader.py                   # JSONL 载入 + 来历 + 子集选择
+onyx/eval/datasets/builtin/intent_zh.py        # 数据集**生成器**（不是来历不明的 JSONL）
+onyx/eval/datasets/builtin/intent_zh.jsonl     # 236 条，由生成器产出
+onyx/eval/tasks/intent_classification.py       # + tasks/__init__.py 的任务注册表
+onyx/eval/runner.py                            # build → gateway → grade → aggregate
+onyx/store/migrations/0004_eval.sql            # dataset/eval_case/eval_task/eval_run/grade
+onyx/store/repos/eval_repo.py                  # + records.py 的 5 个记录类
+tests/unit/{test_metrics,test_graders,test_intent_task,test_eval_runner,test_cli_eval}.py
 ```
-- `test_metrics` 用**手算好的小表格**断言（2×2 混淆矩阵的 P/R/F1、macro、CI 边界），不用浮点容差掩盖逻辑错。
-- `test_intent_task` 用 `mock provider` 的四类响应：正确 / 错标签 / **越界标签（不在标签集）** / 附加解释文字。断言四类得分与 `verdict` 各不相同。
-- `Grade` 必须把"格式不合法"与"内容答错"分成两个维度（`invalid_format` 单独计数，DESIGN §9.4）。
+
+**数据集画像**（`intent_zh.py` 的 `stats()`，seed=20261003）
+```
+n=236  hard=32  unique=236（无重复）
+labels: 转账 73 / 投诉 62 / 其他 53 / 查余额 48   ← min/max = 0.66，不均衡但不至于让 accuracy 骗人
+子集: default 236 · hard 32 · template 204
+```
+刻意包含 `其他` 兜底类：没有它，模型面对越界输入只能硬塞进四个类之一，
+于是"越界标签率"永远测不出来——而它恰恰是幻觉的主要信号。
+生成器打散顺序后再编 `ord`，所以 `--limit 20` 取到的前 20 条覆盖 4 个类（有测试断言）。
+
+**指标的三条纪律**
+1. **零除返回 None，不是 0**。没有正例时 F1 未定义；填 0 会让一个根本没考到的类
+   把 macro 平均拖低，看起来像模型能力差。宏平均**只对定义得出来的类**求平均。
+2. **CI 必须真的在算**：重采样单位是 case，统计量每次重算。把算好的分数重排求均值，
+   对 macro_f1 这类非线性统计量会得到一个"看起来合理但是错的"区间。
+3. **零宽区间不等于确定**：20 条全对时每次重采样仍全对，区间就是 [1.0, 1.0]。
+   这是退化 bootstrap，所以 `low_confidence`（n<100）必须跟着一起看。
+
+**Grade 的两个正交维度**（DESIGN §9.4 的落地点）
+
+| 模型输出 | verdict | invalid_format | 说明 |
+|---|---|---|---|
+| `转账` | correct | False | 干净且正确 |
+| `查余额` | wrong | False | 格式对了内容错——真的分类错误 |
+| `退款` | out_of_label | True | **标签集之外的幻觉**，不是"选错"，不进混淆矩阵 |
+| `这个意图是转账。` | correct | **True** | 内容对但没遵守格式；仍可判，但格式合法率要扣 |
+| `不是转账，是查余额` | invalid_format | True | 出现两个候选 ⇒ **不可判定**，绝不猜 |
+| 空正文 + 有 thinking | invalid_format | True | P12：预算被 thinking 吃光，与"真的没输出"分开报 |
+| 引擎失败 | error | — | `attributable=False`，不进模型能力分母 |
 
 **自测**
 ```bash
-uv run onyx eval import onyx/eval/datasets/builtin/intent_zh.jsonl --id intent-zh-v1
-uv run onyx eval run --task intent_classification --model mock/classifier --limit 20   # 离线跑通管道
-uv run onyx eval run --task intent_classification --model qwen3:8b --k 1 --seed 42
+uv run pytest tests/unit/test_metrics.py tests/unit/test_graders.py -q       # 72 passed
+uv run pytest tests/unit/test_intent_task.py tests/unit/test_eval_runner.py -q  # 54 passed
+uv run pytest tests/unit/test_cli_eval.py -q                                  # 23 passed
+uv run onyx eval import --builtin intent_zh
+uv run onyx eval run --task intent_classification --model mock/echo --provider mock --limit 20 --seed 42
+uv run onyx eval run --task intent_classification --model qwen3.5:9b --limit 20  --seed 42 --json
+uv run onyx eval run --task intent_classification --model qwen3.5:9b --limit 200 --seed 42 --json
+uv run onyx eval show <run_id>          # 每条 grade 都带 trace_id，可直接跳进那条 trace
+uv run onyx eval ls
 ```
-预期最后一条：
-```
-intent_classification · qwen3:8b · n=200 · seed=42
-macro_f1 0.812 [95% CI 0.771–0.849]   acc 0.835   format_valid 0.995   out_of_label 0.005
-per-class: 转账 0.92 / 查余额 0.88 / 投诉 0.71 / 其他 0.62 ← 「其他」最低，混淆集中在 投诉↔其他
-```
-**验收 DoD**：mock 与真实模型都能跑完；`--limit 20` 与 `--limit 200` 的 macro_f1 有可见差异且 CI 变宽（证明区间真的在算，不是常数）；每条 grade 有 `trace_id`。
+真机实测（qwen3.5:9b，2026-10-03）：
+
+| | n | macro_f1 | 95% CI | 宽度 | acc | format_valid | out_of_label | 错误 |
+|---|---|---|---|---|---|---|---|---|
+| `--limit 20` | 20 | 1.0000 | [1.000, 1.000] | 0.000（退化，已标 ⚠低样本） | 1.000 | 1.000 | 0.000 | 0 |
+| `--limit 200` | 200 | 0.9898 | [0.974, 1.000] | 0.026 | 0.990 | 1.000 | 0.000 | 0 |
+| 全量 | 236 | 0.9913 | [0.978, 1.000] | 0.022 | 0.992 | 1.000 | 0.000 | 0 |
+
+全量那次：236/236 完成、0 错误、38 秒、20,395 in / 521 out token；
+混淆仅 2 处（转账→查余额 ×1、投诉→其他 ×1）。
+> 分数很高有一部分是数据集本身的性质：它由模板生成，分布与提示词风格一致。
+> 真机验证的是**管道正确**，不是"这个模型意图识别很强"。要得出后者需要真实语料。
+
+**这一步改掉的一个既有缺陷**：`eval ls` / `eval show` 的主分数在 `macro_f1=None` 时
+会悄悄改显示 `pass_hat_k` 的 `0.000`——把"一条可判定样本都没有"显示成"模型得了 0 分"。
+现在主分数**必须带指标名**，未知就是 `macro_f1 —（无可判定样本）`（UI_DESIGN R2）。
+同类问题：`CI` 是 dataclass，走 `json.dumps(default=str)` 会落成 `"CI(low=…)"` 字符串，
+写进去不报错、读出来取不到上下界，置信区间静默消失 ⇒ 新增 `metrics.jsonable()`，
+在落库与 `--json` 两个出口统一转换，并有回归测试盯着。
+
+**验收 DoD**：mock 与真实模型都能跑完；`--limit 20` 与 `--limit 200` 的 macro_f1 有可见差异
+且 CI 变宽（0.000 → 0.026，证明区间真的在算）；每条 grade 都有 trace_id 且指向库里真实存在的
+trace；`ruff` + 3 条 import-linter 契约（新增 `onyx.eval` 禁止网络 IO）+ 565 条离线测试全过。
 
 **提交**：`feat(eval): task contract, metrics with CI, intent classification`
 
@@ -794,7 +847,7 @@ uv run pytest tests/contract -q
 | S10 | `onyx tools cost` | 与 `token explain` 的 `tool_defs` 同源一致 |
 | S11 | `onyx tools contract` | 8 条断言 × 3 executor 全过；n/a 均带原因；注入缺陷能检出 |
 | S12 | `onyx tools fire --provider mock` | 六种判定可区分；fixture/deny 档零真实执行；上下文不变式成立 |
-| S13 | `onyx eval run --task intent_classification` | macro_f1 + CI + 混淆对；mock 也能跑 |
+| S13 | `onyx eval run --task intent_classification` | macro_f1 + CI + 混淆对；mock 也能跑；grade 均带 trace_id |
 | S14 | `onyx eval run --task tool_selection --k 3` | skip 带原因；resume 不重复计费 |
 | S15 | `onyx eval compare A B` | 配对净变化 + CI；n 小有警告 |
 | S16 | `scripts/check_extension_boundary.sh` | 接入新 provider/task 未碰内核 |

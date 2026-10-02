@@ -1,0 +1,182 @@
+"""评测任务契约（DESIGN §9.1）。
+
+`runner` 只做四件事：`build` → **gateway 发（自动被记录）** → `grade` → `aggregate`，
+外加调度/断点续跑/取消。任务本身**不发请求**，这是"评测绝不建立第二条调用路径"
+在类型上的体现：`build` 返回 `GenerationRequest`，而不是返回一个分数。
+
+两条必须守住的口径：
+1. `Grade.invalid_format` 与"内容答错"是**两个维度**（DESIGN §9.4）。
+   API-only 拿不到受约束的 logprob，只能生成式打分，于是模型会因为
+   "输出格式不听话"额外掉分。把两者混成一个正确率，就会把格式问题误读成能力问题。
+2. `requires` 不满足时**必须 skip 并写明原因**，禁止隐式降级。
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from dataclasses import dataclass, field
+from enum import StrEnum
+from typing import Any, Protocol, runtime_checkable
+
+from onyx.core.types import Cap, Generation, GenerationRequest, ToolSpec
+
+
+class Verdict(StrEnum):
+    """单条样本的判定。**落库即契约**，只增不改。"""
+
+    CORRECT = "correct"
+    PARTIAL = "partial"
+    WRONG = "wrong"
+    #: 输出不是要求的格式（JSON 坏了、多了前后缀）——与"答错"分开计
+    INVALID_FORMAT = "invalid_format"
+    #: 输出了一个标签集/工具集里不存在的名字。这是幻觉，不是选错
+    OUT_OF_LABEL = "out_of_label"
+    HALLUCINATED_TOOL = "hallucinated_tool"
+    NO_CALL = "no_call"
+    TIMEOUT = "timeout"
+    REFUSED = "refused"
+    ERROR = "error"
+    #: 能力不满足而跳过。必须带原因，禁止静默降级（DESIGN §9.1）
+    SKIPPED = "skipped"
+
+
+#: 这些判定算"模型答对了"，用于 pass^k / pass@k
+PASSING = frozenset({Verdict.CORRECT})
+#: 这些判定是**格式/环境问题**，不该计入模型能力分母
+NON_ATTRIBUTABLE = frozenset({Verdict.ERROR, Verdict.TIMEOUT, Verdict.SKIPPED})
+
+
+@dataclass(frozen=True, slots=True)
+class Case:
+    """一条评测样本。`input` / `expect` 的形状由各任务自己定义。"""
+
+    id: str
+    input: dict[str, Any] = field(default_factory=dict)
+    expect: dict[str, Any] = field(default_factory=dict)
+    dataset_id: str = ""
+    ord: int = 0
+    #: single | multi_turn | multi_step | parallel | no_call_needed
+    kind: str = "single"
+    tools: tuple[ToolSpec, ...] = ()
+    #: 工具返回值桩：评测期默认真实工具不执行（DESIGN §8.4）
+    fixture: dict[str, Any] = field(default_factory=dict)
+    meta: dict[str, Any] = field(default_factory=dict)
+    tags: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class Grade:
+    """一条样本的一次评分。`seq` 是同一 case 的第几次采样（pass^k 用）。"""
+
+    case_id: str
+    score: float
+    verdict: Verdict
+    seq: int = 0
+    passed: bool | None = None
+    #: 格式是否合法。**独立于对错**：格式坏了但内容对，和格式对了但内容错，
+    #: 修法完全不同（前者改提示词/停止词，后者改模型或改任务难度）
+    invalid_format: bool = False
+    #: 输出是否落在允许集合之外（幻觉标签/幻觉工具名）
+    out_of_set: bool = False
+    metrics: dict[str, Any] = field(default_factory=dict)
+    #: 每个分数都能点进一条真实 trace（DESIGN §15）。没有 trace_id 的分数不该被展示
+    trace_id: str = ""
+    error: str = ""
+    judge_model_id: str = ""
+    #: judge 自己的开销：judge 也是本地模型时同样吃 GPU 与时间，必须计入成本
+    judge_usage: dict[str, Any] = field(default_factory=dict)
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def ok(self) -> bool:
+        return self.verdict in PASSING
+
+    @property
+    def attributable(self) -> bool:
+        """这条判定能不能算进模型能力分母。"""
+        return self.verdict not in NON_ATTRIBUTABLE
+
+
+@dataclass(frozen=True, slots=True)
+class Skip:
+    """一次跳过。**reason 不许为空**：静默 skip 会让分数看起来正常却少考了题。"""
+
+    case_id: str
+    reason: str
+    missing: tuple[str, ...] = ()
+
+    def as_grade(self) -> Grade:
+        return Grade(
+            case_id=self.case_id, score=0.0, verdict=Verdict.SKIPPED, passed=None,
+            error=self.reason, extra={"missing": list(self.missing)},
+        )
+
+
+@runtime_checkable
+class EvalTask(Protocol):
+    id: str
+    name: str
+    #: 需要的能力位。不满足 → skip 并写明原因
+    requires: frozenset[Cap]
+    #: 该任务会产出的指标名（看板据此建列，不许跑完才知道有哪些指标）
+    metric_names: tuple[str, ...]
+
+    def load(self, *, split: str = "default", limit: int | None = None) -> Iterator[Case]: ...
+    def build(self, case: Case) -> GenerationRequest: ...
+    def grade(self, case: Case, sample: Generation) -> Grade: ...
+    def aggregate(self, grades: Sequence[Grade], *, seed: int = 0) -> dict[str, Any]: ...
+
+
+def check_capabilities(task: EvalTask, caps: Iterable[Cap]) -> Skip | None:
+    """能力不足则返回带原因的 Skip，否则 None。
+
+    这是**任务级**的检查（整个任务跑不了）。样本级的跳过由任务自己在 `load`/`grade`
+    里判断——例如 `no_call_needed` 子集在不支持 tool_choice 的引擎上照样能跑。
+    """
+    have = frozenset(caps)
+    missing = tuple(sorted(str(cap) for cap in task.requires - have))
+    if not missing:
+        return None
+    return Skip(
+        case_id=f"task:{task.id}",
+        reason=(
+            f"任务 {task.id} 需要能力 {missing}，当前 provider/模型不具备；"
+            "不做隐式降级（用提示词模拟工具调用得到的分数无法与原生支持比较）"
+        ),
+        missing=missing,
+    )
+
+
+class TaskRegistry:
+    """任务注册表。S16 会接 entry points，让第三方任务不改内核就能注册。"""
+
+    def __init__(self) -> None:
+        self._tasks: dict[str, Callable[[], EvalTask]] = {}
+
+    def register(self, task_id: str | None = None) -> Callable[[Callable[[], Any]], Any]:
+        def decorator(factory: Callable[[], Any]) -> Callable[[], Any]:
+            key = task_id or getattr(factory, "id", None) or factory.__name__
+            self._tasks[key] = factory
+            return factory
+
+        return decorator
+
+    def add(self, task_id: str, factory: Callable[[], EvalTask]) -> None:
+        self._tasks[task_id] = factory
+
+    def get(self, task_id: str) -> EvalTask | None:
+        factory = self._tasks.get(task_id)
+        return factory() if factory else None
+
+    def names(self) -> tuple[str, ...]:
+        return tuple(sorted(self._tasks))
+
+    def __contains__(self, task_id: object) -> bool:
+        return task_id in self._tasks
+
+    def __len__(self) -> int:
+        return len(self._tasks)
+
+
+#: 全局注册表。内置任务在 `onyx/eval/tasks/__init__.py` 里登记
+REGISTRY = TaskRegistry()

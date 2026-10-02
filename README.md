@@ -36,7 +36,7 @@ uv run onyx db init         # 初始化 .data/onyx.sqlite
 | M1 计量 | ✅ | `core/` 领域层 · `store/` 存储层 · Ollama 适配器 · token 保真阶梯与双特征标定 · gateway 单一咽喉点 · 观测引擎与 visitors · 能力矩阵 · CLI（chat / traces / models / probe / calibrate / doctor） |
 | M2 看板 | ✅ | REST + SSE · Fleet / Models / Traces / TraceDetail / Token Ledger / Playground 六页，已在真实浏览器实测（真机发送到 qwen3.5:9b，引擎计数与冷启动标注齐全，零 console 错误） |
 | M3 工具 | ✅ | 注册表（内容 hash 版本化 + 契约审计 + 上下文开销核算）· 执行层（python_fn / mock_replay / http 三种执行器 + 沙箱 + 契约矩阵）· 客户端工具循环（预算 / 熔断 / 孤儿补齐）· fire-and-verify 六种判定，真机 qwen3.5:9b 端到端 PASS |
-| M4 评测 | ⬜ | 评测内核 / 意图识别 / 工具调用 |
+| M4 评测 | 🚧 S13 完成 · S14 待做 | 评测内核（task/grade/runner + 手算可验的指标层 + bootstrap CI）· 5 个评分器 · 236 条中文意图数据集 · `intent_classification` 真机跑通 |
 | M5 对比 | ⬜ | 矩阵、回归 diff、报告导出 |
 | M6 扩展 | ⬜ | 插件 entry points、第二 provider、MCP 执行器 |
 
@@ -52,6 +52,20 @@ uv run onyx db init         # 初始化 .data/onyx.sqlite
 `pass_rate` 的分母排除 `TOOL_FAILED` 与 `ERROR`：否则模型要替坏掉的工具和挂掉的引擎背锅。
 循环还守着一条不变式：**带 N 个 tool_calls 的 assistant 消息，后面必须紧跟恰好 N 条
 tool 消息**——少一条，之后每次请求的上下文都永久错位，而引擎通常不报错，只是开始答非所问。
+
+**M4 评测的两条口径纪律**：
+- **内容与格式分开报**（DESIGN §9.4）。API-only 拿不到受约束 logprob，只能生成式打分，
+  模型会因为"输出格式不听话"额外掉分。混成一个正确率就会把格式问题读成能力问题，
+  而前者改提示词就能修、后者要换模型。
+- **未知显示「—」，绝不显示 0**。没有可判定样本时 `macro_f1` 是未定义而不是 0 分；
+  零除一律返回 `None`；`n<100` 必须标 ⚠低样本——20 条全对时 bootstrap 会给出
+  `[1.000–1.000]` 的**退化区间**，那不是"置信度 100%"。
+
+真机实测（qwen3.5:9b，236 条自建中文意图集，2026-10-03）：
+`macro_f1 0.991 [95% CI 0.978–1.000]` · `acc 0.992` · `format_valid 1.000` ·
+`out_of_label 0.000` · 236/236 完成、0 错误、38 秒、20,395 in / 521 out token。
+`--limit 20` 与 `--limit 200` 的 CI 宽度分别为 0.000（退化，已标低样本）与 0.026，
+证明区间真的在算而不是返回常数。
 
 **M1 已在真机达成**：`onyx chat` 一次对话即落库完整 trace —— 引擎计数（in=19/out=47，
 source=engine，confidence=high）、分段归因（`msg:0=8 + template_ctl=11 == 19`，
