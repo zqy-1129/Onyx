@@ -212,8 +212,10 @@ def compare_runs(
             "所谓差值只是两个指标的差"
         )
 
-    a_cases = per_case(repo.list_grades(base_id, limit=100_000))
-    b_cases = per_case(repo.list_grades(target_id, limit=100_000))
+    # 全量读取：这里曾经写过 limit=100_000"保护一下"，但那正是最坏的写法——
+    # 超过上限的 grade 会被静默丢掉，配出来的差值看着正常，只是少了一批题
+    a_cases = per_case(repo.list_grades(base_id))
+    b_cases = per_case(repo.list_grades(target_id))
     shared = sorted(set(a_cases) & set(b_cases))
     # 题干来自 eval_case，不是 grade.metrics：任务把"期望/实际"写进 metrics 是各自的约定，
     # 而对比页要展示的是"哪道题变了"，那是样本的内容，属于数据集
@@ -326,7 +328,7 @@ def case_texts(repo: EvalRepo, *runs: RunRecord) -> dict[str, str]:
     for run in runs:
         if not run.dataset_id:
             continue
-        for record in repo.list_cases(run.dataset_id, limit=100_000):
+        for record in repo.list_cases(run.dataset_id):
             out.setdefault(record.id, _text_of(record.input))
     return out
 
