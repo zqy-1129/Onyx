@@ -27,10 +27,17 @@ class Verdict(StrEnum):
     CORRECT = "correct"
     PARTIAL = "partial"
     WRONG = "wrong"
+    #: 调了工具但选错。与 `NO_CALL`（该调却不调）必须分开：
+    #: 前者改工具之间的描述区分度，后者改提示词与"什么时候该用"
+    WRONG_TOOL = "wrong_tool"
+    #: 工具选对了但参数不对。修的是参数 description / required / enum 说明，
+    #: 与 WRONG_TOOL 完全是两件事
+    BAD_ARGS = "bad_args"
     #: 输出不是要求的格式（JSON 坏了、多了前后缀）——与"答错"分开计
     INVALID_FORMAT = "invalid_format"
-    #: 输出了一个标签集/工具集里不存在的名字。这是幻觉，不是选错
+    #: 输出了一个标签集里不存在的名字。这是幻觉，不是选错
     OUT_OF_LABEL = "out_of_label"
+    #: 调用了工具集里不存在的名字
     HALLUCINATED_TOOL = "hallucinated_tool"
     NO_CALL = "no_call"
     TIMEOUT = "timeout"

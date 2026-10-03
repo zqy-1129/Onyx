@@ -679,8 +679,11 @@ labels: 转账 73 / 投诉 62 / 其他 53 / 查余额 48   ← min/max = 0.66，
 生成器打散顺序后再编 `ord`，所以 `--limit 20` 取到的前 20 条覆盖 4 个类（有测试断言）。
 
 **指标的三条纪律**
-1. **零除返回 None，不是 0**。没有正例时 F1 未定义；填 0 会让一个根本没考到的类
-   把 macro 平均拖低，看起来像模型能力差。宏平均**只对定义得出来的类**求平均。
+1. **「未定义」与「0」分开，分界只有一条：这个数算不算得出来。**
+   P 或 R 的分母是 0（这个类一条都没考到）⇒ F1 未定义 ⇒ 返回 `None`，宏平均**跳过它**；
+   填 0 会让一个根本没考到的类把 macro 平均拖低，看起来像模型能力差。
+   反过来 `P=R=0` 两边都算得出来，F1 就必须是 **0.0**——那是"全错"这个事实。
+   （这条边界在 S13 写得太宽，S14 才修正，见下面的缺陷表。）宏平均**只对定义得出来的类**求平均。
 2. **CI 必须真的在算**：重采样单位是 case，统计量每次重算。把算好的分数重排求均值，
    对 macro_f1 这类非线性统计量会得到一个"看起来合理但是错的"区间。
 3. **零宽区间不等于确定**：20 条全对时每次重采样仍全对，区间就是 [1.0, 1.0]。
@@ -738,43 +741,168 @@ trace；`ruff` + 3 条 import-linter 契约（新增 `onyx.eval` 禁止网络 IO
 
 ---
 
-## S14 — 工具调用评测 + runner 调度（M4 出口）
+## S14 — 工具调用评测 + runner 调度（M4 出口）✅
 
 **产出文件**
 ```
-onyx/eval/tasks/{tool_selection,tool_args,structured_extraction,instruction_following}.py
-onyx/eval/graders/args_match.py   # 类型感知：数值容差/日期归一/枚举/集合/字符串模糊
-onyx/eval/runner.py               # GPU 独占锁、并发=1、断点续跑、取消、ETA、skip 记录
-onyx/eval/datasets/sources.py     # BFCL 导入器（记录 upstream/revision/license）
-onyx/api/routes/evals.py
-tests/unit/{test_args_match,test_tool_selection_grade,test_runner_resume}.py
+onyx/eval/graders/args_match.py                     # 类型感知参数比对，每条判定都带 kind
+onyx/eval/tasks/tool_selection.py                   # 七个 verdict；选择维与参数维分开
+onyx/eval/datasets/builtin/tool_calls_zh.{py,jsonl}  # 97 条手写样本，含 25 条 no_call_needed
+onyx/eval/gpu_lock.py                               # 跨进程文件锁 + 心跳 + ETA + 死锁回收
+onyx/eval/datasets/sources.py                       # BFCL 导入器（upstream/revision/license）
+onyx/eval/runner.py                                 # GPU 锁、unload-others、resume、取消、进度检查点
+onyx/api/routes/evals.py                            # /api/datasets /api/runs /api/runs/{id}/grades /api/gpu
+onyx/api/deps.py                                    # AppState 持有 gpu_lock；serve 可 --gpu-lock 覆盖
+tests/unit/{test_args_match,test_tool_selection_grade,test_gpu_lock,test_sources,test_api_evals}.py
+tests/integration/conftest.py                       # live 套件也参与同一把 GPU 锁
 ```
-**skip 必须有原因**：`requires={tools}` 且 `Cap.tools ∉ caps` → 写 `skipped(reason='model lacks native tool calling; needs prompted loop')`，不许静默。
-**runner 语义**：`--resume` 跳过已有 grade；`Ctrl-C` 后已完成的 case 全部保留；GPU 锁被占用时排队并打印 ETA。
-**fixture 默认**：评测期工具返回来自 `case.fixture_json`（DESIGN §8.4），`--live` 才真跑。
+未做：`structured_extraction`、`instruction_following`。M4 的 DoD 只要求"两个 task 各有一次真实运行"，
+已满足；这两个任务需要的 `Cap.STRUCTURED_OUTPUT` 对照实验（强制 vs 自由）当前在 Ollama 上做不到，
+留到 S15 之后与 IFEval 风格 checker 注册表一起做。
+
+**数据集画像**（`tool_calls_zh.py`，seed=20261003）
+```
+n=97  kinds: single 46 · no_call_needed 25 · args 15 · parallel 11
+8 个工具，其中 send_email 是 write 副作用 —— 它出现在**每一条**样本的工具集里，
+但没有任何样本期望调用它
+```
+`send_email` 一直在场才有意义：只在场一次测不出"模型会不会因为工具存在就乱用"，
+而误调率（`false_call_rate`）恰恰是工具评测里最贵的那个错误——它真的会发信。
+有测试同时断言这两件事（每个 case 的工具集含它、且没有任何期望调用它）。
+
+**`args_match` 的判定口径**（为什么不能用 `==`）
+
+| kind | 触发条件 | 算不算"放宽" |
+|---|---|---|
+| `identical` | 字面相等 | 否 |
+| `enum` | schema 声明了 enum 且归一化后命中 | **否**——大小写差异命中同一条规则，不是变宽松 |
+| `normalized` | 去空白/全半角/前后缀后相等 | 是 |
+| `numeric_tolerance` | 数值在 abs/rel 容差内，或一边是数字字符串 | 是 |
+| `date_normalized` | `2026-10-03` ↔ `2026年10月3日` ↔ `2026-10` | 是 |
+| `set_equal` | array + `uniqueItems` 时按集合比 | 是 |
+| `fuzzy` | 仅对显式列入 `fuzzy_fields` 的字段生效，默认不开 | 是 |
+| `type_mismatch`/`value_mismatch`/`missing`/`unexpected` | 判错 | — |
+
+每条判定都把 `kind` 写进 grade，于是 `relaxed_share` 算得出来：
+**只报"参数对了"会把"我们把比对放宽了"藏起来，分数变高就看起来像模型变强了。**
+`exact_rate` 用的是 `strict_ok`（对了且没靠任何放宽规则），它与 `semantic_rate` 的差就是放宽的贡献。
+`bool` 必须在数值之前判（Python 里 `True == 1`），期望值不在 schema 的 enum 里要**报错**而不是判错——
+那说明用例写坏了。
+
+**七个 verdict，因为七种的修法不同**：`correct` / `no_call`（改提示词）/ `wrong_tool`（改工具描述区分度）/
+`bad_args`（改参数 description 与 required）/ `hallucinated_tool`（限工具命名）/ `invalid_format`（max_tokens 与模板，P20）/
+`false_call`（不判成 verdict 而是独立指标 `false_call_rate`，因为它的修法与前六个都不同）。
+`no_call_needed` 的误调绝不并进"没调对"：一个从不乱调的模型和一个不会调的模型，合并后分数一样，但它们相反。
+
+**比率一律折算到 case**：bootstrap 的重采样单位是 case，同一个 case 的 k 次采样不是 k 个独立观测
+（temperature=0 下它们几乎是同一个答案）。按 sample 算会让区间窄得像"模型很确定"，其实只是同一件事被数了三遍。
+所以 `must_call_acc_ci.n`、`n_bootstrap_units` 与 `low_confidence` 说的是同一个数；
+`by_kind` 同时给 `n`（sample）与 `cases`，否则 `n=138` 会被读成 138 个独立观测。
+
+**GPU 锁的关键决定**（DESIGN §8.5 的落地）
+1. **文件锁 + 心跳**，不用 OS advisory lock：Windows 没有 `flock`；而且锁只有两态时排队者只能干等，
+   于是人去 kill 进程——那正好留下半截运行。锁文件里带 `done/total`，排队者能算出 ETA。
+2. **判活用靠心跳过期，不靠 PID 存活**（`os.kill(pid, 0)` 在 Windows 上语义不同且可能误伤）。
+   阈值必须明显大于单条样本耗时：CLI/serve 用 600s，live 套件用 900s。调小会误伤活着的持有者。
+3. **锁路径是机器级全局的**（`tempfile.gettempdir()/onyx-gpu.lock`），不跟 `ONYX_DATA_DIR` 走：
+   数据目录可以按实例覆盖，GPU 不行。跟着数据目录走的话两个实例各锁各的文件，然后照样同时塞显存。
+4. **接管靠 `os.rename` + 内容复验**，不靠"覆盖后回读确认"：顺序执行的两个接管者用后者**都会成功**
+   （后一个回读看到的是自己，前一个早已返回）。两个持有者比没有锁更危险，因为它看起来是安全的。
+5. 坏文件（写入方崩在半路）当成没锁，让下一个进程接管；`release` 只删自己的锁。
+
+**参与方**：`onyx eval run`（默认排队，`--no-queue` 立刻失败、`--lock-timeout` 限时、`--gpu-lock` 覆盖路径）、
+`onyx serve` 的 Playground（忙时 HTTP 429，body 里带持有者与 ETA）、`GET /api/gpu`（只读，不参与竞争）、
+以及 `pytest -m live`。**最后一条是补的缺陷**：live 套件原先完全不参与锁，与评测并发时
+所有延迟与吞吐数字失真但不报错——我就是这么撞上 `test_unload_releases_model` 失败的。
+反过来，**离线**测试绝不能碰这把真锁：`create_app(..., gpu_lock_path=...)` 给了覆盖口，
+CLI/API 的离线测试全部指到 tmp，于是"有人在跑评测时 pytest 挂住"不会发生
+（本次实测：真实评测正在跑时，62 个 CLI/API 测试照常通过）。
+
+**runner 的调度语义**：锁在 `insert_run` **之前**拿（超时失败不留 `status=running` 的僵尸记录）；
+`--unload-others` 在拿到锁之后卸掉其它已载入模型，结果记进 `cost.unloaded_models`；
+心跳在每条 sample 后打；`progress_every`（默认 10）把 `n_done` 落库一次，
+这样崩在中途时那一行也讲得出现在哪——只在收尾写的话，那一行会是 `n_done=0` 而库里已有几百条 grade。
+续跑时 **cost 接续之前那一段**（`_carried_cost`）：本地评测最贵的就是 GPU 时间，
+不接续就会出现"0 tok · 0 请求 · 0 ms"而分数齐全的正常运行记录。
 
 **自测**
 ```bash
-uv run onyx eval dataset add bfcl --split v1 --subset ast
-uv run onyx eval run --task tool_selection --dataset bfcl-ast --model qwen3:8b --k 3 --seed 7 --fixture
-uv run onyx eval run --task tool_selection --model llama3.2:3b --limit 50 --live   # 触发 no_call_needed
+uv run pytest tests/unit/test_args_match.py tests/unit/test_tool_selection_grade.py -q
+uv run pytest tests/unit/test_gpu_lock.py tests/unit/test_sources.py -q
+uv run onyx eval import --builtin tool_calls_zh
+uv run onyx eval run --task tool_selection --model mock/echo --provider mock --limit 10
+uv run onyx eval run --task tool_selection --model qwen3.5:9b --k 3 --seed 7 --unload-others
+uv run onyx eval run --task tool_selection --model qwen3.5:9b --k 3 --resume <run_id> --quiet  # 0 请求，只重算聚合
+uv run onyx eval show <run_id> --verdict bad_args        # 每条 grade 带完整 trace_id 与下钻命令
+uv run onyx eval import <questions.jsonl> --source bfcl --answers <answers.jsonl> --subset ast
 ```
-预期：
+并发起两个 `eval run` 的实测现象（第二个用 `--lock-timeout 2`，等过 2 秒后失败退出）：
 ```
-tool_selection · qwen3:8b · k=3 (pass^3)
-must_call_acc 0.86 [0.80–0.91]   hit@1 0.79   set_f1 0.84   false_call_rate 0.07
-hallucinated_tool 0.02   args_exact 0.66   args_subset 0.81   parse_fail 0.04
-skipped 6 cases: tool_choice unsupported (Ollama) — forced-call variants not runnable
-pass^3 vs pass@3 = 0.61 / 0.78  ← 稳定性缺口 17pp：可用但不可靠
+[i] GPU 当前由 eval:intent_classification@qwen3.5:9b 占用（进度 60/240），排队中…
+GPU 被 eval:intent_classification@qwen3.5:9b 占用，进度 60/240，预计还需 12s
+[i] 详情: eval:intent_classification@qwen3.5:9b 进度 60/240 预计还需 12s；
+    不想排队可以用 --no-queue 立刻失败，或 --gpu-lock 换一个锁文件          # exit 3
 ```
-必须覆盖：
-1. `test_runner_resume`：跑一半 kill → 再跑不重复计费（trace 数 = case 数 × k）；
-2. GPU 锁：并发起两个 eval run，第二个排队且日志有 ETA；
-3. `no_call_needed` 子集：误调率单独统计（不是算成"没调对"）；
-4. `args_match` 的手算用例表（日期/数值容差/枚举/集合各一）；
-5. 每条 grade 的 trace 里 `usage.source` 存在（评测同时是观测的数据来源，DESIGN §15）。
+`--no-queue` 时第一行的措辞会变成"不排队，直接失败"——说"排队中"会让人一直盯着
+一个已经退出的进程。ETA 拿不准时写「未知」而不是 0s：`0s` 会被读成"马上就轮到我"。
 
-**验收 DoD（M4 完整出口）**：两个 task 各有一次真实运行；`eval show` 任一分数能跳到 trace；judge/评测自身耗时与 token 计入 `eval_run.aggregate_json`。
+**真机实测（qwen3.5:9b，temperature=0，2026-10-03）**
+
+| task | n | 头号分数 | 95% CI | 判定分布 | 成本 |
+|---|---|---|---|---|---|
+| `intent_classification` | 236 case × k1 | `macro_f1 0.991` | [0.978–1.000]（n=236） | correct 234 / wrong 2 | 20,395 in · 521 out · 37.3s |
+| `tool_selection` | 97 case × k3 | `must_call_acc 0.639` | [0.528–0.736]（n=72 个该调的 case，⚠97 总样本） | correct 213 / bad_args 69 / no_call 6 / wrong_tool 3 | 401,739 in · 23,265 out · 13.1min |
+
+`tool_selection` 全口径（run `01M3ZZPQC1…`）：
+```
+[内容] must_call_acc 0.639 [95% CI 0.528–0.736]（n=72 case）
+[选择] hit_at_1 1.000  set_precision 0.986  set_recall 0.986  set_f1 0.986
+       no_call_rate 0.028  wrong_tool_rate 0.014  false_call_rate 0.000
+[参数] args_exact 0.684  subset 0.684  field 0.774  relaxed_share 0.000
+[格式] hallucinated_tool 0.000  parse_fail 0.000
+[稳定] pass^3 0.732 = pass@3 0.732（缺口 0.000）
+[分类] no_call_needed 1.000 (25 case) · single 0.696 (46) · parallel 0.636 (11) · args 0.467 (15)
+```
+怎么读这份数字：
+- **选工具几乎没错**（`hit_at_1 1.000`、`set_f1 0.986`、`hallucinated 0.000`——70 个可判定的 case 里
+  只有 1 个选错），掉分几乎全在**参数**上（`bad_args 69/291`）。该改的是参数 description 与 required，
+  不是提示词。`args_match_kinds` 给出细节：`identical 153 · enum 114 · value_mismatch 75 · unexpected 36 · missing 3`——
+  多给字段（unexpected）与值不对几乎一样多。
+- `relaxed_share 0.000`：0.684 的参数一致率里没有一条是靠放宽规则挣来的（命中只有 `identical` 与 `enum`）。
+  这一条与上一条互相印证，也意味着这个数字不需要"会不会是比对器太宽容"的免责声明。
+- `false_call_rate 0.000`：在场 97 次的 `send_email` 一次都没被误用——这是这份数据里最值钱的一个 0。
+- `pass^3 == pass@3`：temperature=0 下同一 case 的三次采样几乎总是同一个答案，所以缺口 0 是**这个设置的下界**，
+  不是"这个模型很稳"的结论。要谈稳定性必须升温度重测。
+- ⚠低样本：97 个 case < 100，所以区间只说明"测过了"，不足以支撑模型之间的取舍决策。
+  区间自身也印证了这点：修掉"按 sample 重采样"之后，同一个 0.639 的区间从 [0.579–0.704]
+  变成 [0.528–0.736]——宽了约 40%，而那才是 97 个 case 该有的宽度。
+
+**这一步修掉的缺陷**（共同点：都不崩溃，都只是"数字看着正常但含义错了"）
+
+| 症状 | 根因 |
+|---|---|
+| `--resume` 之后 cost 变成 `0 tok · 0 请求`，而分数齐全 | 收尾直接写本段的 cost，没接续上一段 |
+| `low_confidence=False`，而 CI 自带的 n 是 97 | 用 grade 条数（291）而不是 case 数判低样本 |
+| `must_call_acc_ci` 的 n=216（应是 72 个 case） | CI 按 sample 重采样，同一个 case 被数了 k 遍 |
+| 声明了 `set_precision/set_recall` 却没产出 | UI 读它们时永远显示「—」，与"这项 0 分"在界面上长得一样 |
+| `exact_rate` 与"匹配率"是同一个数 | 没区分"对了"与"靠放宽规则才对" ⇒ 新增 `ArgMatch.strict_ok` |
+| `set_f1 1.000` 却 `set_precision 0.986` | `P=R=0` 被判成"未定义"并从 F1 均值里剔除，而它照样进 P/R 的均值 ⇒ 三个数分母不同。**F1 的未定义只有一条边界：P 或 R 自己算不出来**；`P=R=0` 是"全错"这个事实，必须等于 0（`prf1` 同源修掉：否则错得最彻底的类不参与宏平均，模型越差 macro_f1 越高） |
+| 报告与列表页只有 `macro_f1` 带区间 | CI 的查找写死了指标名 ⇒ 现在按「指标名 + `_ci`」通用查找，并把重采样单位一起打印（`（n=72 case）`） |
+| live 套件与评测并发时延迟数字失真但不报错 | `pytest -m live` 完全不参与 GPU 锁 |
+| 离线测试会在有人跑评测时挂住 | CLI/API 测试默认去抢机器级那把**真**锁 |
+| `eval show` 的 trace 列只有 12 个字符 | 截断后跳不进去；补完整 id 的下钻提示 |
+| `--builtin` 配 `--source bfcl` 时后者被静默忽略 | 参数组合错了要报错：使用者会以为自己导入的是 BFCL |
+| 接管过期锁的两个进程可能都成功 | "覆盖 + 回读确认"对顺序执行不设防 ⇒ 改成 rename + 内容复验 |
+
+**验收 DoD（M4 完整出口）**
+- 两个 task 各有一次真实运行：`intent_classification`（236 条，`01M3ZWSQ…`）与
+  `tool_selection`（97×3=291，`01M3ZZPQ…`），都在默认数据目录里，看板直接读得到
+- `eval show` 任一分数能跳到 trace：291 条 grade **全部**带 `trace_id`，
+  `onyx traces show <完整 id>` 直接可用；`GET /api/runs/{id}/grades` 同样暴露 trace_id 并返回 200
+- 评测自身的耗时与 token 计入运行记录：`eval_run.cost_json` =
+  `401,739 in / 23,265 out / 291 requests / 787,422 ms`；
+  并且每条 grade 的 trace 都有 `usage.source=engine, confidence=high`
+  ——评测同时是观测的数据来源（DESIGN §15），这条现在是可验证的事实而不是设计意图
 
 **提交**：`feat(eval): tool calling tasks, args matcher, gpu-locked runner`
 

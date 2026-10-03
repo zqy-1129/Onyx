@@ -168,27 +168,57 @@ def load_builtin(name: str = "intent_zh", **kw: Any) -> Dataset:
     `**kw` 里非 None 的项覆盖默认值——CLI 会用 `--upstream/--revision/--license`
     补真实来历，None 表示"调用方没指定"，不该把默认值冲掉。
     """
-    if name != "intent_zh":
-        raise DatasetError(f"没有内置数据集 {name!r}", path=name)
-    from onyx.eval.datasets.builtin.intent_zh import build_cases
+    entry = _BUILTIN.get(name)
+    if entry is None:
+        raise DatasetError(
+            f"没有内置数据集 {name!r}；可选: {sorted(_BUILTIN)}", path=name
+        )
 
     overrides = {key: value for key, value in kw.items() if value is not None}
     dataset_id = overrides.pop("dataset_id", None) or f"{name}-v1"
     fields: dict[str, Any] = {
         "id": dataset_id,
-        "cases": tuple(build_cases()),
+        "cases": tuple(entry["build"]()),
         "upstream": f"builtin:{name}",
-        "revision": "seed=20261003",
+        "revision": entry["revision"],
         "license": "generated-in-repo",
         "loader": f"builtin.{name}",
-        "notes": "模板生成 + 人工补充难例；见 onyx/eval/datasets/builtin/intent_zh.py",
+        "notes": entry["notes"],
     }
     fields.update(overrides)
     return Dataset(**fields)
 
 
+def _build_intent_zh():
+    from onyx.eval.datasets.builtin.intent_zh import build_cases
+
+    return build_cases()
+
+
+def _build_tool_calls_zh():
+    from onyx.eval.datasets.builtin.tool_calls_zh import build_cases
+
+    return build_cases()
+
+
+#: 内置数据集登记表。加一个数据集只需要在这里加一行 + 一个生成器模块
+_BUILTIN: dict[str, dict[str, Any]] = {
+    "intent_zh": {
+        "build": _build_intent_zh,
+        "revision": "seed=20261003",
+        "notes": "模板生成 + 人工补充难例；见 onyx/eval/datasets/builtin/intent_zh.py",
+    },
+    "tool_calls_zh": {
+        "build": _build_tool_calls_zh,
+        "revision": "seed=20261003",
+        "notes": "手写工具调用样本，含 no_call_needed 子集；"
+                 "见 onyx/eval/datasets/builtin/tool_calls_zh.py",
+    },
+}
+
+
 def builtin_names() -> tuple[str, ...]:
-    return ("intent_zh",)
+    return tuple(sorted(_BUILTIN))
 
 
 def _file_revision(path: Path) -> str:

@@ -322,6 +322,22 @@ def test_set_match_empty_vs_empty_is_exact():
     assert result.f1 is None, "0/0 未定义，不许填 1.0"
 
 
+def test_set_match_disjoint_sets_score_f1_zero_not_none():
+    """完全没调对时 F1 是 0，不是"未定义"。
+
+    P 与 R 都算得出来（都是 0），所以 F1 也一定算得得出。以前返回 None，
+    在 `tool_selection` 的聚合里它会被跳过 ⇒ `set_f1` 的均值把最差的样本丢了，
+    于是出现 `set_f1 1.000` 而 `set_precision 0.986` 这种自相矛盾的报表。
+    """
+    disjoint = set_match(["translate"], ["db_query"])
+    assert disjoint.precision == 0.0 and disjoint.recall == 0.0
+    assert disjoint.f1 == 0.0, "全错是 0 分，不是「没考到」"
+
+    # 只有真的算不出来时才返回 None
+    no_prediction = set_match(["a"], [])
+    assert no_prediction.precision is None and no_prediction.f1 is None
+
+
 def test_set_match_false_call_is_not_the_same_as_no_call():
     """误调（期望空、实际有）与漏调（期望有、实际空）必须能分开看。"""
     false_call = set_match([], ["get_weather"])

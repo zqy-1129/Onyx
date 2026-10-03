@@ -373,7 +373,7 @@ def test_dataset_to_records_round_trips(tmp_path):
 
 # ── 任务注册与能力跳过 ────────────────────────────────────────────
 def test_task_registry_builds_the_builtin_task():
-    assert task_ids() == ("intent_classification",)
+    assert "intent_classification" in task_ids()
     task = build_task("intent_classification", model="m")
     assert isinstance(task, IntentClassification)
     assert task.model == "m"

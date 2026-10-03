@@ -12,10 +12,18 @@ from typing import Any
 from onyx.eval.datasets.loader import Dataset, load_builtin
 from onyx.eval.task import EvalTask
 from onyx.eval.tasks.intent_classification import IntentClassification
+from onyx.eval.tasks.tool_selection import ToolSelection
 
 #: task id → (构造函数, 默认数据集载入器)
 TASKS: dict[str, dict[str, Any]] = {
-    IntentClassification.id: {"factory": IntentClassification, "dataset": load_builtin},
+    IntentClassification.id: {
+        "factory": IntentClassification,
+        "dataset": lambda: load_builtin("intent_zh"),
+    },
+    ToolSelection.id: {
+        "factory": ToolSelection,
+        "dataset": lambda: load_builtin("tool_calls_zh"),
+    },
 }
 
 
@@ -43,6 +51,8 @@ def load_dataset(dataset_id: str | None, *, task_id: str) -> Dataset:
         if entry is None:
             raise KeyError(f"未知任务 {task_id!r}；可选: {task_ids()}")
         return entry["dataset"]()
+    if dataset_id in {"tool_calls_zh", "tool_calls_zh-v1"}:
+        return load_builtin("tool_calls_zh")
     if dataset_id in {"intent_zh", "intent_zh-v1"}:
         # 两种写法都必须落到**同一个规范 id**：否则同一份数据会在库里裂成两行，
         # grade 的外键指向哪一行取决于调用方怎么拼名字，历史就断成两截了。

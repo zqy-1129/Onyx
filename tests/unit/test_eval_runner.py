@@ -55,14 +55,16 @@ def env(tmp_path):
     db.close()
 
 
-def _runner(env, scripts, *, dataset=None, task=None, clock=None, on_progress=None, caps=None):
+def _runner(env, scripts, *, dataset=None, task=None, clock=None, on_progress=None, caps=None,
+             gpu_lock=None):
     _, _, observer, blobs = env
     data = dataset or _dataset()
     provider = MockProvider(scripts={MODEL: list(scripts)}, models=(MODEL,))
     gateway = Gateway(provider, observer=observer, blobs=blobs, clock=clock or FakeClock())
     instance = task or IntentClassification(data, model=MODEL)
     runner = EvalRunner(gateway, EvalRepo(env[0]), instance, dataset=data,
-                        clock=clock or FakeClock(), on_progress=on_progress, caps=caps)
+                        clock=clock or FakeClock(), on_progress=on_progress, caps=caps,
+                        gpu_lock=gpu_lock)
     return runner, provider
 
 
@@ -257,12 +259,67 @@ def test_cancel_preserves_completed_grades(env):
     assert report.aggregate["n_total"] == 3
 
 
+class _GradeCrashRepo(EvalRepo):
+    """在第 N 条 grade 写入时崩掉，模拟"进程跑到一半被 kill / 断电"。"""
+
+    def __init__(self, db, *, boom_at: int) -> None:
+        super().__init__(db)
+        self.boom_at = boom_at
+        self.upserts = 0
+
+    def upsert_grade(self, rec):
+        self.upserts += 1
+        if self.upserts == self.boom_at:
+            raise RuntimeError(f"模拟崩在第 {self.boom_at} 条 grade")
+        return super().upsert_grade(rec)
+
+
+def test_a_crash_mid_run_leaves_a_truthful_progress_row(env):
+    """进度必须周期性落库，而不是只在结束时写。
+
+    只在最后写 `n_done` 的话，崩在中途的那一行是 `status=running, n_done=0`，
+    而库里其实已经有三条 grade——恰恰在最需要知道进度的时候它最错。
+    """
+    db, _, observer, blobs = env
+    data = _dataset(8)
+    provider = MockProvider(scripts={MODEL: _scripts("转账")}, models=(MODEL,))
+    gateway = Gateway(provider, observer=observer, blobs=blobs, clock=FakeClock())
+    runner = EvalRunner(gateway, _GradeCrashRepo(db, boom_at=4),
+                        IntentClassification(data, model=MODEL), dataset=data)
+
+    with pytest.raises(RuntimeError, match="崩在第 4 条"):
+        runner.run(RunConfig(model=MODEL, progress_every=2))
+
+    row = EvalRepo(db).list_runs()[0]
+    assert row.status == "running", "没有收尾就不许冒充跑完了"
+    assert row.n_done == 2, "落库的是崩溃前那个检查点（done=2），不是 0"
+    assert len(EvalRepo(db).list_grades(row.id)) == 3, "grade 本身一条都没丢"
+
+
 def test_wall_budget_stops_the_run(env):
     clock = FakeClock(step_ns=50_000_000)  # 每次读钟前进 50ms
     runner, _ = _runner(env, _scripts("转账"), clock=clock)
     report = runner.run(RunConfig(model=MODEL, max_wall_ms=100))
     assert report.status == "cancelled"
     assert report.n_done < 6
+
+
+def test_resume_carries_the_previous_segments_cost(env):
+    """续跑不许把已经花掉的 GPU 时间清零。
+
+    本地评测最贵的资源就是 GPU 时间；cost 变成 0 之后，"这次评测花了多少"
+    再也没有答案，而 run 记录看起来完全正常（status=done、分数齐全）。
+    """
+    runner, provider = _runner(env, _scripts("转账"))
+    partial = runner.run(RunConfig(model=MODEL, should_stop=lambda: len(provider.calls) >= 2))
+    assert partial.cost["requests"] == 2 and partial.cost["in_tokens"] == 200
+
+    resumed = runner.run(RunConfig(model=MODEL, resume_run_id=partial.run_id))
+    row = EvalRepo(env[0]).get_run(resumed.run_id)
+    assert resumed.status == "done"
+    assert row.cost["requests"] == 6, "落库的是两段的总和，不是本次那一段"
+    assert row.cost["in_tokens"] == 600 and row.cost["out_tokens"] == 30
+    assert row.cost["unloaded_models"] == [], "卸载记录属于当前这段，不接续历史"
 
 
 def test_resume_skips_already_graded_cases(env):
@@ -277,7 +334,7 @@ def test_resume_skips_already_graded_cases(env):
     resumed = runner.run(RunConfig(model=MODEL, resume_run_id=partial.run_id))
     assert resumed.run_id == partial.run_id, "续跑必须写回同一个 run"
     assert resumed.status == "done"
-    assert resumed.n_done == 4, "只跑剩下的 4 条"
+    assert resumed.n_done == 6, "n_done 是整个 run 的完成数（2 条已评 + 新跑 4 条）"
     assert len(provider.calls) - first_round_requests == 4, "已评过的 case 不许再发请求"
 
     sink.flush(5.0)
@@ -301,7 +358,7 @@ def test_rerunning_a_completed_case_overwrites_instead_of_duplicating(env):
     again = runner.run(RunConfig(model=MODEL, limit=2, resume_run_id=first.run_id))
     grades = EvalRepo(env[0]).list_grades(first.run_id)
     assert len(grades) == 2, "全部已评过 ⇒ 一条都不该新增"
-    assert again.n_done == 0
+    assert again.n_done == 2, "n_done 是这个 run 的总完成数，不是本段新增数"
 
 
 def test_resume_with_an_unknown_run_id_starts_fresh(env):
@@ -379,3 +436,82 @@ def test_wait_for_throttles_but_keeps_the_first_and_last():
     clock["t"] = 1.6
     throttled(5, 5, "c", grade)      # 最后一条，永远放行
     assert events == [1, 3, 5]
+
+
+# ── GPU 锁 ────────────────────────────────────────────────────────
+def test_runner_heartbeats_and_releases_the_gpu_lock(env, tmp_path):
+    """排队者的 ETA 完全依赖心跳；跑完还必须释放，否则 GPU 永久"被占"。"""
+    from onyx.eval.gpu_lock import GpuLock
+
+    lock = GpuLock(tmp_path / "gpu.lock", owner="eval:test", poll_s=0.01)
+    runner, _ = _runner(env, _scripts("转账"), gpu_lock=lock)
+    report = runner.run(RunConfig(model=MODEL))
+    assert report.status == "done"
+    assert lock.held is False, "跑完没释放锁"
+    assert lock.peek() is None
+
+
+def test_runner_queues_behind_a_live_holder(env, tmp_path):
+    """锁被占时不许开跑：两个评测同时占一块 GPU，现象不是报错而是数字被污染。"""
+    from onyx.eval.gpu_lock import GpuLock
+
+    holder = GpuLock(tmp_path / "gpu.lock", owner="other-eval", poll_s=0.01, stale_after_s=60)
+    holder.acquire()
+    holder.heartbeat(1, 10)
+    try:
+        runner, provider = _runner(env, _scripts("转账"),
+                                   gpu_lock=GpuLock(tmp_path / "gpu.lock", owner="me",
+                                                    poll_s=0.01, stale_after_s=60))
+        with pytest.raises(Exception) as exc:
+            runner.run(RunConfig(model=MODEL, lock_timeout=0.05))
+        assert exc.value.__class__.__name__ == "GpuLockBusy"
+        assert len(provider.calls) == 0, "没拿到锁就不该发任何请求"
+        # 也不该留下一条 status=running 却永远不动的记录
+        assert EvalRepo(env[0]).list_runs(limit=5) == []
+    finally:
+        holder.release()
+
+
+def test_lock_is_released_even_when_a_case_raises(env, tmp_path):
+    """中途抛异常也必须放锁。泄漏的锁会让后面所有评测干等，
+    而且唯一的表现是"所有人都排队"，比崩溃更难归因。"""
+    from onyx.eval.gpu_lock import GpuLock
+
+    class Boom(IntentClassification):
+        def grade(self, case, sample):
+            raise RuntimeError("grader 炸了") if case.id == "c0" else super().grade(case, sample)
+
+    lock = GpuLock(tmp_path / "gpu.lock", owner="me", poll_s=0.01, stale_after_s=60)
+    data = _dataset(2)
+    runner = EvalRunner(
+        _runner(env, _scripts("转账"))[0].gateway, EvalRepo(env[0]),
+        Boom(data, model=MODEL), dataset=data, gpu_lock=lock,
+    )
+    report = runner.run(RunConfig(model=MODEL))
+    assert report.status == "done"  # 单条失败被吸收成 grade=error
+    assert lock.held is False and lock.peek() is None
+
+    after = GpuLock(tmp_path / "gpu.lock", owner="next", poll_s=0.01, stale_after_s=60)
+    after.acquire(timeout=0.2)          # 能被下一个进程拿到，说明锁真的放了
+    after.release()
+
+
+def test_unload_others_records_what_it_evicted(env, monkeypatch):
+    """卸载结果必须进 cost：否则"这次基准是不是被别的模型挤了显存"无从判断。"""
+    from onyx.eval.gpu_lock import GpuLock
+
+    data = _dataset(1)
+    runner, provider = _runner(env, _scripts("转账"), dataset=data,
+                               task=IntentClassification(data, model=MODEL))
+    provider.running = lambda: [type("M", (), {"name": "other-model", "model": "other-model"})()]
+    unloaded: list[str] = []
+    provider.unload = lambda name: unloaded.append(name)
+
+    lock = GpuLock("unused", owner="x")
+    runner2 = EvalRunner(
+        runner.gateway, EvalRepo(env[0]), IntentClassification(data, model=MODEL),
+        dataset=data, gpu_lock=lock,
+    )
+    report = runner2.run(RunConfig(model=MODEL, unload_others=True))
+    assert unloaded == ["other-model"], "该卸的没卸"
+    assert report.cost["unloaded_models"] == ["other-model"]

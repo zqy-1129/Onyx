@@ -25,6 +25,7 @@ from onyx.core.clock import SYSTEM_CLOCK, Clock, utc_now_iso
 from onyx.core.ids import new_trace_id
 from onyx.core.types import Cap, TraceContext, TracePurpose
 from onyx.eval.datasets.loader import Dataset
+from onyx.eval.gpu_lock import GpuLock
 from onyx.eval.metrics import jsonable
 from onyx.eval.task import EvalTask, Grade, Skip, Verdict, check_capabilities
 from onyx.llm.gateway import Gateway
@@ -50,6 +51,14 @@ class RunConfig:
     #: 外部取消信号（Ctrl-C / API 取消按钮）。runner 只在 case 之间检查，
     #: 不打断进行中的请求——半截请求的 trace 会很难解释
     should_stop: Callable[[], bool] | None = None
+    #: 拿不到 GPU 锁时最多等多久（秒）。None = 一直等
+    lock_timeout: float | None = None
+    #: 开跑前把**其它**已载入的模型卸掉。DESIGN §8.5：两个模型同时驻留会触发
+    #: CPU offload，吞吐差一个数量级但数字看起来"正常"——最难发现的污染
+    unload_others: bool = False
+    #: 每跑完 N 条把进度写回 run 记录。每条都写要多一次 UPDATE，而崩溃/中断时
+    #: 需要知道的只是"跑到哪了"，量级上 10 条一次完全够
+    progress_every: int = 10
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +96,7 @@ class EvalRunner:
         clock: Clock = SYSTEM_CLOCK,
         on_progress: ProgressCB | None = None,
         caps: frozenset[Cap] | None = None,
+        gpu_lock: GpuLock | None = None,
     ) -> None:
         self.gateway = gateway
         self.repo = repo
@@ -94,6 +104,7 @@ class EvalRunner:
         self.dataset = dataset
         self.clock = clock
         self.on_progress = on_progress
+        self.gpu_lock = gpu_lock
         self._caps = caps
 
     # ── 能力 ──────────────────────────────────────────────────────
@@ -112,7 +123,8 @@ class EvalRunner:
         self._ensure_persisted()
         skip = check_capabilities(self.task, self.capabilities)
         run_id = config.resume_run_id or new_trace_id()
-        resuming = config.resume_run_id is not None and self.repo.get_run(run_id) is not None
+        previous = self.repo.get_run(run_id) if config.resume_run_id else None
+        resuming = previous is not None
 
         if skip is not None:
             # 能力不足：整个任务不跑，但**必须留下一条记录并写明原因**。
@@ -134,32 +146,36 @@ class EvalRunner:
 
         cases = list(self.task.load(split=config.split, limit=config.limit))
         already: set[str] = set()
+        # 续跑时"这个 run 已经完成了多少"必须以库里已有的 grade 为准，
+        # 不能用本段计数器——否则收尾会把 n_done 写成本段的 0，
+        # 一个跑完的 run 看起来一条都没跑（`n_error` 同理）
+        base_records: list[Any] = []
         if resuming:
             already = self.repo.list_graded_case_ids(run_id)
             cases = [case for case in cases if case.id not in already]
+            base_records = self.repo.list_grades(run_id)
         elif not resuming and config.resume_run_id:
             run_id = new_trace_id()
 
         total = len(cases) * max(1, config.k)
-        if not resuming:
-            self.repo.insert_run(RunRecord(
-                id=run_id, task_id=self.task.id, model_id=config.model,
-                provider_id=getattr(self.gateway.provider, "id", "") or None,
-                started_at=started_at, status="running", seed=config.seed,
-                app_version=__version__, git_rev=_git_rev(),
-                params_snapshot=_params_snapshot(self.task),
-                config={"k": config.k, "limit": config.limit, "split": config.split,
-                        "resumed_from": config.resume_run_id,
-                        "already_graded": len(already)},
-                n_cases=total, notes=config.notes,
-            ))
-
         grades: list[Grade] = []
-        cost = {"in_tokens": 0, "out_tokens": 0, "requests": 0,
-                "in_tokens_unknown": 0, "wall_ms": 0.0}
+        cost: dict[str, Any] = {
+            "in_tokens": 0, "out_tokens": 0, "requests": 0,
+            "in_tokens_unknown": 0, "wall_ms": 0.0, "unloaded_models": [],
+        }
+        if resuming:
+            # 续跑必须**接着算**之前那一段的花费：`_one` 只统计本次发的请求，
+            # 不接上就会出现"0 tok · 0 请求 · 0 ms"，而之前那一段真的花掉了十几分钟 GPU。
+            # 卸载记录不接续：它描述的是"这一段开跑前清掉了什么"
+            cost.update(_carried_cost(previous.cost if previous else {}))
         done = errors = 0
         status = "done"
         cancelled = False
+
+        if self.gpu_lock is not None:
+            # 拿不到锁就抛 GpuLockBusy（带持有者与 ETA）。这一步必须在写 run 记录**之前**：
+            # 否则库里会留下一条 status=running 却永远不动的记录，比没有记录更难解释。
+            self.gpu_lock.acquire(timeout=config.lock_timeout)
 
         def elapsed_ms() -> float:
             return (self.clock.monotonic_ns() - started_ns) / 1e6
@@ -176,6 +192,22 @@ class EvalRunner:
             return bool(config.max_wall_ms and elapsed_ms() > config.max_wall_ms)
 
         try:
+            if not resuming:
+                self.repo.insert_run(RunRecord(
+                    id=run_id, task_id=self.task.id, model_id=config.model,
+                    provider_id=getattr(self.gateway.provider, "id", "") or None,
+                    started_at=started_at, status="running", seed=config.seed,
+                    app_version=__version__, git_rev=_git_rev(),
+                    params_snapshot=_params_snapshot(self.task),
+                    config={"k": config.k, "limit": config.limit, "split": config.split,
+                            "resumed_from": config.resume_run_id,
+                            "already_graded": len(already),
+                            "unload_others": config.unload_others},
+                    n_cases=total, notes=config.notes,
+                ))
+            if self.gpu_lock is not None and config.unload_others:
+                cost["unloaded_models"] = self._unload_other_models(config.model)
+
             for case in cases:
                 if stop_requested():
                     status, cancelled = "cancelled", True
@@ -189,6 +221,18 @@ class EvalRunner:
                         errors += 1
                     if self.on_progress:
                         self.on_progress(done, total, case.id, grade)
+                    if self.gpu_lock is not None:
+                        # 每条样本后刷新心跳：排队者的 ETA 完全依赖它，
+                        # 而且进程崩了之后正是靠心跳过期才能回收锁
+                        self.gpu_lock.heartbeat(done, total)
+                    if config.progress_every and done % config.progress_every == 0:
+                        # 只在样本之间落一次进度：中断/崩溃时 `eval ls` 得说得出跑到哪了。
+                        # 否则那一次的 n_done 是 0，而库里其实已经有几百条 grade——
+                        # 恰好是最需要知道进度的时候它最错
+                        self.repo.update_run(
+                            run_id, n_done=len(base_records) + done,
+                            n_error=_error_count(base_records) + errors,
+                        )
                 # k 次采样属于同一个 case，中途停下会留下半组样本，
                 # pass^k 会把它当成"k 次里只对了这几次的全部"而虚高
                 if stop_requested():
@@ -199,10 +243,18 @@ class EvalRunner:
             # 标成 done 会让一次半截的运行看起来像完整结果
             status, cancelled = "cancelled", True
         finally:
-            cost["wall_ms"] = round(elapsed_ms(), 1)
+            # 墙钟是"累计值"：续跑时之前那一段已经花掉的时间不能假装没花
+            cost["wall_ms"] = round(float(cost.get("wall_ms") or 0.0) + elapsed_ms(), 1)
+            if self.gpu_lock is not None:
+                self.gpu_lock.release()
 
         # 续跑时要把**之前那些** grade 一起纳入聚合，否则分数只反映新跑的部分
         all_records = self.repo.list_grades(run_id)
+        # 完成数与错误数一律以"这个 run 库里现在有多少 grade"为准：
+        # 用本段计数器的话，一次什么都没新跑的续跑会把 n_done 写成 0，
+        # 一个跑完的 run 看起来一条都没跑过
+        n_done = len(all_records)
+        n_error = _error_count(all_records)
         # 立刻转成 JSON-safe：报告里看到的与库里存的必须是同一个形状。
         # 否则刚跑完时 CI 是 dataclass、`eval show` 读回来是字符串，
         # 同一次运行的置信区间在两个入口一个显示一个消失
@@ -215,16 +267,42 @@ class EvalRunner:
         skipped_count = aggregate.get("verdicts", {}).get(Verdict.SKIPPED.value, 0)
 
         self.repo.update_run(
-            run_id, status=status, finished_at=utc_now_iso(), n_done=done,
-            n_error=errors, n_skipped=skipped_count, n_cases=len(all_records),
+            run_id, status=status, finished_at=utc_now_iso(), n_done=n_done,
+            n_error=n_error, n_skipped=skipped_count, n_cases=len(all_records),
             aggregate=aggregate, cost=cost,
         )
         return RunReport(
             run_id=run_id, task_id=self.task.id, model=config.model, status=status,
             aggregate=aggregate, grades=tuple(grades),
-            cost=cost, n_cases=len(all_records), n_done=done, n_error=errors,
+            cost=cost, n_cases=len(all_records), n_done=n_done, n_error=n_error,
             n_skipped=skipped_count, started_at=started_at, finished_at=utc_now_iso(),
         )
+
+    def _unload_other_models(self, keep: str) -> list[str]:
+        """卸掉除目标模型以外已载入的模型。
+
+        失败不中断评测：卸载只是**降低污染概率**的优化，不是正确性前提。
+        但结果必须记进 cost，否则"这次基准是不是被别的模型挤了显存"无从判断。
+        """
+        running = getattr(self.gateway.provider, "running", None)
+        unload = getattr(self.gateway.provider, "unload", None)
+        if not callable(running) or not callable(unload):
+            return []
+        unloaded: list[str] = []
+        try:
+            loaded = running()
+        except Exception:  # noqa: BLE001 - 采样失败不能影响评测
+            return []
+        for item in loaded:
+            name = getattr(item, "name", "") or getattr(item, "model", "")
+            if not name or name == keep:
+                continue
+            try:
+                unload(name)
+                unloaded.append(name)
+            except Exception:  # noqa: BLE001 - 同上
+                continue
+        return unloaded
 
     # ── 单条样本 ──────────────────────────────────────────────────
     def _one(
@@ -287,6 +365,27 @@ class EvalRunner:
 
 def _with_trace(grade: Grade, trace_id: str, seq: int) -> Grade:
     return replace(grade, trace_id=trace_id or grade.trace_id, seq=seq)
+
+
+def _error_count(records: Sequence[Any]) -> int:
+    """库里这些 grade 里有多少判成 error。
+
+    读回来的是字符串（`verdict` 列），所以比对 `Verdict.ERROR.value` 而不是枚举本身。
+    """
+    return sum(1 for record in records if record.verdict == Verdict.ERROR.value)
+
+
+def _carried_cost(previous: dict[str, Any] | None) -> dict[str, Any]:
+    """续跑时要接着算的那些累计字段。
+
+    只接这四个：`unloaded_models` 描述的是"这一段开跑前清掉了什么"，
+    把历史段的一路带过来会读成"刚才又卸了一次"。
+    """
+    source = previous or {}
+    carried = {key: int(source.get(key) or 0) for key in (
+        "in_tokens", "out_tokens", "requests", "in_tokens_unknown")}
+    carried["wall_ms"] = float(source.get("wall_ms") or 0.0)
+    return carried
 
 
 def _to_record(run_id: str, grade: Grade) -> GradeRecord:

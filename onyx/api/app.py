@@ -49,6 +49,7 @@ def create_app(
     provider_id: str = "ollama-local",
     db_path: Path | str | None = None,
     sample_gpu: bool = True,
+    gpu_lock_path: Path | str | None = None,
     cors_origins: tuple[str, ...] = ("http://localhost:5173", "http://127.0.0.1:5173"),
 ) -> FastAPI:
     owns_runtime = runtime is None
@@ -73,17 +74,18 @@ def create_app(
         CORSMiddleware, allow_origins=list(cors_origins), allow_methods=["*"], allow_headers=["*"],
     )
 
-    state = AppState.of(resolved)
+    state = AppState.of(resolved, gpu_lock_path=gpu_lock_path)
     # gateway 的事件同时进 SSE 广播
     resolved.events.add(state.broker)
     app.state.onyx = state
     app.state.owns_runtime = owns_runtime
 
-    from onyx.api.routes import fleet, playground, traces
+    from onyx.api.routes import evals, fleet, playground, traces
 
     app.include_router(fleet.router)
     app.include_router(traces.router)
     app.include_router(playground.router)
+    app.include_router(evals.router)
 
     @app.exception_handler(OnyxError)
     async def _onyx_error(_: Request, exc: OnyxError) -> JSONResponse:

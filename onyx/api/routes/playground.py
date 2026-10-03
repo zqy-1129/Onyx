@@ -18,6 +18,7 @@ from onyx.api.schemas import (
     ToolCallView,
     UsageAlt,
 )
+from onyx.core.errors import GpuLockBusy
 from onyx.core.types import (
     GenerationRequest,
     GenParams,
@@ -72,12 +73,12 @@ def chat(body: ChatRequest, state: AppState = Depends(get_state)) -> ChatRespons
             extra={"client_key": body.client_key} if body.client_key else {},
         ),
     )
-    acquired = state.gpu_lock.acquire(timeout=GPU_LOCK_TIMEOUT)
-    if not acquired:
-        raise HTTPException(
-            status_code=429,
-            detail=f"GPU 被其他请求占用超过 {GPU_LOCK_TIMEOUT:.0f}s，请稍后重试",
-        )
+    # 排队失败要报**谁在占用、预计还要多久**，而不是只说"稍后重试"：
+    # 本地 GPU 一次请求可能就是几十秒，让人盲等只会换来一次 Ctrl-C
+    try:
+        state.gpu_lock.acquire(timeout=GPU_LOCK_TIMEOUT)
+    except GpuLockBusy as exc:
+        raise HTTPException(status_code=429, detail=exc.message) from None
     started = time.monotonic()
     try:
         result = state.runtime.gateway.generate(req, purpose="playground")

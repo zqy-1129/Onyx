@@ -38,10 +38,20 @@ class PRF1:
 
 
 def prf1(tp: int, fp: int, fn: int, *, support: int | None = None) -> PRF1:
+    """P/R/F1。**未定义只有一种情况**：P 或 R 自己算不出来（分母为 0）。
+
+    `P=R=0` 不是未定义，那是"全错"——F1 必须是 0.0。以前这里把两者混在一起，
+    返回 None 的代价很隐蔽：`macro` 会跳过未定义的类，于是**错得最彻底的类
+    从宏平均里整个消失**，模型越差 macro_f1 反而越高。
+    真正的未定义是 `support=0`（这个类一条都没考到），它必须继续返回 None，
+    否则"没考到"就会被读成"考了且得 0 分"。
+    """
     precision = tp / (tp + fp) if (tp + fp) else None
     recall = tp / (tp + fn) if (tp + fn) else None
-    if precision is None or recall is None or (precision + recall) == 0:
+    if precision is None or recall is None:
         f1: float | None = None
+    elif precision + recall == 0:
+        f1 = 0.0
     else:
         f1 = 2 * precision * recall / (precision + recall)
     return PRF1(

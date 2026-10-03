@@ -47,18 +47,40 @@ def test_prf1_hand_computed():
     assert (item.tp, item.fp, item.fn, item.support) == (2, 0, 1, 3)
 
 
-def test_prf1_zero_division_returns_none_not_zero():
-    """没有正例时 F1 是"未定义"，不是"0 分"。填 0 会让没考过的类拖低宏平均。"""
+def test_prf1_undefined_and_zero_are_two_different_things():
+    """`未定义` 与 `0 分` 必须分开，而且分界只有一条：P 或 R 自己算不算得出来。
+
+    - `prf1(0,0,0)`：这个类一条都没考到 ⇒ 未定义 ⇒ None，且 `macro` 必须跳过它。
+      填 0 会让没考到的类拖低宏平均，看起来像模型能力差。
+    - `prf1(0,1,1)`：考到了，而且**全错** ⇒ P=0、R=0 都是算得出来的数 ⇒ F1 必须是 0.0。
+      以前这里也返回 None，于是 `macro` 把这个类整个跳过——错得最彻底的类不参与平均，
+      模型越差 macro_f1 反而越高。
+    """
     empty = prf1(0, 0, 0)
     assert empty.precision is None and empty.recall is None and empty.f1 is None
     assert empty.is_defined is False
 
-    all_wrong = prf1(0, 1, 1)  # P=0 R=0 → F1 的分子分母都是 0
+    all_wrong = prf1(0, 1, 1)
     assert all_wrong.precision == 0.0 and all_wrong.recall == 0.0
-    assert all_wrong.f1 is None, "P+R=0 时 F1 未定义，不许写成 0"
+    assert all_wrong.f1 == 0.0, "P=R=0 是「全错」这个事实，不是「没考到」"
+    assert all_wrong.is_defined is True, "必须进宏平均，否则最差的类会被静默剔除"
 
     perfect = prf1(3, 0, 0)
     assert (perfect.precision, perfect.recall, perfect.f1) == (1.0, 1.0, 1.0)
+
+
+def test_macro_f1_does_not_drop_a_totally_wrong_class():
+    """一个全错的类必须把宏平均拉下来，而不是从分母里消失。
+
+    两个类整个互换（A→B、B→A）：每个类都被预测过、也都被漏掉过，
+    所以 P=0 与 R=0 **都算得出来**，F1 就是 0。
+    按旧口径（P+R=0 ⇒ 未定义）这里会得到"一个类都定义不出来"⇒ macro_f1=None，
+    界面上显示「—」（不知道），而真相是"全错"——两者差一个数量级，且方向相反。
+    """
+    pairs = [("A", "B"), ("B", "A")]
+    per_class = per_class_prf1(pairs)
+    assert per_class["A"].f1 == 0.0 and per_class["B"].f1 == 0.0
+    assert macro_f1(pairs) == 0.0
 
 
 def test_prf1_support_defaults_to_tp_plus_fn():

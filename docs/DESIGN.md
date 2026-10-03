@@ -432,6 +432,23 @@ class ToolExecutor(Protocol):
 - 运行前按策略 unload 上一个模型（`keep_alive="0"`），避免 `size_vram` 叠加导致加载失败或 CPU offload —— 后者会让吞吐数字差一个数量级而看起来"正常"。
 - 每个 eval 样本记录采样时刻 `/api/ps` 的 `size_vram/context_length`，用于事后判定"这次慢是不是因为挤显存"。
 
+**实现口径**（`onyx/eval/gpu_lock.py`，S14 落地）：
+- **跨进程文件锁 + 心跳**，不用 OS advisory lock：Windows 没有 `flock`；而且排队者要能读到持有者的
+  `done/total`，从而算出 ETA——只有"锁住/没锁住"两态的锁，排队者只能干等，于是人会去 kill 进程，
+  而那正好留下半截运行。
+- **判活用靠心跳过期，不靠 PID 存活**（`os.kill(pid, 0)` 在 Windows 上语义不同且可能误伤）。
+  阈值必须明显大于单条样本耗时（默认 180s，CLI/serve 用 600s，live 测试用 900s），
+  否则误伤活着的持有者 ⇒ 两个评测同时占显存，正是这把锁要防的事。
+- 锁路径是**机器级全局**的（`tempfile.gettempdir()/onyx-gpu.lock`），**不跟 `ONYX_DATA_DIR` 走**：
+  数据目录可以按实例覆盖，而 GPU 是整台机器一块的；锁跟着数据目录走，两个实例各锁各的文件，
+  然后照样同时往显存里塞模型。
+- 接管靠 `os.rename`（要求源存在）+ 内容复验，不靠"覆盖后回读确认"：
+  顺序执行的接管者用后者会**都认为自己赢了**。两个持有者比没有锁更危险，因为它看起来是安全的。
+- 参与方：`eval run`（`--no-queue` 立刻失败、`--lock-timeout` 限时排队、`--gpu-lock` 覆盖路径）、
+  `onyx serve` 的 Playground（忙时 HTTP 429 带持有者与 ETA）、`/api/gpu`（只读状态）、
+  以及 `pytest -m live`（`tests/integration/conftest.py` 在整个 session 前拿同一把锁）。
+  最后一条是补的缺陷：live 套件原先不参与锁，与评测并发时**基准数字全部失真但不报错**。
+
 ---
 
 ## 9. 评测子系统（L5）

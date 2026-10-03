@@ -36,7 +36,7 @@ uv run onyx db init         # 初始化 .data/onyx.sqlite
 | M1 计量 | ✅ | `core/` 领域层 · `store/` 存储层 · Ollama 适配器 · token 保真阶梯与双特征标定 · gateway 单一咽喉点 · 观测引擎与 visitors · 能力矩阵 · CLI（chat / traces / models / probe / calibrate / doctor） |
 | M2 看板 | ✅ | REST + SSE · Fleet / Models / Traces / TraceDetail / Token Ledger / Playground 六页，已在真实浏览器实测（真机发送到 qwen3.5:9b，引擎计数与冷启动标注齐全，零 console 错误） |
 | M3 工具 | ✅ | 注册表（内容 hash 版本化 + 契约审计 + 上下文开销核算）· 执行层（python_fn / mock_replay / http 三种执行器 + 沙箱 + 契约矩阵）· 客户端工具循环（预算 / 熔断 / 孤儿补齐）· fire-and-verify 六种判定，真机 qwen3.5:9b 端到端 PASS |
-| M4 评测 | 🚧 S13 完成 · S14 待做 | 评测内核（task/grade/runner + 手算可验的指标层 + bootstrap CI）· 5 个评分器 · 236 条中文意图数据集 · `intent_classification` 真机跑通 |
+| M4 评测 | ✅ | 评测内核（task/grade/runner + 指标层 + bootstrap CI）· 6 个评分器 + 类型感知参数比对 · 236 条中文意图集 + 97 条工具调用集 · `intent_classification` 与 `tool_selection` 各一次真机运行 · BFCL 导入器 · GPU 独占锁（跨进程 + 心跳 + ETA），eval/Playground/live 测试互相排队 |
 | M5 对比 | ⬜ | 矩阵、回归 diff、报告导出 |
 | M6 扩展 | ⬜ | 插件 entry points、第二 provider、MCP 执行器 |
 
@@ -53,19 +53,31 @@ uv run onyx db init         # 初始化 .data/onyx.sqlite
 循环还守着一条不变式：**带 N 个 tool_calls 的 assistant 消息，后面必须紧跟恰好 N 条
 tool 消息**——少一条，之后每次请求的上下文都永久错位，而引擎通常不报错，只是开始答非所问。
 
-**M4 评测的两条口径纪律**：
+**M4 评测的三条口径纪律**：
 - **内容与格式分开报**（DESIGN §9.4）。API-only 拿不到受约束 logprob，只能生成式打分，
-  模型会因为"输出格式不听话"额外掉分。混成一个正确率就会把格式问题读成能力问题，
+  模型会因为"输出格式不听话"额外掉分。混成一个正确率就会把格式问题误读成能力问题，
   而前者改提示词就能修、后者要换模型。
-- **未知显示「—」，绝不显示 0**。没有可判定样本时 `macro_f1` 是未定义而不是 0 分；
-  零除一律返回 `None`；`n<100` 必须标 ⚠低样本——20 条全对时 bootstrap 会给出
+- **「未知」与「0 分」是两个不同的事实，两边都不许互相冒充**。没有可判定样本时 `macro_f1` 是未定义
+  而不是 0 分，零除一律返回 `None`，界面显示「—」（UI_DESIGN R2）；反过来，**算得出来的 0 必须写成 0**——
+  `P=R=0` 是"全错"而不是"没考到"，早期把它判成未定义会让最差的类从宏平均里整个消失，
+  模型越差 macro_f1 反而越高。`n<100` 必须标 ⚠低样本：20 条全对时 bootstrap 会给出
   `[1.000–1.000]` 的**退化区间**，那不是"置信度 100%"。
+- **放宽规则与重采样单位都必须可见**。参数比对按类型走不同规则（数值容差/日期归一/集合/模糊），
+  所以 `exact_rate`（字面就一致）要与 `relaxed_share`（靠放宽挣来的占比）一起报——只报前者会把
+  "我们把比对放宽了"藏进分数里，看起来像模型变强了。CI 的重采样单位是 **case** 而不是 sample：
+  temperature=0 下同一 case 的 k 次采样不是 k 个独立观测，按 sample 算会让区间窄得像"模型很确定"。
 
-真机实测（qwen3.5:9b，236 条自建中文意图集，2026-10-03）：
-`macro_f1 0.991 [95% CI 0.978–1.000]` · `acc 0.992` · `format_valid 1.000` ·
-`out_of_label 0.000` · 236/236 完成、0 错误、38 秒、20,395 in / 521 out token。
-`--limit 20` 与 `--limit 200` 的 CI 宽度分别为 0.000（退化，已标低样本）与 0.026，
-证明区间真的在算而不是返回常数。
+真机实测（qwen3.5:9b，2026-10-03；两个任务走同一个 gateway ⇒ 每个分数都能跳到真实 trace）：
+
+| task | 数据 | 头号分数 | 95% CI | 成本 |
+|---|---|---|---|---|
+| `intent_classification` | 236 条自建中文意图集 · k=1 | `macro_f1 0.991` · acc 0.992 · format_valid 1.000 · out_of_label 0.000 | [0.978–1.000] | 20,395 in / 521 out · 37s · 0 错误 |
+| `tool_selection` | 97 条自建工具调用集 · k=3 | `must_call_acc 0.639` · set_f1 0.986 · hallucinated 0.000 · **false_call 0.000** · args_exact 0.684（relaxed 0.000）· pass^3 0.732 | [0.528–0.736]（⚠ 97 case） | 401,739 in / 23,265 out · 13.1min · 0 错误 |
+
+`--limit 20` 与 `--limit 200` 的意图 CI 宽度分别是 0.000（退化，已标低样本）与 0.026，
+证明区间真的在算而不是返回常数。工具那行的结论是：**选工具几乎没错，掉分全在参数上**
+（291 次采样里 `bad_args` 69 次，而 `hallucinated_tool` 与误调率都是 0——在场 97 次的
+`send_email` 一次都没被用）。
 
 **M1 已在真机达成**：`onyx chat` 一次对话即落库完整 trace —— 引擎计数（in=19/out=47，
 source=engine，confidence=high）、分段归因（`msg:0=8 + template_ctl=11 == 19`，

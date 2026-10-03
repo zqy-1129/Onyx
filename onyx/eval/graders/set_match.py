@@ -36,8 +36,14 @@ class SetMatch:
     @property
     def f1(self) -> float | None:
         precision, recall = self.precision, self.recall
-        if precision is None or recall is None or (precision + recall) == 0:
+        if precision is None or recall is None:
             return None
+        # P 与 R 都算得出来而都是 0 时，F1 是 **0** 而不是未定义：
+        # 那是"完全没调对"这个事实。以前这里返回 None，于是这类样本被从 F1 均值里
+        # 整个剔除（却仍然进 P/R 的均值），结果 set_f1 比 set_precision 还高——
+        # 三个数明明在说同一件事，分母却不一样
+        if precision + recall == 0:
+            return 0.0
         return 2 * precision * recall / (precision + recall)
 
     @property

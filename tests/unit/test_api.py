@@ -36,7 +36,9 @@ def client(tmp_path):
         db_path=tmp_path / "onyx.sqlite", event_log=False,
         provider_kwargs={"scripts": SCRIPTS, "models": tuple(SCRIPTS)},
     )
-    app = create_app(runtime)
+    # 锁路径必须指到 tmp：默认的机器级锁是**真的**那块 GPU 的锁。
+    # 不覆盖的话，离线套件会在有人正在跑评测时失败——而失败原因是环境，不是代码
+    app = create_app(runtime, gpu_lock_path=tmp_path / "gpu.lock")
     with TestClient(app) as test_client:
         yield test_client
     runtime.close()

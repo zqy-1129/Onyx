@@ -747,13 +747,18 @@ def serve(
     port: int = typer.Option(8000, "--port"),
     url: str = typer.Option("http://127.0.0.1:11434", "--url", help="Ollama base url"),
     db: Path = typer.Option(None, "--db"),
+    gpu_lock_path: Path = typer.Option(
+        None, "--gpu-lock",
+        help="GPU 锁文件路径；默认机器级路径。多卡机器用它给每个服务一条锁"
+    ),
 ) -> None:
     """启动 REST + SSE 服务（看板后端）。"""
     import uvicorn
 
     from onyx.api.app import create_app
 
-    app_obj = create_app(base_url=url, db_path=str(db) if db else None)
+    app_obj = create_app(base_url=url, db_path=str(db) if db else None,
+                         gpu_lock_path=gpu_lock_path)
     typer.echo(f"Onyx API: http://{host}:{port}/api/docs")
     uvicorn.run(app_obj, host=host, port=port, log_level="info")
 
@@ -1422,11 +1427,12 @@ def _headline_score(aggregate: dict) -> str:
         if value is None:
             return f"{key} —（无可判定样本）"
         text = f"{key} {_fmt(value)}"
-        if key == "macro_f1":
-            ci = aggregate.get("macro_f1_ci")
-            low, high = _ci_get(ci, "low"), _ci_get(ci, "high")
-            if low is not None and high is not None:
-                text += f" [{_fmt(low)}–{_fmt(high)}]"
+        # 区间按「指标名 + _ci」找，不写死 macro_f1：头号指标一换（工具任务是
+        # must_call_acc），写死的版本就会把区间整个丢掉，只剩一个孤零零的数
+        ci = aggregate.get(f"{key}_ci")
+        low, high = _ci_get(ci, "low"), _ci_get(ci, "high")
+        if low is not None and high is not None:
+            text += f" [{_fmt(low)}–{_fmt(high)}]"
         if aggregate.get("low_confidence"):
             text += " ⚠低样本"
         return text
@@ -1436,30 +1442,59 @@ def _headline_score(aggregate: dict) -> str:
 @eval_app.command("import")
 def eval_import(
     file: Path = typer.Argument(None, exists=True, dir_okay=False, readable=True),
-    id: str = typer.Option(None, "--id", help="数据集 id；默认取文件名 + -v1"),
+    id: str = typer.Option(None, "--id", help="数据集 id；默认 JSONL 取文件名、bfcl 取 bfcl-<子集>"),
     builtin: str = typer.Option(None, "--builtin", help="导入内置数据集，例如 intent_zh"),
+    source: str = typer.Option("auto", "--source", help="auto | jsonl | bfcl"),
+    answers: Path = typer.Option(
+        None, "--answers", exists=True, dir_okay=False, readable=True,
+        help="bfcl：答案文件，与问题文件按 id 配对（不按行号）"
+    ),
+    subset: str = typer.Option("v1", "--subset", help="bfcl 子集名，写进 upstream 和 tags"),
     db: Path = typer.Option(None, "--db"),
     upstream: str = typer.Option("", "--upstream"),
     revision: str = typer.Option("", "--revision"),
     license: str = typer.Option("", "--license", help="上游许可证；转载数据集必须记"),
 ) -> None:
-    """导入数据集（JSONL 或内置生成器），并把来历一并落库。
+    """导入数据集（JSONL、内置生成器或 BFCL 风格文件），并把来历一并落库。
 
     来历（upstream/revision/license）不是元数据装饰：换了数据集版本之后
     两次评测的分数不可比，不记 revision 就永远发现不了这件事。
+
+    外部数据源只支持"从本地文件导入"，不替你下载：下载会在评测路径上引入网络依赖，
+    于是"离线复现一次评测"就做不到了，而这正是本地评测相对云 API 的主要优势。
     """
     from onyx.eval.datasets.loader import DatasetError, load_builtin, load_jsonl
+    from onyx.eval.datasets.sources import describe, import_bfcl, supported
     from onyx.store.repos import EvalRepo
 
+    # 参数组合错了要报错，不能静默挑一个：`--builtin` 配 `--source bfcl` 如果被
+    # 忽略，使用者会以为自己导入的是 BFCL，而实际导入的是内置集
+    if builtin and (answers is not None or source not in ("auto", "jsonl")):
+        typer.echo("--builtin 自带加载器，与 --source/--answers 互斥", err=True)
+        raise typer.Exit(2)
+    if answers is not None and source not in ("auto", "bfcl"):
+        typer.echo("--answers 只在 bfcl 源有意义（BFCL 的问题与答案分两个文件）", err=True)
+        raise typer.Exit(2)
+    if source == "auto":
+        source = "bfcl" if answers is not None else "jsonl"
+
     try:
+        if not builtin:
+            supported(source=source)
         if builtin:
             dataset = load_builtin(builtin, dataset_id=id, upstream=upstream or None,
                                    revision=revision or None, license=license or None)
         elif file is not None:
-            dataset = load_jsonl(file, dataset_id=id, upstream=upstream or None,
-                                 revision=revision or None, license=license or None)
+            dataset = (
+                import_bfcl(file, answers, dataset_id=id or f"bfcl-{subset}",
+                            subset=subset, upstream=upstream, revision=revision,
+                            license=license)
+                if source == "bfcl" else
+                load_jsonl(file, dataset_id=id, upstream=upstream or None,
+                           revision=revision or None, license=license or None)
+            )
         else:
-            typer.echo("要么给出 JSONL 文件，要么用 --builtin intent_zh", err=True)
+            typer.echo("要么给出数据集文件，要么用 --builtin intent_zh", err=True)
             raise typer.Exit(2)
     except DatasetError as exc:
         typer.echo(f"数据集错误: {exc}", err=True)
@@ -1472,8 +1507,10 @@ def eval_import(
         record, cases = dataset.to_records()
         repo.upsert_dataset(record)
         repo.upsert_cases(cases)
-        typer.echo(f"已导入 {dataset.id}: {len(cases)} 条 · 来源 {dataset.upstream} · "
-                   f"revision {dataset.revision}")
+        typer.echo(describe(dataset))
+        # notes 里装着"跳过了多少条"这类信息；不打印的话样本变少这件事就没人知道
+        if dataset.notes:
+            typer.echo(f"  {dataset.notes}")
         for split, count in sorted(dataset.splits().items()):
             typer.echo(f"  子集 {split:<12} {count} 条")
     finally:
@@ -1495,10 +1532,28 @@ def eval_run(
     resume: str = typer.Option(None, "--resume", help="续跑指定 run_id，跳过已评过的 case"),
     max_wall_ms: float = typer.Option(None, "--max-wall-ms"),
     max_tokens: int = typer.Option(None, "--max-tokens", help="覆盖任务的生成预算"),
+    gpu_lock_path: Path = typer.Option(
+        None, "--gpu-lock", help="GPU 锁文件路径；默认用机器级路径，多实例才会互斥"
+    ),
+    no_queue: bool = typer.Option(
+        False, "--no-queue", help="拿不到 GPU 锁就直接失败，不排队等"
+    ),
+    lock_timeout: float = typer.Option(
+        None, "--lock-timeout", help="排队等锁的最长秒数；不给就一直等"
+    ),
+    unload_others: bool = typer.Option(
+        False, "--unload-others",
+        help="开跑前卸掉其它已载入模型，避免 size_vram 叠加触发 CPU offload"
+    ),
     json_out: bool = typer.Option(False, "--json"),
     quiet: bool = typer.Option(False, "--quiet", help="不打进度"),
 ) -> None:
     """跑一次评测。请求全部走 gateway，所以**每个分数都能点进一条真实 trace**。
+
+    默认拿机器级 GPU 锁排队（DESIGN §8.5）：单 GPU 上两个评测同时跑，
+    现象不是报错而是数字被污染——两个模型同时驻留会触发 CPU offload，
+    吞吐差一个数量级却看起来"正常"。这把锁是跨进程的文件锁，
+    所以 `onyx serve` 的 Playground 也会与它互斥。
 
     能力不足时整个任务会被 skip 并写明原因，不做隐式降级：
     用提示词模拟工具调用得到的分数，无法与原生支持的模型比较，
@@ -1508,6 +1563,8 @@ def eval_run(
 
     from rich.console import Console
 
+    from onyx.core.errors import GpuLockBusy
+    from onyx.eval.gpu_lock import GpuLock, default_lock_path
     from onyx.eval.metrics import jsonable
     from onyx.eval.runner import EvalRunner, RunConfig, wait_for
     from onyx.eval.tasks import build_task, load_dataset
@@ -1530,15 +1587,42 @@ def eval_run(
             def progress(done: int, total: int, case_id: str, grade) -> None:
                 typer.echo(f"\r  {done}/{total}  {case_id[:18]}  {grade.verdict}", nl=False)
 
+        # 默认用机器级路径：GPU 是整台机器一块，锁跟着可覆盖的数据目录走就锁不住多实例
+        lock_path = Path(gpu_lock_path) if gpu_lock_path else default_lock_path()
+        lock = GpuLock(
+            lock_path, owner=f"eval:{task}@{model}",
+            stale_after_s=600.0,  # 必须大于单条样本的最长耗时，否则会误伤活着的持有者
+        )
         runner = EvalRunner(
             runtime.gateway, repo, instance, dataset=loaded,
-            on_progress=wait_for(progress) if progress else None,
+            on_progress=wait_for(progress) if progress else None, gpu_lock=lock,
         )
         config = RunConfig(
             model=model, k=k, seed=seed, limit=limit, split=split,
             resume_run_id=resume, max_wall_ms=max_wall_ms,
+            lock_timeout=0.0 if no_queue else lock_timeout, unload_others=unload_others,
         )
-        report = runner.run(config)
+        if not quiet and not json_out:
+            info = lock.peek()
+            # 用 is_busy 而不是"锁文件存在"：崩掉的持有者会留下一个心跳过期的文件，
+            # 那时并没有人在占 GPU，说"当前由 X 占用，排队中"会让人等一个不会来的释放
+            if info is not None and lock.is_busy():
+                verdict = "不排队，直接失败" if no_queue else "排队中…"
+                typer.echo(f"[i] GPU 当前由 {info.owner} 占用（进度 {info.progress}），{verdict}")
+        try:
+            report = runner.run(config)
+        except GpuLockBusy as exc:
+            typer.echo(str(exc), err=True)
+            eta = exc.detail.get("eta_s")
+            # ETA 可能是 None（持有者还没开始跑），这时要写"未知"而不是 0s：
+            # "预计还需 0s"会被读成"马上就轮到我"，然后人会一直等下去
+            typer.echo(
+                f"[i] 详情: {exc.detail.get('owner')} 进度 {exc.detail.get('progress')} "
+                f"预计还需 {'未知' if eta is None else f'{eta:.0f}s'}；"
+                "不想排队可以用 --no-queue 立刻失败，或 --gpu-lock 换一个锁文件",
+                err=True,
+            )
+            raise typer.Exit(3) from None
         runtime.flush()
         if progress:
             typer.echo("")
@@ -1557,6 +1641,23 @@ def eval_run(
         raise typer.Exit(0 if report.status == "done" else 1)
     finally:
         runtime.close()
+
+
+#: (指标, 分组)。分组只是显示用的；聚合里没有的指标就不打印，
+#: 所以新增任务不必改这里——但指标名要与 `EvalTask.metric_names` 对得上
+_REPORT_METRICS = (
+    ("macro_f1", "内容"), ("accuracy", "内容"), ("balanced_accuracy", "内容"),
+    ("must_call_acc", "内容"),
+    ("hit_at_1", "选择"), ("set_f1", "选择"),
+    ("no_call_rate", "选择"), ("wrong_tool_rate", "选择"),
+    ("false_call_rate", "选择"), ("refusal_rate", "选择"),
+    ("args_exact_rate", "参数"), ("args_subset_rate", "参数"),
+    ("args_field_rate", "参数"), ("args_relaxed_share", "参数"),
+    ("format_valid_rate", "格式"), ("invalid_format_rate", "格式"),
+    ("out_of_label_rate", "格式"), ("hallucinated_tool_rate", "格式"),
+    ("parse_fail_rate", "格式"),
+    ("pass_hat_k", "稳定性"), ("pass_at_k", "稳定性"), ("stability_gap", "稳定性"),
+)
 
 
 def _print_run_report(console, report, task, *, k: int, seed: int | None, split: str) -> None:
@@ -1585,20 +1686,27 @@ def _print_run_report(console, report, task, *, k: int, seed: int | None, split:
             "聚合包含全部样本[/dim]"
         )
 
-    ci = aggregate.get("macro_f1_ci") or {}
-    console.print(
-        f"  [内容] macro_f1 [bold]{_fmt(aggregate.get('macro_f1'))}[/bold]"
-        + (f" [95% CI {_fmt(_ci_get(ci, 'low'))}–{_fmt(_ci_get(ci, 'high'))}]"
-           if _ci_get(ci, "low") is not None else "")
-        + f"   acc {_fmt(aggregate.get('accuracy'))}"
-        f"   bal_acc {_fmt(aggregate.get('balanced_accuracy'))}"
-    )
-    console.print(
-        f"  [格式] format_valid {_fmt(aggregate.get('format_valid_rate'))}"
-        f"   invalid_format {_fmt(aggregate.get('invalid_format_rate'))}"
-        f"   out_of_label {_fmt(aggregate.get('out_of_label_rate'))}"
-        f"   refused {_fmt(aggregate.get('refusal_rate'))}"
-    )
+    # 只打印这次评测**真的产出了**的指标。
+    # 这里原本硬编码了 intent 任务的 macro_f1/acc/format_valid，
+    # 于是 tool_selection 的报告整行全是「—」——看着像评测坏了，
+    # 实际是报告模板与任务对不上，正是本项目最该避免的"数字对不上口径"
+    groups: dict[str, list[str]] = {}
+    for key, group in _REPORT_METRICS:
+        if key not in aggregate:
+            continue
+        text = f"{key} {_fmt(aggregate.get(key))}"
+        # CI 跟着指标名走，而不是只对 macro_f1 特判：任何指标算出了区间就必须看得见，
+        # 否则 `must_call_acc` 这类头号指标会显示成一个孤零零的数（DESIGN §9.3）
+        ci = aggregate.get(f"{key}_ci")
+        low, high, units = _ci_get(ci, "low"), _ci_get(ci, "high"), _ci_get(ci, "n")
+        if low is not None or high is not None:
+            text += f" [95% CI {_fmt(low)}–{_fmt(high)}]"
+            if units is not None:
+                text += f"（n={units} case）"
+        groups.setdefault(group, []).append(text)
+    for group in ("内容", "选择", "参数", "格式", "稳定性"):
+        if group in groups:
+            console.print(f"  [{group}] " + "   ".join(groups[group]))
     if aggregate.get("low_confidence"):
         console.print("[yellow]  ⚠ 样本量低于 100，CI 只说明测过了，不足以支撑决策[/yellow]")
     console.print(f"  [dim]打分口径: {aggregate.get('scoring', '—')}"
@@ -1663,6 +1771,29 @@ def _ci_get(ci, key: str):
     if isinstance(ci, dict):
         return ci.get(key)
     return getattr(ci, key, None)
+
+
+def _call_brief(value: object) -> str:
+    """把期望/实际的调用列表压成一行。
+
+    直接 `str()` 会把整份参数 dict 印进表格，一行放不下；而空列表必须显示成
+    **（不调用）**而不是空白——空白看起来像"这个 grade 没有期望值"。
+    """
+    if value is None:
+        return "—"
+    if not isinstance(value, (list, tuple)):
+        return str(value)
+    if not value:
+        return "（不调用）"
+    parts: list[str] = []
+    for item in value:
+        if isinstance(item, dict) and item.get("name"):
+            args = item.get("arguments") or {}
+            tail = "" if not args else "(" + ", ".join(f"{k}={v}" for k, v in args.items()) + ")"
+            parts.append(f"{item['name']}{tail}")
+        else:
+            parts.append(str(item))
+    return " + ".join(parts)
 
 
 @eval_app.command("show")
@@ -1730,10 +1861,18 @@ def eval_show(
             table.add_row(
                 grade.case_id[:20], str(grade.seq), grade.verdict, f"{grade.score:.2f}",
                 "✗" if grade.invalid_format else "✓",
-                str(metrics.get("expected", "—")), str(metrics.get("predicted", "—")),
+                _call_brief(metrics.get("expected")),
+                _call_brief(metrics.get("predicted", metrics.get("actual"))),
                 (grade.trace_id or "—")[:12],
             )
         console.print(table)
+        if grades:
+            # 表里的 trace 是 12 个字符（列宽就那么多），跳进去要用完整 id
+            first = next((g.trace_id for g in grades if g.trace_id), None)
+            console.print(
+                f"[dim]下钻: onyx traces show {first}[/dim]" if first else
+                "[dim]这些 grade 没有关联 trace[/dim]"
+            )
         if grade_errors := [g for g in grades if g.error]:
             console.print("[dim]错误样例:[/dim]")
             for grade in grade_errors[:3]:
