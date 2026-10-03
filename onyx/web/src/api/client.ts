@@ -63,9 +63,15 @@ function qs(params: Record<string, string | number | boolean | null | undefined>
 
 import type {
   ChatResponse,
+  ComparisonView,
+  DatasetView,
   FleetView,
+  GradeView,
+  GpuStatusView,
   HealthView,
+  MatrixView,
   ModelView,
+  RunView,
   TraceDetail,
   TracePage,
   UsageSummaryView,
@@ -110,4 +116,16 @@ export const api = {
     request<{ ok: boolean }>(`/api/admin/models/unload${qs({ name, confirm: 1 })}`, {
       method: 'POST',
     }),
+  /** GPU 锁状态是**只读**的：看板轮询它不能把锁抢了 */
+  gpu: () => request<GpuStatusView>('/api/gpu'),
+  evalDatasets: () => request<DatasetView[]>('/api/datasets'),
+  evalRuns: (params: { task?: string | null; model?: string | null; limit?: number } = {}) =>
+    request<RunView[]>(`/api/runs${qs(params)}`),
+  evalGrades: (runId: string, params: { verdict?: string | null; limit?: number } = {}) =>
+    request<GradeView[]>(`/api/runs/${encodeURIComponent(runId)}/grades${qs(params)}`),
+  matrix: (params: { task?: string | null; model?: string | null; dataset?: string | null } = {}) =>
+    request<MatrixView>(`/api/matrix${qs(params)}`),
+  /** 配对对比在后端算：CI 与净变化只有一处实现，界面不会算出第二个版本 */
+  compare: (base: string, target: string, params: { eps?: number; with_cases?: boolean } = {}) =>
+    request<ComparisonView>(`/api/compare${qs({ base, target, ...params })}`),
 }

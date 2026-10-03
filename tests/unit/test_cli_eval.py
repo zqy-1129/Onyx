@@ -17,7 +17,8 @@ import json
 import pytest
 from typer.testing import CliRunner
 
-from onyx.cli import _call_brief, _fmt, _headline_score, app
+from onyx.cli import _call_brief, _db_path, _fmt, _headline_score, app
+from onyx.settings import load_settings
 
 runner = CliRunner()
 
@@ -68,6 +69,18 @@ def test_headline_score_shows_a_dash_when_the_primary_metric_is_unknown():
     text = _headline_score(aggregate)
     assert text.startswith("macro_f1 —"), text
     assert "0.000" not in text
+
+
+def test_headline_score_never_borrows_a_secondary_metric_to_fill_the_gap():
+    """主指标未定义时，不许把别的指标的数字顶上来。
+
+    这条看着像上一张测试的重复，其实防的是"顺手改一下 fallback"：
+    把 `pass_hat_k 0.420` 写在 `macro_f1 —` 旁边，那个 0.420 一定会被读成主分数，
+    而列表页要传达的恰恰是"这一格没有可信的主分数"。
+    """
+    text = _headline_score({"macro_f1": None, "accuracy": None, "pass_hat_k": 0.42})
+    assert text.startswith("macro_f1 —")
+    assert "0.420" not in text
 
 
 def test_headline_score_flags_low_sample_size():
@@ -444,6 +457,169 @@ def test_eval_run_uses_the_machine_lock_when_not_overridden():
         assert "other-instance" in result.output, "必须说明谁在占，否则用户只会以为命令坏了"
     finally:
         holder.release()
+
+
+# ── compare / matrix / report ─────────────────────────────────────
+def _seed_two_runs(*, task_b: str = "intent_classification"):
+    """直接用 repo 造两次结果不同的 run。
+
+    为什么不用 `eval run --provider mock` 跑两遍：mock 的剧本对同一个模型名是固定的，
+    两次运行分数完全一样，配对差值恒为 0——那测不出"劣化清单"这条路径。
+    这里造的是数据，走的是真实的 compare/matrix/report 代码。
+    """
+    from onyx.store.db import Database
+    from onyx.store.records import CaseRecord, DatasetRecord, GradeRecord, RunRecord, TaskRecord
+    from onyx.store.repos import EvalRepo
+
+    database = Database(_db_path(load_settings(), None))
+    repo = EvalRepo(database)
+    repo.upsert_dataset(DatasetRecord(id="intent_zh-v1", imported_at="2026-10-03",
+                                      upstream="builtin:intent_zh", revision="seed=20261003",
+                                      n_cases=4))
+    repo.upsert_task(TaskRecord(id="intent_classification", name="意图识别",
+                                dataset_id="intent_zh-v1", metrics=["macro_f1"]))
+    repo.upsert_cases([
+        CaseRecord(id=f"izh-{i}", dataset_id="intent_zh-v1", ord=i,
+                   input={"instruction": f"第 {i} 条：转账"}, expect={"label": "转账"})
+        for i in range(4)
+    ])
+    for run_id, model in (("run-good", "a"), ("run-bad", "b")):
+        repo.insert_run(RunRecord(
+            id=run_id, task_id=task_b, model_id=model,
+            started_at="2026-10-03T00:00:00+00:00", status="done", n_cases=4, n_done=4,
+            aggregate={"macro_f1": 1.0 if model == "a" else 0.5,
+                       "macro_f1_ci": {"low": 0.9, "high": 1.0, "n": 4},
+                       "n_judged": 4, "n_total": 4, "low_confidence": True,
+                       "format_valid_rate": 1.0, "scoring": "gen-based"},
+            cost={"requests": 4, "in_tokens": 400, "out_tokens": 40, "wall_ms": 4000.0},
+            params_snapshot={"temperature": 0.0}, config={"k": 1, "split": "default"},
+            dataset_id="intent_zh-v1", dataset_revision="seed=20261003", seed=42,
+        ))
+        for index, case_id in enumerate(f"izh-{i}" for i in range(4)):
+            score = 1.0 if model == "a" or index < 2 else 0.0
+            repo.upsert_grade(GradeRecord(
+                id=f"{run_id}-{case_id}", eval_run_id=run_id, case_id=case_id, seq=0,
+                score=score, verdict="correct" if score else "wrong", passed=bool(score),
+                trace_id=f"tr-{run_id}-{case_id}", graded_at="2026-10-03T00:00:01+00:00",
+            ))
+    database.close()
+    return "run-good", "run-bad"
+
+
+def test_compare_reports_counts_ci_and_the_regression_list():
+    base, target = _seed_two_runs()
+    result = _run("eval", "compare", base, target)
+    assert result.exit_code == 0, result.output
+    assert "改善 0" in result.output and "劣化 2" in result.output
+    assert "95% CI" in result.output, "差值必须带区间，否则只是一个孤零零的数"
+    assert "n=4" in result.output, "区间要带着重采样单位"
+    assert "izh-2" in result.output and "第 2 条" in result.output, "劣化清单要能看出是哪道题"
+    assert "tr-run-bad-izh-2" in result.output, "下钻需要完整 trace id"
+    assert "配对样本只有 4 条" in result.output, "n<30 必须点名"
+
+
+def test_compare_direction_is_target_minus_base():
+    base, target = _seed_two_runs()
+    forward = _run("eval", "compare", base, target)
+    backward = _run("eval", "compare", target, base)
+    assert "均值差 -0.5000" in forward.output
+    assert "均值差 +0.5000" in backward.output
+
+
+def test_compare_writes_a_markdown_report_with_matrix_and_diff(tmp_path):
+    base, target = _seed_two_runs()
+    out = tmp_path / "reports" / "diff.md"
+    result = _run("eval", "compare", base, target, "--format", "md", "--out", str(out))
+    assert result.exit_code == 0, result.output
+    text = out.read_text(encoding="utf-8")
+    assert "## 模型 × 任务矩阵" in text and "## 配对对比" in text
+    assert "seed=20261003" in text, "报告要自带数据集来历，否则离开看板就没人知道考的是什么"
+
+
+def test_compare_refuses_two_tasks_with_an_actionable_message():
+    base, _target = _seed_two_runs()
+    _run("eval", "run", "--task", "intent_classification", "--model", "mock/echo",
+         "--provider", "mock", "--limit", "2", "--quiet")
+    result = _run("eval", "compare", base, "01M3ZWSQ9H3QEFZ72EV1MM1MT1")
+    assert result.exit_code == 2
+    assert "无法比较" in result.output or "找不到 run" in result.output
+
+
+def test_compare_rejects_terminal_table_written_to_a_file(tmp_path):
+    base, target = _seed_two_runs()
+    result = _run("eval", "compare", base, target, "--format", "table",
+                  "--out", str(tmp_path / "x.txt"))
+    assert result.exit_code == 2
+    assert "终端表格" in result.output
+
+
+def test_matrix_shows_the_headline_with_ci_and_its_provenance():
+    _seed_two_runs()
+    result = _run("eval", "matrix")
+    assert result.exit_code == 0, result.output
+    assert "intent_classification" in result.output
+    assert "数据集 intent_zh-v1@seed=20261003" in result.output
+
+
+def test_matrix_names_a_cell_whose_headline_saw_a_minority_of_samples():
+    """主分数只覆盖 1/236 时，那一格必须自己说出来。
+
+    真机就产出了这种格子：不守格式的模型让 `macro_f1` 只在 8 个可判定样本上算出 1.000，
+    单看数字像"这个模型更强"，而它的 format_valid_rate 只有 3.4%。
+    """
+    _seed_two_runs()
+    from onyx.store.db import Database
+
+    database = Database(_db_path(load_settings(), None))
+    database.execute(
+        """UPDATE eval_run SET aggregate_json=? WHERE id='run-good'""",
+        (json.dumps({"macro_f1": 1.0, "macro_f1_ci": {"low": 1.0, "high": 1.0, "n": 1},
+                     "n_judged": 1, "n_total": 236, "low_confidence": True}),),
+    )
+    database.close()
+
+    result = _run("eval", "matrix")
+    assert result.exit_code == 0, result.output
+    assert "可判定 1/236" in result.output, result.output
+    assert "只覆盖不到一半样本" in result.output
+
+
+def test_report_exports_csv_and_html(tmp_path):
+    _seed_two_runs()
+    csv_out = tmp_path / "matrix.csv"
+    result = _run("eval", "report", "--format", "csv", "--out", str(csv_out))
+    assert result.exit_code == 0, result.output
+    rows = csv_out.read_text(encoding="utf-8").strip().splitlines()
+    assert len(rows) == 3 and rows[0].startswith("model,task,metric,value")
+
+    html_out = tmp_path / "report.html"
+    done = _run("eval", "report", "--format", "html", "--out", str(html_out))
+    assert done.exit_code == 0, done.output
+    text = html_out.read_text(encoding="utf-8")
+    assert "<!doctype html>" in text and "模型 × 任务矩阵" in text
+    assert "两个任务的雷达" not in text, "2 个任务不该画雷达图（两点连成的形状没有信息量）"
+    assert "<svg" not in text
+
+
+def test_report_requires_a_file_for_html(tmp_path):
+    _seed_two_runs()
+    result = _run("eval", "report", "--format", "html")
+    assert result.exit_code == 2
+    assert "--out" in result.output
+
+
+def test_report_can_attach_a_paired_comparison():
+    base, target = _seed_two_runs()
+    result = _run("eval", "report", "--format", "md", "--compare", f"{base}:{target}")
+    assert result.exit_code == 0, result.output
+    assert "配对对比" in result.output and "劣化" in result.output
+
+
+def test_report_rejects_a_malformed_compare_spec():
+    _seed_two_runs()
+    result = _run("eval", "report", "--format", "md", "--compare", "run-good")
+    assert result.exit_code == 2
+    assert "A:B" in result.output
 
 
 def test_eval_show_exposes_grades_for_the_tool_task():

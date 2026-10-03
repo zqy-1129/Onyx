@@ -15,7 +15,7 @@ def db(tmp_path) -> Database:
 
 #: 仓库里的迁移数量。新增迁移时这个数会变，测试随之更新——
 #: 它是"迁移有没有被意外删掉/改名"的一道哨兵
-EXPECTED_VERSION = 4
+EXPECTED_VERSION = 5
 
 
 def test_fresh_db_applies_migrations(db):
@@ -65,23 +65,90 @@ def test_incremental_migration_applies_only_new(tmp_path):
     path = tmp_path / "t.sqlite"
 
     with Database(path, migrate=False) as db:
-        assert db.migrate(migrations) == [1, 2, 3, 4]
+        assert db.migrate(migrations) == list(range(1, EXPECTED_VERSION + 1))
         db.execute(
             "INSERT INTO provider(id, kind, base_url, api_style, created_at) VALUES('p','mock','','native','')"
         )
         assert db.version() == EXPECTED_VERSION
 
     # 之后新增一个迁移（版本号必须接在现有迁移之后）
-    (migrations / "0005_add_probe_log.sql").write_text(
+    next_version = EXPECTED_VERSION + 1
+    (migrations / f"{next_version:04d}_add_probe_log.sql").write_text(
         "CREATE TABLE IF NOT EXISTS probe_log(id TEXT PRIMARY KEY, model TEXT NOT NULL);",
         encoding="utf-8",
     )
     with Database(path, migrate=False) as db:
-        assert db.migrate(migrations) == [5], "只应用新增的迁移"
-        assert db.version() == 5
+        assert db.migrate(migrations) == [next_version], "只应用新增的迁移"
+        assert db.version() == next_version
         assert "probe_log" in db.table_names()
         assert db.scalar("SELECT COUNT(*) FROM provider") == 1, "既有数据必须完好"
         assert db.migrate(migrations) == []
+
+
+def test_backfill_only_runs_when_the_source_version_is_reachable(tmp_path):
+    """回填型迁移的边界：跳级升级时它根本不会执行（前一个版本已被裁剪）。
+
+    这类迁移不能假装"重跑一次就好了"，所以这里断言它只在目标场景里跑。
+    """
+    from onyx.store.db import discover_migrations
+
+    assert len(discover_migrations(MIGRATIONS_DIR)) == EXPECTED_VERSION
+
+
+def test_dataset_provenance_is_backfilled_for_existing_runs(tmp_path):
+    """0005 的回填必须真的把历史 run 的数据集补上。
+
+    回填是迁移最容易糊弄过去的一步：新库看起来一切正常，老库升级之后
+    `dataset_id` 全空，于是"这两次跑的是不是同一份数据"重新变成无法回答的问题
+    ——而 M5 的每个对比结论都建立在这件事上。
+    """
+    from onyx.store.records import CaseRecord, DatasetRecord
+    from onyx.store.repos import EvalRepo
+
+    migrations = tmp_path / "migrations"
+    migrations.mkdir()
+    # 只放 0001–0004：模拟"升级前"的库
+    for path in sorted(MIGRATIONS_DIR.glob("*.sql"))[:4]:
+        shutil.copy(path, migrations / path.name)
+
+    path = tmp_path / "t.sqlite"
+    with Database(path, migrate=False) as db:
+        assert db.migrate(migrations) == [1, 2, 3, 4]
+        repo = EvalRepo(db)
+        repo.upsert_dataset(DatasetRecord(id="intent_zh-v1", imported_at="2026-10-03T00:00:00+00:00",
+                                          upstream="builtin:intent_zh",
+                                          revision="seed=20261003", n_cases=2))
+        repo.upsert_cases([
+            CaseRecord(id="izh-1", dataset_id="intent_zh-v1", ord=0,
+                       input={"instruction": "a"}, expect={"label": "转账"}),
+            CaseRecord(id="izh-2", dataset_id="intent_zh-v1", ord=1,
+                       input={"instruction": "b"}, expect={"label": "查余额"}),
+        ])
+        db.execute(
+            """INSERT INTO eval_task(id, name, dataset_id, metrics_json)
+               VALUES('intent_classification','意图识别','intent_zh-v1','[]')"""
+        )
+        # 旧数据必须用**旧 schema** 写：`EvalRepo.insert_run` 现在带 dataset_id 列，
+        # 而 0005 之前那一列还不存在
+        db.execute(
+            """INSERT INTO eval_run(id, task_id, model_id, started_at, status, n_cases)
+               VALUES('run-old','intent_classification','qwen3.5:9b',
+                      '2026-10-03T00:00:00+00:00','done',2)"""
+        )
+        for index, case_id in enumerate(("izh-1", "izh-2")):
+            db.execute(
+                """INSERT INTO grade(id, eval_run_id, case_id, seq, score, verdict,
+                                    invalid_format, out_of_set, graded_at)
+                   VALUES(?,?,?,0,1.0,'correct',0,0,'2026-10-03T00:00:01+00:00')""",
+                (f"g{index}", "run-old", case_id),
+            )
+
+    with Database(path, migrate=False) as db:
+        assert db.migrate(MIGRATIONS_DIR) == [5], "只应用 0005"
+        run = EvalRepo(db).get_run("run-old")
+        assert run is not None
+        assert run.dataset_id == "intent_zh-v1", "历史 run 的数据集必须被回填出来"
+        assert run.dataset_revision == "seed=20261003", "版本号也要回填，否则不可比性无从判断"
 
 
 def test_bad_migration_filename_rejected(tmp_path):

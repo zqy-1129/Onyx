@@ -6,9 +6,12 @@ import { StatusDot } from './components/primitives'
 import { UNKNOWN } from './format'
 import { useApi } from './hooks/useApi'
 import { navigate, useRoute } from './router'
+import { EvalMatrixPage } from './pages/EvalMatrix'
+import { EvalRunsPage } from './pages/EvalRuns'
 import { FleetPage } from './pages/Fleet'
 import { ModelsPage } from './pages/Models'
 import { PlaygroundPage } from './pages/Playground'
+import { RegressionPage } from './pages/Regression'
 import { TracesPage } from './pages/Traces'
 import { TraceDetailPage } from './pages/TraceDetail'
 import { UsagePage } from './pages/Usage'
@@ -25,6 +28,7 @@ const NAV: NavItem[] = [
   { path: '/playground', glyph: '▶', label: 'Playground' },
   { path: '/traces', glyph: '≡', label: 'Traces' },
   { path: '/usage', glyph: '∿', label: 'Token Ledger' },
+  { path: '/eval', glyph: '◎', label: '评测' },
 ]
 
 function useTheme(): [string, () => void] {
@@ -59,6 +63,17 @@ export function App() {
     content = <PlaygroundPage />
   } else if (page === 'usage') {
     content = <UsagePage />
+  } else if (page === 'eval' && segments[1] === 'matrix') {
+    content = <EvalMatrixPage />
+  } else if (page === 'eval' && segments[1] === 'regression') {
+    content = <RegressionPage />
+  } else if (page === 'eval') {
+    // /eval/run/<id> 直接落到运行页并选中它：矩阵与 diff 都靠这个链接下钻
+    content = (
+      <EvalRunsPage
+        selectedRunId={segments[1] === 'run' && segments[2] ? decodeURIComponent(segments[2]) : undefined}
+      />
+    )
   } else {
     content = <FleetPage />
   }

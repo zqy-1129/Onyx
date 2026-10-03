@@ -79,6 +79,9 @@ class RunReport:
     finished_at: str = ""
     #: 整个任务因能力不足被跳过时的原因（不是"跑了但都失败"）
     skip_reason: str = ""
+    #: 数据集来历。对比与报告的每个结论都默认"同一份数据"，所以这个必须随结果走
+    dataset_id: str = ""
+    dataset_revision: str = ""
 
     @property
     def ok(self) -> bool:
@@ -115,6 +118,14 @@ class EvalRunner:
         caps = getattr(self.gateway.provider, "capabilities", None)
         return frozenset(caps()) if callable(caps) else frozenset()
 
+    @property
+    def _dataset_id(self) -> str:
+        return self.dataset.id if self.dataset is not None else ""
+
+    @property
+    def _dataset_revision(self) -> str:
+        return self.dataset.revision if self.dataset is not None else ""
+
     # ── 主流程 ────────────────────────────────────────────────────
     def run(self, config: RunConfig) -> RunReport:
         started_at = utc_now_iso()
@@ -135,13 +146,15 @@ class EvalRunner:
                     started_at=started_at, finished_at=utc_now_iso(), status="skipped",
                     seed=config.seed, app_version=__version__, n_skipped=1,
                     aggregate={"skip": {"reason": skip.reason, "missing": list(skip.missing)}},
-                    notes=config.notes,
+                    notes=config.notes, dataset_id=self._dataset_id,
+                    dataset_revision=self._dataset_revision,
                 ))
             return RunReport(
                 run_id=run_id, task_id=self.task.id, model=config.model, status="skipped",
                 skipped=(skip,), n_skipped=1, skip_reason=skip.reason,
                 started_at=started_at, finished_at=utc_now_iso(),
                 aggregate={"skip": {"reason": skip.reason, "missing": list(skip.missing)}},
+                dataset_id=self._dataset_id, dataset_revision=self._dataset_revision,
             )
 
         cases = list(self.task.load(split=config.split, limit=config.limit))
@@ -204,6 +217,7 @@ class EvalRunner:
                             "already_graded": len(already),
                             "unload_others": config.unload_others},
                     n_cases=total, notes=config.notes,
+                    dataset_id=self._dataset_id, dataset_revision=self._dataset_revision,
                 ))
             if self.gpu_lock is not None and config.unload_others:
                 cost["unloaded_models"] = self._unload_other_models(config.model)

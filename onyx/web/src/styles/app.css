@@ -253,3 +253,38 @@ textarea.input { font-family: var(--font-ui); resize: vertical; line-height: 1.5
 .muted { color: var(--text-muted); }
 .small { font-size: var(--fs-xs); }
 .nowrap { white-space: nowrap; }
+
+/* ── 评测页（S15）──────────────────────────────────────────────
+ * R2：矩阵与 diff 里的「—」与 0 必须在视觉上不同；
+ * R5：红只用于"这次请求失败"，模型答错是测量结果，用琥珀色。 */
+.matrix { width: 100%; border-collapse: separate; border-spacing: 0; }
+.matrix th, .matrix td { border-bottom: 1px solid var(--border); padding: 6px var(--space-2); text-align: left; }
+.matrix thead th { color: var(--text-secondary); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: .4px; }
+.matrix tbody th { color: var(--text-secondary); font-weight: 500; }
+.matrix td { font-variant-numeric: tabular-nums; }
+.cell-empty, .cell-unknown { color: var(--text-muted); }
+/* 覆盖率不足：加边框，不只靠颜色（R4） */
+.cell-thin { background: var(--warn-dim); box-shadow: inset 2px 0 0 var(--warn); }
+
+.linklike {
+  background: none; border: 0; padding: 0; color: inherit; font: inherit;
+  cursor: pointer; border-bottom: 1px dotted var(--border-strong);
+}
+.linklike:hover { color: var(--accent); border-bottom-color: var(--accent); }
+.tone-good { color: var(--ok); }
+.tone-bad { color: var(--warn); }
+
+.banner {
+  display: flex; align-items: center; gap: var(--space-2); flex-wrap: wrap;
+  border: 1px solid var(--border); border-left: 3px solid var(--info);
+  background: var(--bg-panel); border-radius: var(--radius-panel); padding: var(--space-2) var(--space-3);
+}
+.banner-warn { border-left-color: var(--warn); }
+
+.warnbox {
+  border: 1px solid var(--border); border-left: 3px solid var(--warn);
+  background: var(--bg-inset); border-radius: var(--radius-chip);
+  padding: var(--space-2) var(--space-3); margin-top: var(--space-3); font-size: var(--fs-sm);
+}
+.warnbox ul { margin: 4px 0 0; padding-left: 18px; }
+.note { color: var(--text-muted); font-size: var(--fs-xs); margin: var(--space-2) 0 0; }

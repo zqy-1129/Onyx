@@ -130,12 +130,14 @@ class EvalRepo:
             """INSERT INTO eval_run(id, task_id, model_id, provider_id, started_at, finished_at,
                                     status, seed, app_version, git_rev, params_snapshot_json,
                                     config_json, n_cases, n_done, n_error, n_skipped,
-                                    aggregate_json, cost_json, notes)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                                    aggregate_json, cost_json, notes,
+                                    dataset_id, dataset_revision)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (rec.id, rec.task_id, rec.model_id, rec.provider_id, rec.started_at, rec.finished_at,
              rec.status, rec.seed, rec.app_version, rec.git_rev, dumps(rec.params_snapshot),
              dumps(rec.config), rec.n_cases, rec.n_done, rec.n_error, rec.n_skipped,
-             dumps(rec.aggregate), dumps(rec.cost), rec.notes),
+             dumps(rec.aggregate), dumps(rec.cost), rec.notes,
+             rec.dataset_id, rec.dataset_revision),
         )
         return rec.id
 
@@ -179,21 +181,39 @@ class EvalRepo:
         return self._run_from_row(row) if row else None
 
     def list_runs(
-        self, *, task_id: str | None = None, model_id: str | None = None, limit: int = 20
+        self,
+        *,
+        task_id: str | None = None,
+        model_id: str | None = None,
+        dataset_id: str | None = None,
+        status: str | None = None,
+        limit: int = 20,
     ) -> list[RunRecord]:
         clauses, params = [], []
-        if task_id:
-            clauses.append("task_id=?")
-            params.append(task_id)
-        if model_id:
-            clauses.append("model_id=?")
-            params.append(model_id)
+        for column, value in (("task_id", task_id), ("model_id", model_id),
+                              ("dataset_id", dataset_id), ("status", status)):
+            if value:
+                clauses.append(f"{column}=?")
+                params.append(value)
         where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
         params.append(limit)
         rows = self.db.query(
             f"SELECT * FROM eval_run{where} ORDER BY started_at DESC LIMIT ?", tuple(params)
         )
         return [self._run_from_row(r) for r in rows]
+
+    def run_dataset_ids(self, run_id: str) -> set[str]:
+        """一个 run 实际用到的数据集 id（从 grade 反推）。
+
+        对比前必须问这个：跨数据集的"回归"看着像模型变差，实际是换了考卷。
+        """
+        rows = self.db.query(
+            """SELECT DISTINCT c.dataset_id FROM grade g
+               JOIN eval_case c ON c.id = g.case_id
+               WHERE g.eval_run_id=? AND c.dataset_id IS NOT NULL""",
+            (run_id,),
+        )
+        return {str(r["dataset_id"]) for r in rows}
 
     # ── grade ─────────────────────────────────────────────────────
     def upsert_grade(self, rec: GradeRecord) -> str:
@@ -293,6 +313,7 @@ class EvalRepo:
             n_error=int(row["n_error"] or 0), n_skipped=int(row["n_skipped"] or 0),
             aggregate=loads_dict(row["aggregate_json"]), cost=loads_dict(row["cost_json"]),
             notes=row["notes"] or "",
+            dataset_id=row["dataset_id"], dataset_revision=row["dataset_revision"] or "",
         )
 
     def _grade_from_row(self, row) -> GradeRecord:

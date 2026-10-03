@@ -96,3 +96,38 @@ export function shortRef(ref: string | null | undefined): string {
   if (!digest) return ref
   return `${scheme}:${digest.slice(0, 10)}`
 }
+
+/* ── 评测数字（S15）─────────────────────────────────────────────
+ * 规则与 R2 一致，但多一条：**带符号的差值不能把 0 显示成「—」**。
+ * 差值 0 是"没变化"这个结论，未知是"没配对上"，两者混了就等于把结论抹掉。 */
+
+/** 0–1 的分数保留三位；未定义显示「—」 */
+export function fmtScore(value: number | null | undefined): string {
+  return isMissing(value) ? UNKNOWN : value.toFixed(3)
+}
+
+/** 带符号的差值，用于回归/改善列表。 */
+export function fmtDelta(value: number | null | undefined): string {
+  if (isMissing(value)) return UNKNOWN
+  const sign = value > 0 ? '+' : value < 0 ? '−' : '±'
+  return `${sign}${Math.abs(value).toFixed(3)}`
+}
+
+/** CI 的紧凑写法：`[0.528–0.736]`，缺一端就只写知道的那端。 */
+export function fmtCi(ci: { low: number | null; high: number | null } | null | undefined): string {
+  if (!ci || (ci.low === null && ci.high === null)) return ''
+  const low = ci.low === null ? '?' : ci.low.toFixed(3)
+  const high = ci.high === null ? '?' : ci.high.toFixed(3)
+  return `[${low}–${high}]`
+}
+
+/** 比例（覆盖率、误调率）用百分数；分母未知时不猜。 */
+export function fmtRate(value: number | null | undefined, digits = 0): string {
+  return isMissing(value) ? UNKNOWN : `${(value * 100).toFixed(digits)}%`
+}
+
+/** 差值该染成"变好"还是"变坏"：方向由调用方给，颜色不由数值大小自己决定。 */
+export function deltaTone(value: number | null | undefined, eps = 0): 'good' | 'bad' | 'flat' {
+  if (isMissing(value) || Math.abs(value) <= eps) return 'flat'
+  return value > 0 ? 'good' : 'bad'
+}

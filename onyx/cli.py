@@ -14,6 +14,7 @@ from pathlib import Path
 import typer
 
 from onyx import __version__
+from onyx.eval.task import HEADLINE_METRICS
 from onyx.settings import Settings, load_settings
 from onyx.store.db import Database
 
@@ -1354,7 +1355,7 @@ def _policy_from_cli(allow: str | None):
 
 
 # ── eval ─────────────────────────────────────────────────────────
-eval_app = typer.Typer(help="评测：数据集、任务、运行与分数下钻", no_args_is_help=True)
+eval_app = typer.Typer(help="评测：数据集、任务、运行、分数下钻与对比报告", no_args_is_help=True)
 app.add_typer(eval_app, name="eval")
 
 
@@ -1408,35 +1409,45 @@ def eval_ls(
         database.close()
 
 
-#: 主分数的候选指标，按优先级。**只显示任务声明过的第一个指标**，
-#: 绝不因为它是 None 就悄悄换成另一个——那会让"macro_f1 未知"显示成"得了 0 分"，
-#: 而这两个结论的修法完全相反（前者是根本没有可判定样本，后者是模型不行）
-_HEADLINE_METRICS = ("macro_f1", "accuracy", "must_call_acc", "pass_hat_k", "score")
-
-
+#: 主分数的候选指标在 `onyx.eval.task.HEADLINE_METRICS`：列表页、矩阵与导出报告
+#: 共用同一份优先级，否则同一个 run 在不同界面会显示不同的"头号分数"。
 def _headline_score(aggregate: dict) -> str:
     """列表页只显示一个数，但必须**带上指标名**，且未知就显示「—」。"""
     if not aggregate:
         return "—"
     if aggregate.get("skip"):
         return "skipped"
-    for key in _HEADLINE_METRICS:
-        if key not in aggregate:
-            continue
-        value = aggregate.get(key)
-        if value is None:
-            return f"{key} —（无可判定样本）"
-        text = f"{key} {_fmt(value)}"
-        # 区间按「指标名 + _ci」找，不写死 macro_f1：头号指标一换（工具任务是
-        # must_call_acc），写死的版本就会把区间整个丢掉，只剩一个孤零零的数
-        ci = aggregate.get(f"{key}_ci")
-        low, high = _ci_get(ci, "low"), _ci_get(ci, "high")
-        if low is not None and high is not None:
-            text += f" [{_fmt(low)}–{_fmt(high)}]"
-        if aggregate.get("low_confidence"):
-            text += " ⚠低样本"
-        return text
-    return "—"
+    key, value = _headline_of(aggregate)
+    if key is None:
+        return "—"
+    if value is None:
+        # 只说"未定义"，不把别的指标的数字顺手带上来：
+        # `macro_f1 —（无可判定样本；pass_hat_k 0.000）` 里那个 0.000 一定会被读成主分数，
+        # 而列表页要传达的恰恰是"这一格没有可信的主分数"（UI_DESIGN R2）
+        return f"{key} —（无可判定样本）"
+    text = f"{key} {_fmt(value)}"
+    # 区间按「指标名 + _ci」找，不写死 macro_f1：头号指标一换（工具任务是
+    # must_call_acc），写死的版本就会把区间整个丢掉，只剩一个孤零零的数
+    ci = aggregate.get(f"{key}_ci")
+    low, high = _ci_get(ci, "low"), _ci_get(ci, "high")
+    if low is not None and high is not None:
+        text += f" [{_fmt(low)}–{_fmt(high)}]"
+    if aggregate.get("low_confidence"):
+        text += " ⚠低样本"
+    return text
+
+
+def _headline_of(aggregate: dict) -> tuple[str | None, object]:
+    """任务声明过的第一个主分数指标。
+
+    取"出现过"而不是"非空"：值为 None 表示这个指标算不出来（没有可判定样本），
+    它仍然是这个任务的主分数。跳过 None 去选下一个候选，等于把"没考到"
+    显示成"另一个指标得了分"——两者的修法完全相反。
+    """
+    for key in HEADLINE_METRICS:
+        if key in aggregate:
+            return key, aggregate[key]
+    return None, None
 
 
 @eval_app.command("import")
@@ -1877,6 +1888,233 @@ def eval_show(
             console.print("[dim]错误样例:[/dim]")
             for grade in grade_errors[:3]:
                 console.print(f"  {grade.case_id[:20]} [{grade.verdict}] {grade.error[:120]}")
+    finally:
+        database.close()
+
+
+#: 导出与对比支持的格式。`table` 只在终端有意义，所以不放进 `--out` 的允许值里
+_FORMATS = ("table", "md", "csv", "html", "json")
+
+
+@eval_app.command("compare")
+def eval_compare(
+    base: str = typer.Argument(..., help="基准 run_id（差值方向是 target − base）"),
+    target: str = typer.Argument(..., help="对比 run_id"),
+    eps: float = typer.Option(0.0, "--eps", help="小于它的差值算「没变化」（浮点抖动与部分分）"),
+    fmt: str = typer.Option("table", "--format", help=" | ".join(_FORMATS)),
+    out: Path = typer.Option(None, "--out", help="写到文件（table 格式不能用）"),
+    db: Path = typer.Option(None, "--db"),
+    limit: int = typer.Option(10, "--limit", help="列出的劣化 case 条数"),
+) -> None:
+    """配对比较两次运行：净改善/净劣化/不变 + 配对 bootstrap CI。
+
+    刻意**不**只报均值差。均值差 0.02 可能是 30 条变好、28 条变坏相互抵消的结果，
+    那不是"略好"，而是"在两类任务上方向相反"——修法完全不同。
+    区间用的是配对 bootstrap（重采样 case 后重算均值差），
+    比"看两个独立 CI 是否重叠"灵敏得多，后者在 n 小的时候几乎永远不显著。
+    """
+    import json as _json
+
+    from rich.console import Console
+    from rich.table import Table
+
+    from onyx.eval.compare import CompareError, compare_runs
+    from onyx.report.eval_report import render_csv, render_html, render_markdown
+    from onyx.store.repos import EvalRepo
+
+    if fmt not in _FORMATS:
+        typer.echo(f"未知格式 {fmt!r}；可选: {list(_FORMATS)}", err=True)
+        raise typer.Exit(2)
+    if fmt == "table" and out is not None:
+        typer.echo("--format table 不能配 --out：终端表格不是可分享的产物", err=True)
+        raise typer.Exit(2)
+
+    settings = _settings()
+    database = Database(_db_path(settings, db))
+    try:
+        repo = EvalRepo(database)
+        try:
+            result = compare_runs(repo, base, target, eps=eps)
+        except CompareError as exc:
+            typer.echo(f"无法比较: {exc}", err=True)
+            raise typer.Exit(2) from None
+
+        if fmt == "json":
+            text = _json.dumps(result.as_dict(), ensure_ascii=False, indent=2)
+        elif fmt == "csv":
+            text = render_csv(_matrix_of(result))
+        elif fmt == "md":
+            text = render_markdown(_matrix_of(result), [result])
+        else:
+            text = render_html(_matrix_of(result), [result])
+
+        if out is not None:
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(text, encoding="utf-8", newline="\n")
+            typer.echo(f"已写出 {fmt} 报告：{out}")
+            return
+        if fmt in ("html", "csv"):
+            typer.echo(f"{fmt} 是给文件看的，用 --out 落地；终端请用 table 或 json", err=True)
+            raise typer.Exit(2)
+        if fmt == "md":
+            typer.echo(text)
+            return
+
+        console = Console()
+        ci = result.delta_ci
+        console.print(
+            f"[bold]{result.base.model_id} → {result.target.model_id}[/bold] · "
+            f"{result.base.task_id} · 配对 {result.n_paired} 条"
+        )
+        console.print(
+            f"  改善 {result.improved} · [red]劣化 {result.regressed}[/red] · "
+            f"不变 {result.unchanged} · pass^k 翻转 +{result.flips['up']}/-{result.flips['down']}"
+        )
+        console.print(f"  均值差 {result.mean_delta:+.4f} · {ci.format()}")
+        if result.coverage is not None and (result.only_base or result.only_target):
+            console.print(
+                f"  [dim]覆盖率 {result.coverage:.0%}："
+                f"只有 base 考了 {len(result.only_base)} 条，"
+                f"只有 target 考了 {len(result.only_target)} 条[/dim]"
+            )
+        for note in result.warnings:
+            console.print(f"  [yellow]⚠ {note}[/yellow]")
+        worse = result.regressions(limit=limit)
+        if worse:
+            table = Table(title=f"劣化清单（前 {len(worse)} 条）", pad_edge=False)
+            for column in ("case", "Δ", "base", "target", "题干"):
+                table.add_column(column, overflow="fold")
+            for item in worse:
+                table.add_row(
+                    item.case_id[:18], f"{item.delta:+.2f}", item.verdict_base,
+                    item.verdict_target, (item.instruction or "—")[:48],
+                )
+            console.print(table)
+            console.print(f"[dim]下钻: onyx traces show "
+                          f"{worse[0].trace_base or '—'} / {worse[0].trace_target or '—'}[/dim]")
+    finally:
+        database.close()
+
+
+def _matrix_of(result) -> object:
+    """把 Comparison 的两个 run 装进矩阵，让报告里既有网格也有配对结论。"""
+    from onyx.report.eval_report import build_matrix
+
+    return build_matrix([result.base, result.target])
+
+
+@eval_app.command("matrix")
+def eval_matrix(
+    dataset: str = typer.Option(None, "--dataset", help="只看某个数据集的 run"),
+    task: str = typer.Option(None, "--task"),
+    limit: int = typer.Option(200, "--limit", help="最多读多少次运行（取每组合的最新一次）"),
+    db: Path = typer.Option(None, "--db"),
+) -> None:
+    """模型 × 任务矩阵：每格是该组合**最新一次 done 运行**的主分数。"""
+    from rich.console import Console
+    from rich.table import Table
+
+    from onyx.report.eval_report import THIN_COVERAGE, build_matrix
+    from onyx.store.repos import EvalRepo
+
+    settings = _settings()
+    database = Database(_db_path(settings, db))
+    try:
+        repo = EvalRepo(database)
+        runs = repo.list_runs(task_id=task, dataset_id=dataset, limit=limit)
+        matrix = build_matrix(runs)
+        console = Console()
+        if not matrix.cells:
+            console.print("[yellow]没有 done 状态的运行可进矩阵"
+                          "（running/cancelled 不进网格：半截分数没有可比性）[/yellow]")
+            raise typer.Exit(1)
+        table = Table(title="模型 × 任务矩阵", pad_edge=False)
+        table.add_column("模型")
+        for task_id in matrix.tasks:
+            table.add_column(task_id)
+        for model in matrix.models:
+            row = [model]
+            for task_id in matrix.tasks:
+                cell = matrix.cell(model, task_id)
+                if cell is None:
+                    row.append("[dim]—[/dim]")
+                    continue
+                span = ""
+                ci = cell.ci or {}
+                if ci.get("low") is not None and ci.get("high") is not None:
+                    span = f" [dim][{ci['low']:.3f}–{ci['high']:.3f}][/dim]"
+                flag = " [yellow]⚠[/yellow]" if cell.low_confidence else ""
+                # 覆盖不到一半样本时把分母写出来，否则 "1.000" 会被读成整场考试的成绩
+                cover = (f" [dim](可判定 {cell.n_judged}/{cell.n_total})[/dim]"
+                         if (cell.coverage or 1.0) < THIN_COVERAGE else "")
+                row.append("—" if cell.value is None
+                           else f"{cell.value:.3f}{span}{cover}{flag}")
+            table.add_row(*row)
+        console.print(table)
+        console.print(f"[dim]数据集 {'、'.join(matrix.provenance) or '未知'} · "
+                      f"{len(matrix.cells)} 格来自 {len(runs)} 次运行[/dim]")
+        for note in matrix.warnings:
+            console.print(f"[yellow]⚠ {note}[/yellow]")
+    finally:
+        database.close()
+
+
+@eval_app.command("report")
+def eval_report(
+    fmt: str = typer.Option("md", "--format", help="md | csv | html"),
+    out: Path = typer.Option(None, "--out", help="输出路径；省略时 md/csv 打到标准输出"),
+    dataset: str = typer.Option(None, "--dataset"),
+    task: str = typer.Option(None, "--task"),
+    compare: list[str] = typer.Option([], "--compare",
+                                      help="附上配对对比，写成 A:B 形式，可重复"),
+    db: Path = typer.Option(None, "--db"),
+) -> None:
+    """导出可脱离看板阅读的报告（md / csv / 自包含 html）。"""
+    from onyx.eval.compare import CompareError, compare_runs
+    from onyx.report.eval_report import build_matrix, render_csv, render_html, render_markdown
+    from onyx.store.repos import EvalRepo
+
+    if fmt not in ("md", "csv", "html"):
+        typer.echo(f"未知格式 {fmt!r}；可选: md | csv | html", err=True)
+        raise typer.Exit(2)
+
+    settings = _settings()
+    database = Database(_db_path(settings, db))
+    try:
+        repo = EvalRepo(database)
+        matrix = build_matrix(repo.list_runs(task_id=task, dataset_id=dataset, limit=500))
+        if not matrix.cells:
+            typer.echo("没有 done 状态的运行，报告是空的", err=True)
+            raise typer.Exit(1)
+
+        comparisons = []
+        for spec in compare:
+            parts = spec.split(":")
+            if len(parts) != 2:
+                typer.echo(f"--compare 要写成 A:B，收到 {spec!r}", err=True)
+                raise typer.Exit(2)
+            try:
+                comparisons.append(compare_runs(repo, parts[0], parts[1]).as_dict())
+            except CompareError as exc:
+                typer.echo(f"无法比较 {spec}: {exc}", err=True)
+                raise typer.Exit(2) from None
+
+        if fmt == "csv":
+            text = render_csv(matrix)
+        elif fmt == "html":
+            text = render_html(matrix, comparisons)
+        else:
+            text = render_markdown(matrix, comparisons)
+
+        if out is not None:
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(text, encoding="utf-8", newline="\n")
+            typer.echo(f"已写出 {fmt} 报告：{out}")
+            return
+        if fmt == "html":
+            typer.echo("html 报告请用 --out 落地（它是给人双击打开的文件）", err=True)
+            raise typer.Exit(2)
+        typer.echo(text)
     finally:
         database.close()
 

@@ -154,6 +154,24 @@ def check_capabilities(task: EvalTask, caps: Iterable[Cap]) -> Skip | None:
     )
 
 
+#: 主分数（headline）候选，按优先级。列表页、矩阵、导出报告**共用这一份**：
+#: 同一个 run 在不同界面显示不同的"头号分数"会让人怀疑所有数字。
+HEADLINE_METRICS = ("macro_f1", "accuracy", "must_call_acc", "pass_hat_k", "score")
+
+
+def headline_of(aggregate: dict[str, Any]) -> tuple[str, Any] | None:
+    """返回 (指标名, 值)——第一个在该任务的聚合里出现的候选指标。
+
+    注意取的是"**出现过**"而不是"非 None"：值为 None 表示这个指标算不出来
+    （没有可判定样本），它仍然是这个任务的主分数，必须原样交给上层去显示「—」。
+    跳过 None 去选下一个候选，就等于把"没考到"显示成"另一个指标得了分"。
+    """
+    for key in HEADLINE_METRICS:
+        if key in aggregate:
+            return key, aggregate[key]
+    return None
+
+
 class TaskRegistry:
     """任务注册表。S16 会接 entry points，让第三方任务不改内核就能注册。"""
 

@@ -303,6 +303,10 @@ class RunRecord:
     #: 评测自身的开销。judge 也是本地模型时同样吃 GPU 与时间，必须计入（DESIGN R13）
     cost: dict[str, Any] = field(default_factory=dict)
     notes: str = ""
+    #: 数据集来历（id + revision）。对比与回归的全部结论都建立在"两次跑的是同一份数据"
+    #: 这件事上，所以它必须是记录的一部分，而不是靠 case_id 反推出来的推测
+    dataset_id: str | None = None
+    dataset_revision: str = ""
 
 
 @dataclass(frozen=True, slots=True)

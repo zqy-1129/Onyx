@@ -37,7 +37,7 @@ uv run onyx db init         # 初始化 .data/onyx.sqlite
 | M2 看板 | ✅ | REST + SSE · Fleet / Models / Traces / TraceDetail / Token Ledger / Playground 六页，已在真实浏览器实测（真机发送到 qwen3.5:9b，引擎计数与冷启动标注齐全，零 console 错误） |
 | M3 工具 | ✅ | 注册表（内容 hash 版本化 + 契约审计 + 上下文开销核算）· 执行层（python_fn / mock_replay / http 三种执行器 + 沙箱 + 契约矩阵）· 客户端工具循环（预算 / 熔断 / 孤儿补齐）· fire-and-verify 六种判定，真机 qwen3.5:9b 端到端 PASS |
 | M4 评测 | ✅ | 评测内核（task/grade/runner + 指标层 + bootstrap CI）· 6 个评分器 + 类型感知参数比对 · 236 条中文意图集 + 97 条工具调用集 · `intent_classification` 与 `tool_selection` 各一次真机运行 · BFCL 导入器 · GPU 独占锁（跨进程 + 心跳 + ETA），eval/Playground/live 测试互相排队 |
-| M5 对比 | ⬜ | 矩阵、回归 diff、报告导出 |
+| M5 对比 | ✅ | 模型 × 任务矩阵 + 配对回归 diff（净改善/净劣化 + 配对 bootstrap CI + 劣化清单）· Eval / 矩阵 / 回归三页已在真实浏览器实测 · md/csv/自包含 html 报告导出 · 每次运行带数据集来历 |
 | M6 扩展 | ⬜ | 插件 entry points、第二 provider、MCP 执行器 |
 
 **M3 执行层的核心保证**（`onyx tools contract`，离线、零真实网络）：
@@ -78,6 +78,19 @@ tool 消息**——少一条，之后每次请求的上下文都永久错位，�
 证明区间真的在算而不是返回常数。工具那行的结论是：**选工具几乎没错，掉分全在参数上**
 （291 次采样里 `bad_args` 69 次，而 `hallucinated_tool` 与误调率都是 0——在场 97 次的
 `send_email` 一次都没被用）。
+
+**M5 对比的一条纪律**：**换模型要看配对差值，不看两个平均值。**
+均值差 0.02 可能是 30 条变好、28 条变坏相互抵消——那不是"略好"，是"方向相反"。
+所以 `eval compare` 的头一行是"净改善 / 净劣化 / 不变"，区间用**配对 bootstrap**
+（先按 case 算差值，再重采样 case），比"看两个 CI 是否重叠"灵敏得多；
+下面紧跟劣化清单，每条带**两个模型各自的 trace_id**——差在哪道题只有并排看才知道。
+
+真机配对结论（同一份 236 条意图集，qwen3.5:9b → gpt-oss:20b）：
+**改善 0 / 劣化 226 / 不变 10**，均值差 −0.958，95% CI [−0.983, −0.932]。
+但 gpt-oss 那一格的 `macro_f1` 显示 **1.000**——因为 236 条里只有 8 条产出了正文
+（`max_tokens=32` 全被它的 reasoning 吃光，P12），主分数是在这 8 条上算的。
+矩阵因此必须把分母一起摆出来（`可判定 8/236` + 顶部警告）：数字是真的，读法是错的。
+下钻 trace 才给出正确结论——该改的是 `max_tokens`/`thinking` 参数，不是换模型。
 
 **M1 已在真机达成**：`onyx chat` 一次对话即落库完整 trace —— 引擎计数（in=19/out=47，
 source=engine，confidence=high）、分段归因（`msg:0=8 + template_ctl=11 == 19`，

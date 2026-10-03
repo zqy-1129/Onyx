@@ -101,6 +101,20 @@ def test_run_detail_exposes_aggregate_and_cost(env):
     assert payload["verdict_counts"].get("correct") == 6
 
 
+def test_run_view_carries_the_dataset_provenance(env):
+    """`RunView` 里的数据集字段必须真的被填上。
+
+    库里有了、模型里声明了、但构造时漏传 —— 界面就会显示「—」，
+    看起来像"这次运行没记来历"，而真相是 API 把它丢了。
+    """
+    client, _, report = env
+    run = client.get(f"/api/runs/{report.run_id}").json()["run"]
+    assert run["dataset_id"] == "intent_zh-v1"
+    assert run["dataset_revision"] == "r1"
+    listed = client.get("/api/runs").json()[0]
+    assert listed["dataset_id"] == "intent_zh-v1", "列表页也要能按数据集分组"
+
+
 def test_unknown_run_is_404_not_500(env):
     client, _, _ = env
     assert client.get("/api/runs/nope").status_code == 404

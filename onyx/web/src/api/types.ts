@@ -203,3 +203,162 @@ export interface ChatResponse {
   anomalies: AnomalyView[]
   parts: TokenPartView[]
 }
+
+/* ── 评测（S13–S15）───────────────────────────────────────────── */
+
+/** 置信区间。后端在落库前已把 CI dataclass 转成 dict，所以这里永远是对象。 */
+/** 一次运行的开销。unloaded_models 是字符串数组，所以这里不用 Record<string, number> 糊过去。 */
+export interface EvalCost {
+  in_tokens?: number
+  out_tokens?: number
+  requests?: number
+  in_tokens_unknown?: number
+  wall_ms?: number
+  unloaded_models?: string[]
+}
+
+export interface CIView {
+  low: number | null
+  high: number | null
+  point: number | null
+  n: number
+  iterations?: number
+  method?: string
+  low_confidence?: boolean
+}
+
+export interface DatasetView {
+  id: string
+  n_cases: number | null
+  upstream: string
+  revision: string
+  license: string
+  loader: string
+  splits: Record<string, number>
+  imported_at: string
+  notes: string
+}
+
+export interface RunView {
+  id: string
+  task_id: string
+  model_id: string
+  status: string
+  started_at: string
+  finished_at: string | null
+  seed: number | null
+  app_version: string
+  git_rev: string
+  params_snapshot: Record<string, unknown>
+  config: Record<string, unknown>
+  n_cases: number
+  n_done: number
+  n_error: number
+  n_skipped: number
+  dataset_id: string | null
+  dataset_revision: string
+  /** 汇总指标。值可能是 null（=未定义），CI 是 CIView */
+  aggregate: Record<string, unknown>
+  cost: EvalCost
+}
+
+export interface GradeView {
+  case_id: string
+  seq: number
+  score: number
+  verdict: string
+  passed: boolean | null
+  invalid_format: boolean
+  out_of_set: boolean
+  /** 每个分数都能点进一条真实 trace；为空表示这条没发出请求（skip） */
+  trace_id: string | null
+  error: string | null
+  metrics: Record<string, unknown>
+}
+
+export interface MatrixCell {
+  run_id: string
+  model_id: string
+  task_id: string
+  metric: string
+  value: number | null
+  ci: CIView | null
+  n: number | null
+  n_judged: number | null
+  n_total: number | null
+  coverage: number | null
+  low_confidence: boolean
+  status: string
+  started_at: string
+  dataset_id: string
+  dataset_revision: string
+  cost: EvalCost
+}
+
+export interface MatrixView {
+  models: string[]
+  tasks: string[]
+  cells: MatrixCell[]
+  provenance: string[]
+  warnings: string[]
+}
+
+export interface PairedCase {
+  case_id: string
+  kind: string
+  score_base: number
+  score_target: number
+  delta: number
+  passed_base: boolean | null
+  passed_target: boolean | null
+  verdict_base: string
+  verdict_target: string
+  trace_base: string | null
+  trace_target: string | null
+  instruction: string
+}
+
+export interface RunBrief {
+  id: string
+  task_id: string
+  model_id: string
+  status: string
+  n_cases: number
+  n_done: number
+  n_error: number
+  seed: number | null
+  started_at: string
+  dataset_id: string | null
+  dataset_revision: string
+  params: Record<string, unknown>
+  k: number | null
+  headline: { metric: string; value: number | null } | null
+  cost: EvalCost
+}
+
+export interface ComparisonView {
+  base: RunBrief
+  target: RunBrief
+  eps: number
+  n_paired: number
+  only_base: string[]
+  only_target: string[]
+  coverage: number | null
+  mean_delta: number | null
+  delta_ci: CIView | null
+  improved: number
+  regressed: number
+  unchanged: number
+  flips: { up: number; down: number; net: number }
+  low_confidence: boolean
+  warnings: string[]
+  cases: PairedCase[]
+}
+
+export interface GpuStatusView {
+  busy: boolean
+  owner: string | null
+  progress: string | null
+  eta_s: number | null
+  holder_host: string | null
+}

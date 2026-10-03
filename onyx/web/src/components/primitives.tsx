@@ -131,10 +131,28 @@ export function SeverityBadge({ severity, children }: { severity: string; childr
   return <span className={`badge badge-${severity}`}>{symbol} {children}</span>
 }
 
+/** 状态 → 符号。导出来是为了能被测到：R4 要求"形状互不相同"，
+ *  而 "?" 在本项目里专指"未实测"，所以任何真实状态都不许落到 "?"。 */
+export const STATUS_BADGE_MAP: Record<string, string> = {
+  ok: 'ok', done: 'ok', error: 'error', timeout: 'warn', cancelled: 'neutral',
+  running: 'info', skipped: 'unknown',
+}
+
+export const STATUS_SYMBOL: Record<string, string> = {
+  ok: '✓', done: '✓', error: '✕', timeout: '⏱', cancelled: '⊘',
+  running: '▶', skipped: '⊝',
+}
+
+export function statusSymbol(status: string): string {
+  return STATUS_SYMBOL[status] ?? '?'
+}
+
 export function StatusBadge({ status }: { status: string }) {
-  const map: Record<string, string> = { ok: 'ok', error: 'error', timeout: 'warn', cancelled: 'neutral' }
-  const symbol = { ok: '✓', error: '✕', timeout: '⏱', cancelled: '⊘' }[status] ?? '?'
-  return <span className={`badge badge-${map[status] ?? 'neutral'}`}>{symbol} {status}</span>
+  return (
+    <span className={`badge badge-${STATUS_BADGE_MAP[status] ?? 'neutral'}`}>
+      {statusSymbol(status)} {status}
+    </span>
+  )
 }
 
 export function AnomalyChip({ anomaly }: { anomaly: AnomalyView }) {

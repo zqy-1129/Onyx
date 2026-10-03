@@ -908,23 +908,96 @@ GPU 被 eval:intent_classification@qwen3.5:9b 占用，进度 60/240，预计还
 
 ---
 
-## S15 — 对比矩阵、回归 diff、Eval UI 与报告（M5）
+## S15 — 对比矩阵、配对回归、Eval UI 与报告导出（M5）✅
 
 **产出文件**
 ```
-onyx/eval/compare.py            # 两 run 配对对比：per-case diff + bootstrap CI + 劣化清单
+onyx/eval/compare.py                     # 配对对比：per-case 折算 + 配对 bootstrap CI + 劣化清单
+onyx/report/eval_report.py               # 模型×任务矩阵 + md/csv/自包含 html 导出（含内联 SVG 雷达）
+onyx/store/migrations/0005_eval_provenance.sql  # eval_run 补 dataset_id/dataset_revision（含历史回填）
+onyx/api/routes/evals.py                 # + /api/matrix、/api/compare
+onyx/cli.py                              # eval compare / eval matrix / eval report
 onyx/web/src/pages/{EvalRuns,EvalMatrix,Regression}.tsx
-onyx/report/eval_report.py      # md/csv/html：模型 × task 矩阵 + 雷达图
-tests/unit/test_compare_paired.py
+tests/unit/{test_compare_paired,test_eval_report,test_api_compare}.py
+onyx/web/src/__tests__/eval.test.ts
 ```
-**配对对比的正确做法**（`test_compare_paired` 覆盖）：同一 `case_id` 两 run 配对；只看均值差是错的，要报"净改善数 / 净劣化数 / 无变化数 + 配对 bootstrap CI"；`n<30` 时 UI 必须显示低样本警告。
+**为什么"比较两个平均值"是错的**（这一步的全部立意）
+
+均值差 0.02 可能是 30 条变好、28 条变坏相互抵消的结果——那不是"略好"，是"在两类任务上方向相反"。
+所以 `Comparison` 的头一行是三个计数（净改善 / 净劣化 / 不变），均值差与区间跟在后面，
+再下面必须是劣化清单，清单里每条都带**两个模型各自的 trace_id**：
+差在哪道题、两边分别怎么想的，只有并排打开那两条 trace 才能判断。
+
+配对 CI 的做法：先在 case 层面算差值，再**重采样 case 后重算均值差**。
+常见错误是"把两个 run 各自的 CI 摆在一起看是否重叠"——两条独立区间的重叠检验远比配对检验保守，
+n 小的时候几乎永远"不显著"，于是真回归被读成噪声。
+
+另外报一对翻转数（McNemar 的两个不和谐格）：分数均值会被部分分抹平，
+而"这道题从会答变成不会答"是离散事件，只有按 pass^k 逐条配对才数得出来。
+
+**`eval_run` 现在记数据集来历**（0005）。这不是元数据装饰：M5 的每个结论都默认
+"两次跑的是同一份考卷"，而原先只能靠 case_id 反推。迁移带历史回填（从 grade→eval_case 取多数），
+并有测试用"升级前的库"验证回填真的执行——回填是迁移最容易糊弄过去的一步。
+
+**矩阵的三条规则**
+1. 每格取该 (模型, 任务) **最新一次 done** 运行，不取历史最好成绩；running/cancelled 不进网格。
+2. 出现多于一份数据集 ⇒ 顶部警告，跨列比较被明说成无意义。
+3. **覆盖率**：主分数只统计到不到一半样本时，格子里直接写"可判定 8/236"并计入警告。
+
+第 3 条来自一次真实误读：`gpt-oss:20b` 的 236 条里有 226 条**没有正文**
+（`max_tokens=32` 全被 reasoning 吃光，P12），于是它的 `macro_f1` 只在剩下 8 条上算出 **1.000**——
+单看矩阵会得出"这个模型更强"，而它的 `format_valid_rate` 只有 3.4%。
+数字是真的，读法是错的；界面必须把分母一起摆出来。
 
 **自测**
 ```bash
-uv run onyx eval compare <runA> <runB> --format md > reports/qwen3-vs-llama.md
-uv run pytest tests/e2e -m e2e -q      # 矩阵页 + case 钻取 + diff 页
+uv run pytest tests/unit/test_compare_paired.py tests/unit/test_eval_report.py tests/unit/test_api_compare.py -q
+uv run onyx eval matrix
+uv run onyx eval compare <runA> <runB>                       # 终端：净变化 + 区间 + 劣化清单
+uv run onyx eval compare <runA> <runB> --format md --out reports/diff.md
+uv run onyx eval report --format html --out reports/matrix.html --compare <runA>:<runB>
+cd onyx/web && npx tsc --noEmit && npx vitest run && npm run build
 ```
-**验收 DoD（M5 出口）**：给定同一数据集的两个模型，能一眼回答"该用哪个、在哪些意图/工具上它更差、差多少置信度多少"；报告导出可脱离看板阅读。
+浏览器实测（`#/eval`、`#/eval/matrix`、`#/eval/regression`，真数据，零 console 错误）：
+运行页点行→grade 面板→点 trace 进 TraceDetail；矩阵点格子→`/eval/run/<id>` 并选中那次运行；
+回归页选任务+两次运行后给出 `qwen3.5:9b → gpt-oss:20b：劣化 226 / 不变 10，均值差 −0.958，
+95% CI [−0.983, −0.932]（n=236）`，逐题表带 base/target 两个 trace 链接。
+
+**真机配对结论（intent_classification，同一份 intent_zh-v1@seed=20261003）**
+
+| | qwen3.5:9b | gpt-oss:20b |
+|---|---|---|
+| 主分数 | `macro_f1 0.991 [0.978–1.000]`（n=236） | `macro_f1 1.000 [1.000–1.000]`（n=8，**可判定 8/236**） |
+| 格式合法率 | 1.000 | 0.034 |
+| 判定分布 | correct 234 / wrong 2 | invalid_format 226 / correct 8 / out_of_label 2 |
+| 成本 | 20,395 in / 521 out · 37.3s | 35,856 in / 7,549 out · 3.9min |
+
+配对（qwen → gpt-oss）：**改善 0 / 劣化 226 / 不变 10**，均值差 **−0.9576**，
+配对 95% CI **[−0.9831, −0.9322]**（n=236 case，覆盖率 100%）。
+劣化清单里 target 侧判定齐一全是 `invalid_format`。下钻进那条 trace 才看到真正的原因：
+`正文为空但产出了推理内容：预算被 thinking 吃光（P12），提高 max_tokens 或确认 thinking=False`
+——`max_tokens=32` 对 gpt-oss 的 reasoning 来说整个预算都被 thinking 用掉了，正文一个字没剩。
+所以结论**不是**"gpt-oss 意图识别差"，而是"这个提示词预算对它不成立"，该改的是
+`max_tokens` / `thinking` 参数，而不是换模型。这个判断只有"分数 → trace"这条路走得通才做得到，
+也正是 §15 那条主张的第一个真实回报点。
+
+**这一步修掉的缺陷**
+| 症状 | 根因 |
+|---|---|
+| `eval_run` 不记数据集来历 | 跨版本的两次运行看起来可比；回填 + 强制在写入时记录 |
+| `RunView` 声明了 `dataset_id` 却没填 | 界面显示「—」，看起来像"数据缺失"而不是"API 漏传" |
+| `StatusBadge('done')` 渲染成 `? done` | 映射表里没有评测的状态；而 "?" 在本项目里专指"未实测" |
+| 矩阵只报 `macro_f1 1.000` 不报分母 | 见上面 8/236 的真实误读 |
+| 报告 CI 用单 run 的 n<100 阈值 | 配对口径是 n<30；同一载荷里两个"低置信"标记互相矛盾 ⇒ 对比自己覆盖 |
+| 差值 0 有被渲染成「—」的风险 | 0 是"没变化"的结论，未知是"没配对上"；`fmtDelta(0)` 必须是 `±0.000` |
+
+**验收 DoD（M5 出口）**
+- "该用哪个"：`eval compare` / 回归页给出净改善、净劣化、配对 CI 与劣化清单（真机一组见上）
+- "在哪些题上更差"：逐题 Δ 表 + 题干（从 `eval_case` 取，不靠 grade.metrics 的私有约定）
+  + 两侧 trace_id 可并排打开
+- "报告可脱离看板阅读"：`eval report --format md|csv|html` 三种产物都带数据集来历、
+  可比性警告与每次运行成本；html 自包含（内联样式，无外部依赖），可直接发给别人
+- 雷达图只在任务数 ≥3 时画；两个任务时明说"两点的形状没有信息量"而不是硬画
 
 **提交**：`feat(eval): paired regression diff, matrix UI, exportable reports`
 
