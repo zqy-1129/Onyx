@@ -241,8 +241,32 @@ export interface DatasetView {
   splits: Record<string, number>
   imported_at: string
   notes: string
-  /** 界面能不能直接选它跑评测。库里登记的导入数据集还没有"读回"载入器，选了也跑不起来 */
+  /** 界面能不能直接选它跑评测：内置写法，或已导入且真有样本的登记。
+   *  只有 dataset 行没有样本的（导入被中断）选了只会跑出一个 n_total=0 的"正常"评测 */
   selectable: boolean
+}
+
+/** 数据集导入：JSONL **文本**而不是路径——请求体里带路径等于让服务器读任意文件 */
+export interface DatasetImportBody {
+  jsonl: string
+  name?: string
+  id?: string | null
+  upstream?: string
+  revision?: string
+  license?: string
+  notes?: string
+  allow_replace?: boolean
+}
+
+export interface ImportView {
+  id: string
+  n_cases: number
+  upstream: string
+  revision: string
+  license: string
+  splits: Record<string, number>
+  replaced: boolean
+  warnings: string[]
 }
 
 /** 评测任务清单：来自后端注册表，不在前端硬编码，否则装了插件的任务界面看不到 */

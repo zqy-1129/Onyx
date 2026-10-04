@@ -1,11 +1,11 @@
 # 项目现状（Onyx · v0.8.0）
 
-核对时间 **2026-10-04**，HEAD = M8 收口（S20–S22 配置/鉴权/发行面）+ M9 第一步（S23 界面发起评测）之后。
+核对时间 **2026-10-04**，HEAD = M8 收口（S20–S22）+ M9 前两步（S23 界面发起评测、S24 数据集闭环）之后。
 本文所有数字都是当场跑出来的（命令附在每节末尾），不是从旧文档抄的；
 `README.md` 的进度表、`docs/IMPLEMENTATION.md` 的分步档案是历史沿革，
 **这里回答的是"现在有什么、能干什么、还欠什么"**。
 
-一句话：**M0–M8 全部达成，M9 已迈出第一步（评测可以在界面发起、可以取消）；
+一句话：**M0–M8 全部达成；M9 已交付两步——评测能在界面发起（含队列/进度/取消），数据能在界面导入并立刻用它跑。
 欠的是 S7 剩下的 `report usage` / `token explain` 两个入口、Tool Bench 网页、M10 的告警出口，
 以及一批"带原因推迟"的项。**
 
@@ -65,6 +65,9 @@ WAL + 批量 sink（队列满丢样本但 `dropped` 计数可见）、
   取消（排队中 / 等锁中 / 跑一半三条路都真能停）、逐条进度快照、启动时回收上次进程留下的 `running` 僵尸行
 - 能力不满足 ⇒ 整任务 skip 且**留下带原因的记录**（禁止隐式降级）
 - 数据集导入：`--source bfcl`、JSONL、`file:<路径>`；来历（upstream/revision/license）参与可比性判定
+- **导入 → 读回 → 跑评测 是通的（S24）**：`load_registered` 把已登记的 id 读回成 Dataset，
+  `load_dataset(..., db=)` 按"内置 → file: → 库里"解析，CLI 与界面同一个顺序；
+  `register_dataset` 是唯一的落库口，覆盖旧 revision / 条数变化会返回警告（CLI 打印、API 一起回给界面）
 
 ### L6 接口
 - **CLI 39 条命令**：顶层 7（`chat` / `serve` / `doctor` / `plugins` / `version` / `calibrate` / `rotate`）
@@ -72,12 +75,13 @@ WAL + 批量 sink（队列满丢样本但 `dropped` 计数可见）、
 - **部署配置 `onyx.toml`**（S20）：provider / GPU 锁 / 保留窗口 / sandbox / serve 绑定收在一处。
   优先级只有一条规则 **flag > 环境 > 文件 > 默认**；`onyx config show` 逐项标出它来自哪一层，
   `onyx doctor` 把"写了不生效"的未知键与坏类型报成红项（模板见 `onyx.example.toml`）
-- **API 24 个操作 / 23 条路径**（23 REST + `GET /api/stream` SSE）。写操作 4 个：
-  Playground chat、admin unload、**发起评测**、**取消评测**（后两个 S21 的 `--read-only` 一样挡 403）
+- **API 25 个操作 / 24 条路径**（24 REST + `GET /api/stream` SSE）。写操作 5 个：
+  Playground chat、admin unload、**发起评测**、**取消评测**、**导入数据集**（S21 的 `--read-only` 全部挡 403）
 - **非回环绑定强制 token**（S21）：`serve --host 0.0.0.0` 没有 token 就拒绝启动；
   `--read-only` 让共享看板不变成共享操作台；错误体统一 `{error:{code,message,detail.hint}}`
-- **Web 9 页**：Fleet / Models / Traces / TraceDetail / Token Ledger / Playground / 评测 / 矩阵 / 回归
-  ——手写 CSS token 与手写 SVG，无组件库无图表库；每页都实测过（零 console 错误）
+- **Web 10 页**：Fleet / Models / Traces / TraceDetail / Token Ledger / Playground / 评测（运行与发起）/ 矩阵 / 回归 / 数据集
+  ——手写 CSS token 与手写 SVG，无组件库无图表库；每页都实测过（零 console 错误）。
+  评测的四个子页从 S24 起有 subnav——之前矩阵与回归**只能手敲 hash** 才到得了
 
 ### 扩展点（DESIGN §13，六个 group 共用一套发现语义）
 | group | 状态 | 现在有什么 |
@@ -104,22 +108,27 @@ WAL + 批量 sink（队列满丢样本但 `dropped` 计数可见）、
 ## 2. 质量门与规模
 
 ```
-uv run pytest            # 1175 passed, 1 skipped（S17–S23 新增：retention 28 / backup 20 / doctor 9 / config 25 / auth 31 / 发行面 15 / 提交服务 25 / 发起评测 API 16）
+uv run pytest            # 1196 passed, 1 skipped（S17–S24 新增：retention 28 / backup 20 / doctor 9 / config 25 / auth 31 / 发行面 15 / 提交服务 25 / 发起评测 API 16 / 数据集 registry 11 + API 10）
 uv run pytest -m live     # 20 passed（真打 qwen3.5:9b，与评测共用机器级 GPU 锁）
 uv run pytest -m probe     # 4 passed（P 系列实验的可重跑版本）
 uv run ruff check .         # All checks passed（`ruff format` 不是门禁）
 uv run lint-imports          # 3 contracts kept（两条网络例外显式登记）
-uv run coverage run -m pytest -q && uv run coverage report   # 89% ≥ 80%（分支覆盖，离线套件；S23 新代码 service 95% / evals 路由 97% / deps 100%）
+uv run coverage run -m pytest -q && uv run coverage report   # 89% ≥ 80%（分支覆盖，离线套件；S23–S24 新代码 service 95% / evals 路由 97% / deps 100%）
 uv run python scripts/check_extension_boundary.py   # 接入实现未触碰受保护内核文件
 uv run onyx doctor            # 9 项体检：配置 / Python / 可写 / 磁盘 / 迁移 / blob / 档位 / 插件 / 引擎
 uv run onyx config show       # 每一项生效值标出来自 flag/环境/文件/默认哪一层（token 只报"已设置"）
 uv build && uv tool install --from dist/*.whl …  # 干净环境装起来：version / db init / chat(mock) / doctor 全通
-前端：tsc --noEmit / vitest 60 / vite build（211KB js）+ 浏览器 take_snapshot
-API：openapi 23 paths / 24 operations（含 `GET /api/stream` SSE）
+前端：tsc --noEmit / vitest 70 / vite build（218KB js）+ 浏览器 take_snapshot
+API：openapi 24 paths / 25 operations（含 `GET /api/stream` SSE）
 CI：.github/workflows/ci.yml 跑上面这些（本机已验证命令本身可跑通；仓库尚无远端 ⇒ 还没真跑过一次）
 ```
 
 真机跑过的证据（可复查，都在 git 里）：
+S24 在浏览器里走完了整条闭环：`#/eval/datasets` 导入 3 条 JSONL（`id=browser-mini-v1`、
+手填 upstream/license）⇒ 自动跳回「运行与发起」，数据集下拉出现它 ⇒ 点开始 ⇒ ✓ done 3/3，
+run 记录里 `dataset_id=browser-mini-v1`、`dataset_revision=sha256:75a32ae5246c2742`、`trigger=api`。
+顺带修掉两处只有真点才会露出来的裂缝：评测四个子页之前没有导航（矩阵/回归只能手敲 hash），
+以及子集下拉一直显示任务默认集的 splits（选别的数据集还能挑一个不存在的子集）。
 意图集 `macro_f1 0.991 [0.978–1.000]`；工具集 `must_call_acc 0.639` 而
 `hallucinated_tool`、误调率均为 0（**掉分全在参数上**）；
 配对回归 `改善 0 / 劣化 226 / 不变 10`，同时暴露 `可判定 8/236` 的分母陷阱；
@@ -178,8 +187,8 @@ S23 在浏览器里真跑过：`--provider mock` 的 serve 上点「开始评测
 
 1. ~~M7 跑得住~~（S17 保留策略 / S18 可验证备份 / S19 体检补齐 + 迁移前自动快照 + 体积曲线，全部达成）。
    ~~M8 配置与发行~~（S20 `onyx.toml` / S21 token 姿态 / S22 版本 + CHANGELOG + CI）。
-   **M9 操作闭环进行中**：S23 界面发起评测已交付；欠 S24 数据集导入进界面、
-   S25 Tool Bench 页、S26 `models pull|rm` 与被中断运行的续跑入口。
+   **M9 操作闭环进行中**：S23 界面发起评测 ✅、S24 数据集导入与读回 ✅；欠 S25 Tool Bench 页、
+   S26 `models pull|rm` 与被中断运行的续跑入口。
 2. **`-m e2e` 用例**：把已经手工验证过的六页路径固化成回归（SSE 联通、矩阵分母显示、劣化清单下钻）。
    S23 之后这条更值钱：发起评测的浏览器路径现在是核心流程，只靠手工点。
 3. **Tool Bench 页**：后端齐了（`tools ls/audit/cost/contract/fire` 的数据都在库里），缺的是把它摆上看板。

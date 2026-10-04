@@ -68,11 +68,13 @@ function qs(params: Record<string, string | number | boolean | null | undefined>
 import type {
   ChatResponse,
   ComparisonView,
+  DatasetImportBody,
   DatasetView,
   FleetView,
   GradeView,
   GpuStatusView,
   HealthView,
+  ImportView,
   MatrixView,
   ModelView,
   ProgressView,
@@ -127,6 +129,9 @@ export const api = {
   /** GPU 锁状态是**只读**的：看板轮询它不能把锁抢了 */
   gpu: () => request<GpuStatusView>('/api/gpu'),
   evalDatasets: () => request<DatasetView[]>('/api/datasets'),
+  /** 导入 JSONL 数据集（文本而不是路径）。覆盖已有 id 需要 allow_replace=true */
+  importDataset: (body: DatasetImportBody) =>
+    request<ImportView>('/api/datasets', { method: 'POST', body: JSON.stringify(body) }),
   /** 任务清单现读后端注册表：前端不硬编码任务名，否则插件任务在界面上是隐形的 */
   evalTasks: () => request<TaskView[]>('/api/tasks'),
   /** 发起评测：只入队，立刻返回 run_id。跑评测的是服务里的 worker 线程，不是这个请求 */

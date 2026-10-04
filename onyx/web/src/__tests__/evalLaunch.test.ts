@@ -5,7 +5,9 @@
  * 渲染快照不测——与评测页其余部分同一个理由。
  */
 import { describe, expect, it } from 'vitest'
-import { buildBody, isLive, progressRatio, toNumber, waitNote, type Form } from '../pages/EvalLaunch'
+import {
+  buildBody, isLive, keepSplit, progressRatio, splitChoices, toNumber, waitNote, type Form,
+} from '../pages/EvalLaunch'
 import type { ProgressView } from '../api/types'
 
 function form(over: Partial<Form> = {}): Form {
@@ -82,8 +84,7 @@ describe('isLive', () => {
   })
 })
 
-describe('waitNote', () => {
-  it('排队要说前面还有几个', () => {
+describe('waitNote', () => {  it('排队要说前面还有几个', () => {
     expect(waitNote(progress({ state: 'queued', position: 3 }))).toContain('前面还有 3 个')
     expect(waitNote(progress({ state: 'queued', position: 0 }))).toBe('排队中')
   })
@@ -100,5 +101,27 @@ describe('waitNote', () => {
   it('正常在跑时不编造一句等待', () => {
     expect(waitNote(progress({ state: 'running', holder: '' }))).toBe('')
     expect(waitNote(null)).toBe('')
+  })
+})
+
+describe('splitChoices / keepSplit', () => {
+  const taskSource = { splits: { default: 236, hard: 32, 转账: 73 } }
+  const miniSource = { splits: { default: 3, hard: 1 } }
+
+  it('default 永远不重复出现在选项里', () => {
+    expect(splitChoices(taskSource)).toEqual(['hard', '转账'])
+    expect(splitChoices(null)).toEqual([])
+  })
+
+  it('换了数据集后不存在的子集要回到 default', () => {
+    // 选了 3 条的小集合却还能选"转账（73）"，跑起来只会得到一条"没有这个子集"的 error
+    expect(keepSplit('转账', miniSource)).toBe('')
+    expect(keepSplit('hard', miniSource)).toBe('hard')
+    expect(keepSplit('', taskSource)).toBe('')
+    expect(keepSplit('hard', null)).toBe('')
+  })
+
+  it('选项跟着实际要用的那份数据走', () => {
+    expect(splitChoices(miniSource)).toEqual(['hard'])
   })
 })

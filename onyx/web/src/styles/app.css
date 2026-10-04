@@ -297,3 +297,14 @@ textarea.input { font-family: var(--font-ui); resize: vertical; line-height: 1.5
   background: var(--bg-inset); border: 1px solid var(--border);
 }
 .meter-fill { height: 100%; background: var(--info); transition: width var(--dur-fast) linear; }
+
+/* 评测子页导航：/eval 有四个页，之前只能手敲 hash 才能到矩阵与回归 */
+.subnav { display: flex; flex-wrap: wrap; gap: var(--space-1); margin-bottom: var(--space-2); }
+.subnav-item {
+  background: none; border: 1px solid var(--border); border-radius: var(--radius-chip);
+  padding: 3px 10px; color: var(--text-secondary); font: inherit; font-size: var(--fs-xs);
+  cursor: pointer;
+}
+.subnav-item:hover { color: var(--text-primary); border-color: var(--border-strong); }
+.subnav-item.active { color: var(--text-primary); border-color: var(--accent); background: var(--accent-dim); }
+.subnav-note { color: var(--text-muted); font-size: var(--fs-xs); align-self: center; margin-left: var(--space-2); }

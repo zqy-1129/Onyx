@@ -6,6 +6,7 @@ import { StatusDot } from './components/primitives'
 import { UNKNOWN } from './format'
 import { useApi } from './hooks/useApi'
 import { navigate, useRoute } from './router'
+import { DatasetsPage } from './pages/Datasets'
 import { EvalMatrixPage } from './pages/EvalMatrix'
 import { EvalRunsPage } from './pages/EvalRuns'
 import { FleetPage } from './pages/Fleet'
@@ -29,6 +30,14 @@ const NAV: NavItem[] = [
   { path: '/traces', glyph: '≡', label: 'Traces' },
   { path: '/usage', glyph: '∿', label: 'Token Ledger' },
   { path: '/eval', glyph: '◎', label: '评测' },
+]
+
+/** 评测子页。之前矩阵与回归只能手敲 hash 才到得了——四个页共用一条导航才说得过去 */
+const EVAL_TABS: Array<{ path: string; label: string; note?: string }> = [
+  { path: '/eval', label: '运行与发起' },
+  { path: '/eval/matrix', label: '矩阵' },
+  { path: '/eval/regression', label: '回归对比' },
+  { path: '/eval/datasets', label: '数据集' },
 ]
 
 function useTheme(): [string, () => void] {
@@ -67,6 +76,8 @@ export function App() {
     content = <EvalMatrixPage />
   } else if (page === 'eval' && segments[1] === 'regression') {
     content = <RegressionPage />
+  } else if (page === 'eval' && segments[1] === 'datasets') {
+    content = <DatasetsPage />
   } else if (page === 'eval') {
     // /eval/run/<id> 直接落到运行页并选中它：矩阵与 diff 都靠这个链接下钻
     content = (
@@ -77,6 +88,12 @@ export function App() {
   } else {
     content = <FleetPage />
   }
+
+  const evalTab = page === 'eval'
+    ? (segments[1] === 'matrix' || segments[1] === 'regression' || segments[1] === 'datasets'
+        ? `/eval/${segments[1]}`
+        : '/eval')
+    : ''
 
   return (
     <div className="shell">
@@ -114,7 +131,25 @@ export function App() {
             {theme === 'dark' ? '☾' : '☀'}
           </button>
         </header>
-        <main className="content">{content}</main>
+        <main className="content">
+          {evalTab ? (
+            <nav className="subnav">
+              {EVAL_TABS.map((tab) => (
+                <button
+                  key={tab.path}
+                  className={`subnav-item${evalTab === tab.path ? ' active' : ''}`}
+                  onClick={() => navigate(tab.path)}
+                >
+                  {tab.label}
+                </button>
+              ))}
+              <span className="subnav-note">
+                发起评测与导入数据集都在这里；被中断的运行不进矩阵，半截分数没有可比性
+              </span>
+            </nav>
+          ) : null}
+          {content}
+        </main>
       </div>
     </div>
   )

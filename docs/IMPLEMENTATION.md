@@ -1740,6 +1740,81 @@ deps 100%），`ruff check .` 与 `lint-imports`（3 条契约）全绿，前端
 
 ---
 
+## S24 — 数据集闭环：读回已登记的数据集 + 界面导入 ✅
+
+**产出文件**
+```
+onyx/eval/datasets/loader.py          # parse_jsonl / load_registered / register_dataset（load_jsonl 改为薄壳）
+onyx/eval/tasks/__init__.py           # load_dataset(..., db=)：内置 → file: → 库里
+onyx/eval/service.py                  # 数据集校验放开到"已导入且有样本"，与界面一致
+onyx/cli.py                           # eval run 带 db 解析；eval import 的落库交给 register_dataset 并打印警告
+onyx/api/routes/evals.py              # POST /api/datasets（收文本不收路径）+ selectable 口径统一
+onyx/web/src/pages/Datasets.tsx       # 数据集列表 + 导入表单（本地文件由浏览器读成文本）
+onyx/web/src/App.tsx                  # 评测四个子页的 subnav（矩阵与回归以前只能手敲 hash）
+onyx/web/src/pages/EvalLaunch.tsx     # 子集选项跟着实际选中的数据走 + 换数据集后重置
+onyx/web/src/{api/client,api/types,styles/app}
+tests/unit/test_dataset_registry.py（11）
+tests/unit/test_api_datasets.py（10）
+onyx/web/src/__tests__/datasets.test.ts（7）
+```
+
+**这一步真正的动机是一个断掉的闭环**：`onyx eval import --id x` 把样本写进了库，
+但解析器只认内置别名与 `file:<路径>`，于是紧接着 `onyx eval run --dataset x` 报"未知数据集"——
+数据在库里，路不通。补 `load_registered` 并把 `load_dataset` 改成接受 `db`，
+CLI 与界面共用同一个解析顺序（内置 → `file:` → 库里登记）。
+
+**解析器只有一份**：`load_jsonl`（文件）与 `parse_jsonl`（文本）现在共用同一套行校验，
+两个入口对"第 37 行坏了"必须给同一个行号；差异只在**来历默认值**——
+文件按字节 hash、上传按内容 hash，两者都保证"同一份内容两次导入得到同一个 revision"，
+而"没填 revision"绝不允许变成空串（空 revision 等于放弃可比性判据）。
+
+**落库只有一份**：`register_dataset` 返回警告——覆盖同一个 id 且 revision 或条数变了时，
+必须说"指向它的历史分数与之后的分数不可比"。CLI 打印它，`POST /api/datasets` 把它一起回给界面。
+覆盖本身是允许的（upsert），**不允许的是悄悄覆盖**。
+另外界面 409 之后要人自己勾「允许覆盖同名 id」，前端不替人勾。
+
+**两条刻意的限制**
+- `POST /api/datasets` 收 **JSONL 文本**而不是路径：请求体里带路径就是"服务器任意读文件"，
+  而这个看板是可以带 token 共享的（S21）。本地文件由浏览器 `file.text()` 读成文本再发。
+- 超过 4MB 直接 413：解析要占请求线程，不设上限等于"任何人一个 POST 就能把看板钉住"。
+
+**只有 dataset 行、没有样本的登记**：`selectable=false`（列表里标黄），
+提交服务里同样拒绝（422）。否则跑出来是 `status=done / n_total=0` 这种
+"看起来完全正常"的空评测——它正是本项目反复强调的那类失败（0 与未知不能互冒充）。
+
+**顺带修掉两处界面裂缝**（都是真机点出来的）
+- 评测的四个子页之前**没有导航**：矩阵与回归只能手敲 `#/eval/matrix`。加了 `.subnav`。
+- 发起面板的"子集"下拉一直显示**任务默认数据集**的 splits，选了别的数据集还能挑一个
+  不存在于该数据集的子集，跑起来只会是一条"没有这个子集"的 error。现在选项跟着
+  实际要用的那份数据走，切换后原选择若已不存在就重置为 default。
+
+**本机验证**
+```bash
+uv run pytest      # 1196 passed, 1 skipped（S24 新增 21 条：registry 11 + API 10）
+uv run coverage run -m pytest -q && uv run coverage report   # 89%
+uv run ruff check . · uv run lint-imports（3 kept）
+前端：tsc --noEmit · vitest 70 · vite build（218KB js）
+API：openapi 24 paths / 25 operations
+浏览器（#/eval/datasets）：
+  导入 3 条 JSONL（id=browser-mini-v1, upstream/license 手填）⇒ 回到「运行与发起」，
+  数据集下拉出现 browser-mini-v1（3 条）；点开始 ⇒ ✓ done 3/3，
+  run 记录里 dataset_id=browser-mini-v1 · dataset_revision=sha256:75a32ae5246c2742 · trigger=api
+  子集联动：任务默认 → default/template/转账/投诉/其他/hard/查余额；
+  切到 browser-mini-v1 → 只剩 default/hard（1），原先选的"转账"被重置
+```
+
+**没做以及为什么**：不删数据集（`DELETE /api/datasets/{id}`）——grade 有外键指向 eval_case，
+真删会撕断分数历史，而"归档/隐藏"需要先定义历史 run 的显示语义；导入大文件走分批判次，
+不做流式解析（4MB 上限 + 行号报错已经把最常见的场景覆盖，剩下的交给 CLI）。
+
+**验收 DoD**：不发一句命令能完成"导入数据 → 选它跑评测 → 看到带来历的分数"。
+
+**提交**：
+`feat(eval): 数据集闭环 —— 读回已登记的数据集 + POST /api/datasets（S24 上半）`
+`feat(web): 数据集页与评测子页导航 —— 导入即可跑（S24 下半）`
+
+---
+
 ## 附录 A — 每步自测速查
 
 | 步 | 命令 | 绿的条件 |
@@ -1767,6 +1842,7 @@ deps 100%），`ruff check .` 与 `lint-imports`（3 条契约）全绿，前端
 | S21 | `ONYX_SERVE_TOKEN=… onyx serve --host 0.0.0.0 --read-only` | 无 token 时非回环绑定拒绝启动；401/403 都带可行动的 hint；浏览器带 token 全量渲染 |
 | S22 | `uv build && uv tool install --from dist/*.whl onyx`（隔离目录） | 干净环境装起来后 version / db init / chat / doctor 全通；CI 步数被测试钉住 |
 | S23 | 浏览器点「开始评测」＋另起进程占住 GPU 锁 | 提交立刻返回 run_id；进度逐条推进；等锁时看得见持有者与 ETA；取消后库里没有那条 run |
+| S24 | 浏览器导入 JSONL → 立刻用它发起评测 | run 记录里 `dataset_id`/`dataset_revision` 跟着结果走；覆盖旧 id 要显式确认；坏行报行号 |
 | 门禁 | `make coverage`（`coverage run -m pytest -q`） | 离线套件分支覆盖率 ≥ 80%（S17 落地时 88%，S21 后 89%，S23 后仍 89%） |
 
 ## 附录 B — 架构自测（让"模块化"可验证，而非口号）

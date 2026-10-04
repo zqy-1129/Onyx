@@ -92,6 +92,21 @@ export function waitNote(p: ProgressView | null): string {
   return ''
 }
 
+/** 子集列表跟着**实际要用的那份数据**走。任务默认集的 splits 与导入集的 splits 通常不同，
+ *  选了 A 集却把 B 集的子集留在下拉里，跑起来只会得到一条"没有这个子集"的 error。 */
+export function splitChoices(source: { splits: Record<string, number> } | null): string[] {
+  return Object.keys(source?.splits ?? {}).filter((name) => name !== 'default')
+}
+
+/** 换了数据集之后，原来选中的子集还在不在；不在就回到 default（空串） */
+export function keepSplit(
+  split: string,
+  source: { splits: Record<string, number> } | null,
+): string {
+  if (split === '') return ''
+  return source && split in source.splits ? split : ''
+}
+
 export function EvalLaunchPanel({
   onRefresh,
   onFinished,
@@ -196,7 +211,11 @@ export function EvalLaunchPanel({
   const state = progress?.state ?? submitted?.state ?? ''
   const live = isLive(state)
   const datasetRows = (datasets.data ?? []).filter((d) => d.selectable)
-  const splits = pickedTask ? Object.keys(pickedTask.splits) : []
+  const chosenDataset = form.dataset
+    ? datasetRows.find((item) => item.id === form.dataset) ?? null
+    : null
+  const splitSource = chosenDataset ?? pickedTask
+  const splits = splitChoices(splitSource)
 
   return (
     <Panel
@@ -241,7 +260,14 @@ export function EvalLaunchPanel({
         </label>
         <label className="field">
           <span className="field-label">数据集</span>
-          <select className="select" value={form.dataset} onChange={(e) => setForm({ ...form, dataset: e.target.value })}>
+          <select
+            className="select" value={form.dataset}
+            onChange={(e) => {
+              const id = e.target.value
+              const next = id ? datasetRows.find((item) => item.id === id) ?? null : pickedTask
+              setForm({ ...form, dataset: id, split: keepSplit(form.split, next) })
+            }}
+          >
             <option value="">
               任务默认{pickedTask ? `（${pickedTask.default_dataset}，${fmtInt(pickedTask.n_cases)} 条）` : ''}
             </option>
@@ -256,9 +282,9 @@ export function EvalLaunchPanel({
           <span className="field-label">子集</span>
           <select className="select" value={form.split} onChange={(e) => setForm({ ...form, split: e.target.value })}>
             <option value="">default</option>
-            {splits.filter((s) => s !== 'default').map((s) => (
-              <option key={s} value={s}>
-                {s}（{fmtInt(pickedTask?.splits[s] ?? null)}）
+            {splits.map((name) => (
+              <option key={name} value={name}>
+                {name}（{fmtInt(splitSource?.splits[name] ?? null)}）
               </option>
             ))}
           </select>

@@ -23,6 +23,22 @@ M9（操作闭环）进行中。这一版的主线是"不发一句命令就能�
 
 ### Added
 
+- **在界面导入数据集**。`POST /api/datasets` 收 JSONL **文本**而不是路径（请求体里带路径
+  就是"服务器任意读文件"，而这个看板是可以带 token 共享的），本地文件由浏览器读成文本再发。
+  来历 `upstream / revision / license` 一起落库；没填 revision 时按**内容 hash** 补——
+  "没填"绝不能变成空串，空 revision 等于放弃"这两次跑的是不是同一份数据"的判据。
+- **补上一条断掉的闭环**：`onyx eval import --id x` 把样本写进了库，但解析器只认内置别名与
+  `file:<路径>`，于是紧接着 `onyx eval run --dataset x` 报"未知数据集"。现在
+  `load_dataset(..., db=)` 按"内置 → file: → 库里登记"解析，CLI 与界面同一个顺序。
+- **覆盖同名 id 必须显式确认**（409 → 人自己勾选 `允许覆盖同名 id`）。历史 grade 指向这个 id，
+  悄悄换内容会让"这两次分数能不能比"从"能"变成"不知道"；替换成功后服务端返回警告
+  （revision 变了 / 条数变了），CLI 打印它，界面显示它。
+- 解析与落库各只有一份（`parse_jsonl` / `register_dataset`）：两个入口对"第 37 行坏了"
+  必须给同一个行号，对"覆盖了旧 revision"必须说同一句警告。
+- 只有 dataset 行、没有样本的登记：列表里标"不可选"，发起评测时 422 拒绝。
+  否则跑出来是 `status=done / n_total=0` 这种看起来完全正常的空评测。
+- 评测四个子页（运行与发起 / 矩阵 / 回归对比 / 数据集）之间终于有导航了：
+  之前矩阵与回归**只能手敲 hash** 才到得了。
 - **在界面发起评测**。`POST /api/runs` 只入队并**立刻**返回 run_id：一次 236 条的评测要占住
   GPU 几十分钟，让 HTTP 请求等结果，超时会让调用方以为失败了而 GPU 还在跑。跑评测的是服务里
   一个 worker 线程，用的仍是 `onyx eval run` 那套 `load_dataset` / `build_task` / `EvalRunner`
@@ -53,8 +69,11 @@ M9（操作闭环）进行中。这一版的主线是"不发一句命令就能�
 
 ### 已知边界（本节随 M9 更新）
 
-- 数据集导入、Tool Bench、`onyx models pull/rm` 仍然只有 CLI（计划里是 S24–S26）。
+- Tool Bench（工具注册表 / 审计 / 开销 / 契约矩阵 / fire 结果）与 `onyx models pull/rm` 仍只有 CLI
+  （计划里是 S25–S26）。
 - 被中断的 run 现在状态正确，但**续跑入口还在命令行**（`onyx eval run --resume <id>`）。
+- 数据集导入有 4MB 上限且不流式：更大批次的导入走 CLI。删除数据集没有做——grade 有外键指向样本，
+  真删会撕断分数历史，而"归档"需要先定义历史 run 在界面上的显示语义。
 
 ---
 
@@ -135,8 +154,8 @@ M7（跑得住）与 M8（配置与鉴权姿态）。这一版的主线不是加
 
 - 单实例观测：一个 `serve` 进程绑一个 provider；多引擎要起多份服务。
 - `hf_tokenizer` / `gguf_vocab` 两档计量未实现（只有插拔位与采信优先级）。
-- 评测与工具子系统仍靠 CLI 驱动，界面只能读 + Playground（S23 起"发起评测"这一半已经进界面，
-  数据集导入与 Tool Bench 仍在这条边界里）。
+- 评测与工具子系统仍靠 CLI 驱动，界面只能读 + Playground（S23 起"发起评测"、S24 起"导入数据集"
+  已经进界面，Tool Bench 与 `models pull/rm` 仍在这条边界里）。
 - `-m e2e` 用例数为 0：浏览器验证目前是手工 `take_snapshot`。
 - 未发行：没有 LICENSE（默认保留所有权利）、没有 Docker、没有 pipx 发布流程。
 
