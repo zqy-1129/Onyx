@@ -38,7 +38,7 @@ uv run onyx db init         # 初始化 .data/onyx.sqlite
 | M3 工具 | ✅ | 注册表（内容 hash 版本化 + 契约审计 + 上下文开销核算）· 执行层（python_fn / mock_replay / http 三种执行器 + 沙箱 + 契约矩阵）· 客户端工具循环（预算 / 熔断 / 孤儿补齐）· fire-and-verify 六种判定，真机 qwen3.5:9b 端到端 PASS |
 | M4 评测 | ✅ | 评测内核（task/grade/runner + 指标层 + bootstrap CI）· 6 个评分器 + 类型感知参数比对 · 236 条中文意图集 + 97 条工具调用集 · `intent_classification` 与 `tool_selection` 各一次真机运行 · BFCL 导入器 · GPU 独占锁（跨进程 + 心跳 + ETA），eval/Playground/live 测试互相排队 |
 | M5 对比 | ✅ | 模型 × 任务矩阵 + 配对回归 diff（净改善/净劣化 + 配对 bootstrap CI + 劣化清单）· Eval / 矩阵 / 回归三页已在真实浏览器实测 · md/csv/自包含 html 报告导出 · 每次运行带数据集来历 |
-| M6 扩展 | ⬜ | 插件 entry points、第二 provider、MCP 执行器 |
+| M6 扩展 | ✅ | 六个扩展点接 entry points（一处实现语义：坏插件隔离 + 失败可见 + 同名覆盖可查）· 两个真外部插件样板（任务 / provider）· 第二 provider：OpenAI 兼容通道（vLLM / LM Studio / Ollama `/v1`）· MCP 执行器（stdio + JSON-RPC，纯 stdlib）· OTLP 导出 sink · provider/sink/插件三套契约测试 · `scripts/check_extension_boundary.py` 把"接实现不改内核"变成构建门禁 |
 
 **M3 执行层的核心保证**（`onyx tools contract`，离线、零真实网络）：
 8 条契约断言在 3 个执行器上全部适用并通过（各列的 n/a 都写明原因）；
@@ -92,11 +92,27 @@ tool 消息**——少一条，之后每次请求的上下文都永久错位，�
 矩阵因此必须把分母一起摆出来（`可判定 8/236` + 顶部警告）：数字是真的，读法是错的。
 下钻 trace 才给出正确结论——该改的是 `max_tokens`/`thinking` 参数，不是换模型。
 
+**M6 扩展点的一条纪律**：**"可替换"不是文档里写着可替换，而是有一个外部实现真的跑通，
+并且有脚本判定"接它有没有改内核"。**
+内置实现与内核一起过拟合是察觉不到的——照协议写的外部实现才会把泄漏顶出来。
+这一条在 M6 一次挖出四处：`LlmProvider` 协议漏了 gateway 必传的 `trace_id`
+（外部实现必崩 TypeError）、`StreamingProvider` 描述了一个不存在的机制、
+`ToolKind` 是 closed enum 所以外部执行器种类无法被表示、
+`--provider mock|echo` 跑出来的 trace 在库里自称 `ollama-local`。
+`scripts/check_extension_boundary.py` 因此是**第四道质量门**，而且豁免的只有注册表本身：
+需要改内核的口径修正必须先单独落地（M6 里真的先落了采信阶梯与三态推断），
+再接实现——反过来自家门禁会被"顺手绕过"一次，它就不再是门禁。
+
+顺带立了另一条：**隔离机制会掩盖故障**，所以坏插件不再只是"跳过"——
+它进台账，`onyx plugins` / `onyx eval tasks` 会打印出来并以退出码 1 结束，
+`onyx doctor` 也多了一项体检。只隔离不报告，等于把"插件没生效"伪装成"插件正常工作"。
+
 **M1 已在真机达成**：`onyx chat` 一次对话即落库完整 trace —— 引擎计数（in=19/out=47，
 source=engine，confidence=high）、分段归因（`msg:0=8 + template_ctl=11 == 19`，
 残差与标定截距 10.9958 互相验证）、prefill 冷/热判定、decode TPS、GPU 快照、原始 body 可 replay。
 
-实测结论见 [`docs/PROBES.md`](docs/PROBES.md)（P1–P21，每条带证据与引擎版本）。
+实测结论见 [`docs/PROBES.md`](docs/PROBES.md)（P1–P24，每条带证据与引擎版本）。
+评测怎么跑才不出错觉：[`docs/eval-recipes.md`](docs/eval-recipes.md)。
 
 下一步（S9 收尾）：Playground 页（多模型并排、thinking 分栏、工具面板、SSE 实时增量）与 Token Ledger 页。
 

@@ -1003,7 +1003,7 @@ cd onyx/web && npx tsc --noEmit && npx vitest run && npm run build
 
 ---
 
-## S16 — 扩展点固化 + 第二 Provider + MCP（M6）
+## S16 — 扩展点固化 + 第二 Provider + MCP（M6）✅
 
 **产出文件**
 ```
