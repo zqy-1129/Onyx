@@ -113,6 +113,7 @@ source=engine，confidence=high）、分段归因（`msg:0=8 + template_ctl=11 =
 
 实测结论见 [`docs/PROBES.md`](docs/PROBES.md)（P1–P24，每条带证据与引擎版本）。
 评测怎么跑才不出错觉：[`docs/eval-recipes.md`](docs/eval-recipes.md)。
+**现在到底有什么、还欠什么**：[`docs/STATUS.md`](docs/STATUS.md)（数字当场核对，含核对命令）。
 
 下一步（S9 收尾）：Playground 页（多模型并排、thinking 分栏、工具面板、SSE 实时增量）与 Token Ledger 页。
 
