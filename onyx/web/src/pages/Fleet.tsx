@@ -108,10 +108,12 @@ export function FleetPage() {
         <div className="col-8">
           <Panel
             title="已载入模型"
-            note={`${data.loaded_models.length} / ${data.installed_models} 已安装`}
+            note={data.loaded_known
+              ? `${data.loaded_models.length} / ${data.installed_models} 已安装`
+              : '驻留状态未知（该通道不报告）'}
             flush
           >
-            {data.loaded_models.length ? (
+            {data.loaded_known && data.loaded_models.length ? (
               <DataTable
                 columns={loadedColumns}
                 rows={data.loaded_models}
@@ -120,8 +122,11 @@ export function FleetPage() {
               />
             ) : (
               <EmptyState
-                title="当前没有载入任何模型"
-                hint="发一次请求即会载入；或在 Playground 里选一个模型"
+                title={data.loaded_known ? '当前没有载入任何模型' : '这个通道不报告驻留状态'}
+                hint={data.loaded_known
+                  ? '发一次请求即会载入；或在 Playground 里选一个模型'
+                  : 'OpenAI 兼容层（vLLM / LM Studio 等）没有"哪些模型在显存里"的统一端点；'
+                    + '驻留策略由服务器自己决定，Onyx 不猜'}
               />
             )}
           </Panel>

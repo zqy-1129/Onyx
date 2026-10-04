@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest'
 import { render, screen } from '@testing-library/react'
 import {
   fmtBytes,
+  fmtGb,
   fmtCompact,
   fmtInt,
   fmtMs,
@@ -11,6 +12,7 @@ import {
   fmtSeconds,
   shortId,
   shortRef,
+  residencyOf,
   timeAgo,
   UNKNOWN,
 } from '../format'
@@ -128,5 +130,31 @@ describe('CapSymbol：✗ 与 ? 必须可区分', () => {
   it('tooltip 说明未实测 ≠ 不支持', () => {
     const { container } = render(<CapSymbol state="unknown" cap="structured_output" />)
     expect(container.querySelector('.cap-unknown')?.getAttribute('title')).toContain('未实测')
+  })
+})
+describe('驻留状态三态（R2 的又一个断面）', () => {
+  it('未知(null) 与 未载入(false) 必须长得不一样', () => {
+    const unknown = residencyOf(null)
+    const idle = residencyOf(false)
+    expect(unknown.marker).toBe('unknown')
+    expect(idle.marker).toBe('idle')
+    // 这条不是样式测试：把"问不出来"显示成"没载入"，人会去查一个不存在的问题
+    expect(unknown.text).not.toBe(idle.text)
+    expect(unknown.title).toContain('不报告')
+    expect(idle.title).toBe('未载入')
+  })
+
+  it('已载入用实心点，未知用「—」而不是 0 或空格', () => {
+    expect(residencyOf(true).marker).toBe('loaded')
+    expect(residencyOf(null).text).toBe(UNKNOWN)
+  })
+})
+describe('体积（GB）', () => {
+  it('不上报体积的通道显示「—」而不是 0.00GB', () => {
+    expect(fmtGb(null)).toBe(UNKNOWN)
+    expect(fmtGb(undefined)).toBe(UNKNOWN)
+    // 0.00GB 会被读成"这个模型不占磁盘"，而真相是我们没问出来
+    expect(fmtGb(0)).toBe('0.00GB')
+    expect(fmtGb(4.567)).toBe('4.57GB')
   })
 })

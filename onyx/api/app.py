@@ -46,6 +46,7 @@ def create_app(
     runtime: Runtime | None = None,
     *,
     base_url: str = "http://127.0.0.1:11434",
+    provider_kind: str = "ollama",
     provider_id: str = "ollama-local",
     db_path: Path | str | None = None,
     sample_gpu: bool = True,
@@ -55,8 +56,8 @@ def create_app(
 ) -> FastAPI:
     owns_runtime = runtime is None
     resolved = runtime or build_runtime(
-        base_url=base_url, provider_id=provider_id, db_path=db_path,
-        sample_gpu=sample_gpu, event_log=False, event_sinks=event_sinks,
+        base_url=base_url, provider_kind=provider_kind, provider_id=provider_id,
+        db_path=db_path, sample_gpu=sample_gpu, event_log=False, event_sinks=event_sinks,
     )
 
     @asynccontextmanager

@@ -4,7 +4,7 @@ import { api } from '../api/client'
 import type { CapReportDto, ModelView } from '../api/types'
 import { DataTable, type Column } from '../components/DataTable'
 import { CapSymbol, ErrorState, Panel, Skeleton } from '../components/primitives'
-import { fmtFloat, fmtInt, fmtPct, UNKNOWN } from '../format'
+import { fmtFloat, fmtGb, fmtInt, fmtPct, residencyOf, UNKNOWN } from '../format'
 import { useApi } from '../hooks/useApi'
 
 const CAP_COLUMNS: Array<{ key: string; cap: string; label: string }> = [
@@ -31,15 +31,33 @@ const columns: Array<Column<ModelView>> = [
     header: '模型',
     mono: true,
     sortValue: (r) => r.name,
-    render: (r) => (
-      <span>
-        {r.loaded ? <span className="status-dot status-ok" title="已载入" /> : null} {r.name}
-      </span>
-    ),
+    render: (r) => {
+      const res = residencyOf(r.loaded)
+      return (
+        <span>
+          {/* 三态必须可区分：已载入 / 未载入 / 该通道不报告（未知）。
+              把"未知"画成"未载入"会引着人去查一个不存在的问题（R2） */}
+          {res.marker === 'loaded' ? (
+            <span className="status-dot status-ok" title={res.title} />
+          ) : (
+            <span className="muted" title={res.title}>{res.text}</span>
+          )}{' '}
+          {r.name}
+        </span>
+      )
+    },
   },
   { key: 'params', header: '参数', align: 'right', render: (r) => r.parameter_size || UNKNOWN, sortValue: (r) => r.parameter_size },
   { key: 'quant', header: '量化', render: (r) => r.quantization || UNKNOWN },
-  { key: 'size', header: '磁盘', align: 'right', mono: true, render: (r) => `${fmtFloat(r.size_gb, 2)}GB`, sortValue: (r) => r.size_gb },
+  {
+    key: 'size',
+    header: '磁盘',
+    align: 'right',
+    mono: true,
+    // 兼容通道不报体积 ⇒ 「—」，不是 0.00GB（0 会被当成一个测量值）
+    render: (r) => fmtGb(r.size_gb),
+    sortValue: (r) => r.size_gb ?? -1,
+  },
   ...CAP_COLUMNS.map((entry): Column<ModelView> => ({
     key: entry.key,
     header: entry.label,

@@ -407,20 +407,31 @@ def models_ls(
     from rich.console import Console
     from rich.table import Table
 
+    from onyx.core.types import Cap
+
     runtime = _runtime(url, db)
     try:
-        loaded = {m.name: m for m in runtime.provider.running()}
+        # 通道不报告驻留时（OpenAI 兼容层没有统一的"哪些模型在显存里"端点），
+        # 状态必须显示「未知」而不是「未载入」——后者是一个我们没问出来的断言
+        residency = Cap.ADMIN in runtime.provider.capabilities()
+        loaded = {m.name: m for m in runtime.provider.running()} if residency else {}
         table = Table(title="模型", pad_edge=False)
         for column in ("模型", "参数", "量化", "磁盘", "能力", "状态", "显存", "ctx(载入/训练)"):
             table.add_column(column)
         for card in runtime.provider.list_models():
             live = loaded.get(card.name)
+            if not residency:
+                status, vram, ctx_loaded = "[dim]未知[/]", "—", "—"
+            elif live:
+                status = f"[green]已载入[/] 剩 {_remaining(live.expires_at)}"
+                vram = f"{live.size_vram / 1e9:.2f}GB"
+                ctx_loaded = str(live.context_length or "—")
+            else:
+                status, vram, ctx_loaded = "[dim]未载入[/]", "—", "—"
             table.add_row(
                 card.name, card.parameter_size or "—", card.quantization or "—",
                 f"{card.size_gb}GB", ",".join(card.capabilities) or "—",
-                f"[green]已载入[/] 剩 {_remaining(live.expires_at)}" if live else "[dim]未载入[/]",
-                f"{live.size_vram / 1e9:.2f}GB" if live else "—",
-                f"{live.context_length if live else '—'} / {card.context_length or '—'}",
+                status, vram, f"{ctx_loaded} / {card.context_length or '—'}",
             )
         Console().print(table)
     finally:
@@ -858,7 +869,10 @@ def calibrate(
 def serve(
     host: str = typer.Option("127.0.0.1", "--host"),
     port: int = typer.Option(8000, "--port"),
-    url: str = typer.Option("http://127.0.0.1:11434", "--url", help="Ollama base url"),
+    url: str = typer.Option("http://127.0.0.1:11434", "--url", help="引擎 base url"),
+    provider: str = typer.Option(
+        "ollama", "--provider", help="ollama | openai-compat | mock | 插件 kind（onyx plugins 看全量）"
+    ),
     db: Path = typer.Option(None, "--db"),
     gpu_lock_path: Path = typer.Option(
         None, "--gpu-lock",
@@ -873,7 +887,11 @@ def serve(
 
     from onyx.api.app import create_app
 
-    app_obj = create_app(base_url=url, db_path=str(db) if db else None,
+    provider_id = "ollama-local" if provider == "ollama" else f"{provider}-local"
+    app_obj = create_app(base_url=url, provider_kind=provider, provider_id=provider_id,
+                         db_path=str(db) if db else None,
+                         # 显存采样是引擎专有的：非 ollama 通道不去猜
+                         sample_gpu=provider == "ollama",
                          gpu_lock_path=gpu_lock_path, event_sinks=tuple(sink))
     typer.echo(f"Onyx API: http://{host}:{port}/api/docs")
     uvicorn.run(app_obj, host=host, port=port, log_level="info")

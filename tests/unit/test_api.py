@@ -70,6 +70,61 @@ def test_fleet_shape(client):
     assert window["by_prefill_mode"].get("cold") == 1
 
 
+def test_residency_is_boolean_when_the_channel_reports_it(client):
+    """有控制面的通道（mock 声明 ADMIN）继续给 true/false——这是原有行为，不能退化。"""
+    body = client.get("/api/models").json()
+    assert body
+    assert all(isinstance(item["loaded"], bool) for item in body), \
+        "能问出答案时不许返回 null，那会把已知变成未知"
+    assert client.get("/api/fleet").json()["loaded_known"] is True
+
+
+@pytest.fixture
+def compat_client(tmp_path):
+    """OpenAI 兼容通道：只有数据面，没有"哪些模型在显存里"的端点。
+
+    用 `provider_kwargs={"transport": ...}` 注入 MockTransport：走的是生产同一条构造路径
+    （`build_runtime(provider_kind="openai-compat")`），不是替身对象。
+    """
+    import httpx
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/models"):
+            return httpx.Response(200, json={"data": [
+                {"id": "vllm/a", "created": 1700000000}, {"id": "vllm/b"}]})
+        return httpx.Response(200, json={"choices": [
+            {"index": 0, "message": {"role": "assistant", "content": "ok"},
+             "finish_reason": "stop"}], "usage": {"prompt_tokens": 3, "completion_tokens": 2}})
+
+    runtime = build_runtime(
+        provider_kind="openai-compat", provider_id="compat-local",
+        base_url="http://compat.test/v1", db_path=tmp_path / "compat.sqlite", event_log=False,
+        provider_kwargs={"transport": httpx.MockTransport(handler), "caps": ("chat", "tools")},
+    )
+    app = create_app(runtime, gpu_lock_path=tmp_path / "gpu.lock")
+    with TestClient(app) as test_client:
+        yield test_client
+    runtime.close()
+
+
+def test_residency_is_unknown_when_the_channel_cannot_answer(compat_client):
+    """`loaded=null` 与 `loaded=false` 是两个事实：前者是"问不出来"。
+
+    vLLM / LM Studio 的兼容层没有驻留查询端点。若把它们一律显示成"未载入"，
+    看板上"这个模型没在显存里"与"我们不知道"长得一样，人就会去查一个不存在的问题。
+    """
+    fleet = compat_client.get("/api/fleet").json()
+    assert fleet["loaded_known"] is False
+    assert fleet["loaded_models"] == []
+    assert fleet["installed_models"] == 2, "模型清单是问得到的，驻留不是"
+
+    models = compat_client.get("/api/models").json()
+    assert len(models) == 2
+    assert all(item["loaded"] is None for item in models)
+    detail = compat_client.get("/api/models/detail", params={"name": "vllm/a"}).json()
+    assert detail["loaded"] is None
+
+
 def test_models_expose_three_state_caps(client):
     """三态必须都在响应里，且语义正确。
 

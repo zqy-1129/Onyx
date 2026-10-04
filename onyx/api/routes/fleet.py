@@ -11,12 +11,26 @@ from onyx import __version__
 from onyx.api.app import iso_before
 from onyx.api.deps import AppState, get_state
 from onyx.api.schemas import FleetView, HealthView, LoadedModelView, ModelView
-from onyx.core.types import LoadedModel, ModelCard
+from onyx.core.types import Cap, LoadedModel, ModelCard
 from onyx.llm.caps import CapReport, infer_caps
 
 router = APIRouter(prefix="/api", tags=["fleet"])
 
 WINDOW_SECONDS = 3600
+
+
+def _reports_residency(provider: object) -> bool:
+    """这个引擎能回答"哪些模型驻留在显存里"吗？
+
+    判据是**能力位**而不是 provider 名字：`Cap.ADMIN` 在 `caps.py` 里明确表示
+    "实现了 tags/show/ps 控制面"。按名字分支的话，接一个新通道就得改这里
+    （而 `scripts/check_extension_boundary.py` 会把它判成抽象泄漏）。
+    """
+    caps = getattr(provider, "capabilities", None)
+    try:
+        return callable(caps) and Cap.ADMIN in caps()
+    except Exception:  # noqa: BLE001 - 能力探测失败按"未知"处理，不许猜"没载入"
+        return False
 
 
 def _keep_alive_seconds(expires_at: str) -> float | None:
@@ -55,7 +69,10 @@ def _caps_for(state: AppState, card: ModelCard) -> tuple[CapReport, dict[str, An
     return report, report.as_dict()
 
 
-def _model_view(state: AppState, card: ModelCard, loaded: dict[str, LoadedModel]) -> ModelView:
+def _model_view(
+    state: AppState, card: ModelCard, loaded: dict[str, LoadedModel], *,
+    residency_known: bool = True,
+) -> ModelView:
     record = state.models.find_by_name(card.provider_id, card.name)
     _, caps_dict = _caps_for(state, card)
     extra = (record.extra or {}) if record else {}
@@ -72,14 +89,17 @@ def _model_view(state: AppState, card: ModelCard, loaded: dict[str, LoadedModel]
     }
     return ModelView(
         id=f"{card.provider_id}/{card.name}", name=card.name, provider_id=card.provider_id,
-        parameter_size=card.parameter_size, quantization=card.quantization, size_gb=card.size_gb,
+        parameter_size=card.parameter_size, quantization=card.quantization,
+        # `bytes=0` 在兼容通道上表示"没上报体积"，不是"0 GB"：
+        # 显示 0.00GB 会被读成一个测量值（R2 的老毛病，换个通道又长出来一次）
+        size_gb=card.size_gb if card.bytes else None,
         capabilities=list(card.capabilities), caps=caps_dict,
         tool_format=(record.tool_format if record else "unknown"),
         ctx_train=card.context_length, ctx_loaded=live.context_length if live else None,
         tokenizer_source=(record.tokenizer_source if record else "none"),
         calibrated=bool(record and record.usage_ratio and (record.usage_ratio_n or 0) >= 30),
         calibration=calibration, probed=bool(record and record.probe),
-        loaded=live is not None,
+        loaded=(live is not None) if residency_known else None,
     )
 
 
@@ -98,7 +118,8 @@ def fleet(state: AppState = Depends(get_state)) -> FleetView:
     """总览：服务状态 + 已载入模型 + 近 1 小时窗口指标 + 异常分布。"""
     provider = state.runtime.provider
     info = provider.info()
-    loaded = provider.running()
+    residency_known = _reports_residency(provider)
+    loaded = provider.running() if residency_known else []
     since = iso_before(WINDOW_SECONDS)
     summary = state.usage.summarize(since=since)
 
@@ -126,6 +147,7 @@ def fleet(state: AppState = Depends(get_state)) -> FleetView:
         provider_kind=str(info.kind), provider_reachable=info.reachable,
         engine_version=info.version, base_url=info.base_url,
         loaded_models=[_loaded_view(item) for item in loaded],
+        loaded_known=residency_known,
         installed_models=len(provider.list_models()),
         window=window, anomalies=state.traces.anomaly_counts(since=since),
     )
@@ -134,8 +156,12 @@ def fleet(state: AppState = Depends(get_state)) -> FleetView:
 @router.get("/models", response_model=list[ModelView])
 def models(state: AppState = Depends(get_state)) -> list[ModelView]:
     provider = state.runtime.provider
-    loaded = {item.name: item for item in provider.running()}
-    return [_model_view(state, card, loaded) for card in provider.list_models()]
+    residency_known = _reports_residency(provider)
+    loaded = {item.name: item for item in provider.running()} if residency_known else {}
+    return [
+        _model_view(state, card, loaded, residency_known=residency_known)
+        for card in provider.list_models()
+    ]
 
 
 @router.get("/models/detail", response_model=ModelView)
@@ -145,11 +171,12 @@ def model_detail(
 ) -> ModelView:
     """模型详情。用 query 参数而不是路径参数：模型名可能含 `/`（命名空间）。"""
     provider = state.runtime.provider
+    residency_known = _reports_residency(provider)
     card = next((c for c in provider.list_models() if c.name == name), None)
     if card is None:
         raise HTTPException(status_code=404, detail=f"模型不存在: {name}")
-    loaded = {item.name: item for item in provider.running()}
-    return _model_view(state, card, loaded)
+    loaded = {item.name: item for item in provider.running()} if residency_known else {}
+    return _model_view(state, card, loaded, residency_known=residency_known)
 
 
 @router.get("/models/probe")

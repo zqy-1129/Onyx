@@ -131,3 +131,24 @@ export function deltaTone(value: number | null | undefined, eps = 0): 'good' | '
   if (isMissing(value) || Math.abs(value) <= eps) return 'flat'
   return value > 0 ? 'good' : 'bad'
 }
+
+/** 体积按 GB 显示；未知（该通道不上报）显示「—」而不是 0.00GB。 */
+export function fmtGb(value: number | null | undefined): string {
+  return isMissing(value) ? UNKNOWN : `${value.toFixed(2)}GB`
+}
+
+/** 驻留状态的三态。
+ *
+ * `null`（这个通道不报告）与 `false`（问了，答案是没有）必须长得不一样：
+ * 把"未知"画成"未载入"会让人去查一个不存在的问题（R2）。 */
+export type Residency = { marker: 'loaded' | 'idle' | 'unknown'; text: string; title: string }
+
+export function residencyOf(loaded: boolean | null): Residency {
+  if (loaded === true) return { marker: 'loaded', text: '●', title: '已载入' }
+  if (loaded === false) return { marker: 'idle', text: '·', title: '未载入' }
+  return {
+    marker: 'unknown',
+    text: UNKNOWN,
+    title: '驻留状态未知：这个通道不报告（OpenAI 兼容层没有该端点）',
+  }
+}

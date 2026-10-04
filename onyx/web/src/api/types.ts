@@ -53,6 +53,8 @@ export interface FleetView {
   engine_version: string
   base_url: string
   loaded_models: LoadedModelView[]
+  /** false 时 loaded_models 是空且无含义：面板必须显示「驻留状态未知」而不是"当前没有载入任何模型" */
+  loaded_known: boolean
   installed_models: number
   window: FleetWindow
   anomalies: Record<string, number>
@@ -71,7 +73,7 @@ export interface ModelView {
   provider_id: string
   parameter_size: string
   quantization: string
-  size_gb: number
+  size_gb: number | null
   capabilities: string[]
   caps: CapReportDto
   tool_format: string
@@ -81,7 +83,9 @@ export interface ModelView {
   calibrated: boolean
   calibration: Record<string, number | null>
   probed: boolean
-  loaded: boolean
+  /** null = 该通道不报告驻留状态（例如 OpenAI 兼容层）。
+   *  必须与 false（问了，答案是"没载入"）区分：把未知画成"未载入"会引着人去查一个不存在的问题 */
+  loaded: boolean | null
 }
 
 export interface UsageAlt {

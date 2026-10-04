@@ -136,7 +136,7 @@ class ModelView(BaseModel):
     provider_id: str
     parameter_size: str = ""
     quantization: str = ""
-    size_gb: float = 0.0
+    size_gb: float | None = None
     capabilities: list[str] = Field(default_factory=list)
     caps: dict[str, Any] = Field(default_factory=dict)
     tool_format: str = "unknown"
@@ -146,7 +146,10 @@ class ModelView(BaseModel):
     calibrated: bool = False
     calibration: dict[str, Any] = Field(default_factory=dict)
     probed: bool = False
-    loaded: bool = False
+    #: `None` = 该通道不报告驻留状态（例如 vLLM/LM Studio 的 OpenAI 兼容层）。
+    #: 必须与 `False`（问了，答案是"没载入"）区分开——界面把未知画成"未载入"
+    #: 会让人去查一个不存在的问题（UI_DESIGN R2）
+    loaded: bool | None = None
 
 
 class FleetView(BaseModel):
@@ -158,6 +161,9 @@ class FleetView(BaseModel):
     engine_version: str = ""
     base_url: str = ""
     loaded_models: list[LoadedModelView] = Field(default_factory=list)
+    #: 该通道能否回答"哪些模型在显存里"。`False` 时 `loaded_models` 是空且**无含义**，
+    #: 界面必须显示「驻留状态未知」而不是"当前没有载入任何模型"
+    loaded_known: bool = True
     installed_models: int = 0
     window: dict[str, Any] = Field(default_factory=dict)
     anomalies: dict[str, int] = Field(default_factory=dict)
