@@ -21,6 +21,9 @@ from onyx.core.clock import utc_now_iso
 from onyx.core.errors import MigrationError
 
 MIGRATIONS_DIR = Path(__file__).parent / "migrations"
+#: 升级前的快照放这里（`backups/`）。它与 `onyx db backup` 的产物在同一棵树下，
+#: 所以 `doctor` 谈磁盘余量时可以把两者一起算。
+BACKUP_DIR_NAME = "backups"
 
 _PRAGMAS = (
     "PRAGMA journal_mode=WAL",
@@ -80,8 +83,11 @@ class Database:
                 int(row["version"]): str(row["checksum"])
                 for row in self._conn.execute("SELECT version, checksum FROM schema_version")
             }
+            planned = discover_migrations(directory)
+            if any(version not in applied for version, _name, _sql in planned):
+                self._snapshot_before_migration(applied)
             done: list[int] = []
-            for version, name, sql in discover_migrations(directory):
+            for version, name, sql in planned:
                 digest = hashlib.sha256(sql.encode("utf-8")).hexdigest()
                 if version in applied:
                     if applied[version] != digest:
@@ -99,6 +105,21 @@ class Database:
                     raise MigrationError(f"迁移 {name} 失败: {exc}", detail={"version": version}) from exc
                 done.append(version)
             return done
+
+    def _snapshot_before_migration(self, applied: dict[int, str]) -> Path | None:
+        """真正要改 schema 之前先复制一份库，失败时人还能退回去。
+
+        只备库、不备 blob：这是回滚快照，不是完整备份（完整备份是 `onyx db backup`，
+        它会连被引用的证据一起带走并可 verify）。名字里带升级前的版本号，
+        于是"从哪升上来"在目录里自己就说得清；同一版本只留一份，免得每次开库都复制。
+        """
+        if str(self.path) == ":memory:" or not applied:
+            return None  # 空库没有可回滚的东西
+        target = self.path.parent / BACKUP_DIR_NAME / f"pre-migration-v{max(applied)}.sqlite"
+        if target.exists():
+            return None
+        self.backup_to(target)
+        return target
 
     @staticmethod
     def _migration_script(version: int, name: str, checksum: str, sql: str) -> str:

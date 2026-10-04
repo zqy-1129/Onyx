@@ -1423,6 +1423,61 @@ ONYX_DATA_DIR=.tmp/data-copy uv run onyx doctor                 # ✗ blob 引�
 
 ---
 
+## S19 — doctor 补齐两项 + 迁移前自动快照 + `.data` 曲线（M7 收口）✅
+
+**产出文件**
+```
+onyx/cli.py                     # doctor: 磁盘余量 / token 计量档位；db sizes（现状+趋势）
+onyx/store/db.py                # BACKUP_DIR_NAME + _snapshot_before_migration（升级前先复制）
+onyx/store/retention.py         # Trend + footprint_trend（日均增速）
+onyx/llm/measurement/fidelity.py # FITTED_MIN_SAMPLES：门槛只承认这一处
+onyx/llm/measurement/calibrate.py # usable 改用同一个门槛
+tests/unit/test_doctor.py（9，S7 承诺的文件名）+ test_retention.py（+7）+ test_db_migrations.py（+3）
+```
+
+**这步挖出来的一件事最重要：`FITTED_MIN_SAMPLES` 以前散在 4 处字面量 30**
+（`FittedCounter`、`text_counter`、`Calibration.usable`、CLI 的档位标签）。
+门槛一旦分叉，最坏的组合就是体检绿着而计数其实早已退回 heuristic/low。
+现在四处共用一个常量，并由 `test_tier_check_boundary_is_the_same_number_the_counter_uses`
+把"体检与计数用同一个门槛"钉成断言。
+
+**两条新检查的立场**
+- **磁盘余量**：低于 2 GiB 就红。`.data` 写满的表现不是优雅报错，而是崩溃 + 半截 blob。
+  修法必须具体（先 `rotate --apply` 回收，还是把 `ONYX_DATA_DIR` 挪盘），余量问不出来时
+  写"问不出来"而不是当作充足。
+- **token 计量档位**：报的是"**这台机器上每个模型落到哪一档**"，不是"设计稿上有几档"。
+  所以它明说 `hf_tokenizer` / `gguf_vocab` 本版本没有实现、`tokens` extra 装了也不生效
+  （P9：3 个模型里 2 个没有 chat template，T2 的 GGUF 自建 BPE 没做）。
+  不写这句话，看板就会一直显得比实际更能精确复算——同一个数字谎的两种写法而已。
+
+**迁移前自动快照**：真要改 schema 之前先 `backup_to(backups/pre-migration-v{旧}.sqlite)`。
+只备库不备 blob（那是回滚点，不是完整备份——完整备份是 `onyx db backup`）。
+同名已存在就不再复制，空库与 `:memory:` 直接跳过。
+
+**`.data` 曲线（`onyx db sizes`）**：采样点只来自 `retention_run`。
+两个点相隔 72 秒也能算出"每天多少字节"，但那是噪声除以时间——所以跨度不足 1 天时
+`footprint_trend` 返回 `per_day_bytes=None`，CLI 说"问不出来 · 最近两个点只跨 1 分钟"。
+日均很小时也别报"还能写约 1.4 亿天"：超过十年就只说"余量还很充裕"。
+
+**自测（全部实际执行）**
+```bash
+uv run pytest                     # 1057 passed, 1 skipped（doctor 9 + 曲线 7 + 快照 3）
+uv run pytest -m live             # 20 passed
+uv run ruff check . && uv run lint-imports    # clean / 3 kept
+uv run coverage report            # 88%（retention.py 与 backup.py 均 100%）
+uv run onyx doctor --skip-network # 8 项：新增 磁盘余量 416.2 GiB / token 计量档位（明说 T1/T2 未实现）
+uv run onyx db sizes              # 现在 6.5 MiB · 趋势问不出来（两个点只跨 1 分钟）
+```
+真机验证自动快照：把 `.data/onyx.sqlite` 拷到 `.tmp/mig/`，加一个 `0007_note.sql` 后升级 ⇒
+`backups/pre-migration-v6.sqlite` 生成，里面 version=6、trace 1345 行完好（没拿真库做实验）。
+
+**验收 DoD**：M7 出口判据全部达成——保留策略可 dry-run 且落库审计、备份可验证恢复、
+`doctor` 在人为破坏后报具体项（blob 具名 + 磁盘 + 档位）、`.data` 体积有曲线可查。
+
+**提交**：`feat(cli): doctor 补磁盘与计量档位 + 迁移前自动快照 + db sizes 曲线（S19）`
+
+---
+
 ## 附录 A — 每步自测速查
 
 | 步 | 命令 | 绿的条件 |
@@ -1445,6 +1500,7 @@ ONYX_DATA_DIR=.tmp/data-copy uv run onyx doctor                 # ✗ blob 引�
 | S16 | `scripts/check_extension_boundary.sh` | 接入新 provider/task 未碰内核 |
 | S17 | `onyx rotate && onyx rotate --apply` | 默认不删任何东西；两次数字一致；每次运行有留痕 |
 | S18 | `onyx db backup --to D && onyx db verify-backup D` | 9 项检查全绿；人为删一个 blob 后 verify 与 `doctor` 都报出具体 ref |
+| S19 | `onyx doctor && onyx db sizes` | 磁盘与计量档位两项可见；升级前自动留 `backups/pre-migration-v*.sqlite` |
 | 门禁 | `make coverage`（`coverage run -m pytest -q`） | 离线套件分支覆盖率 ≥ 80%（基线 88%） |
 
 ## 附录 B — 架构自测（让"模块化"可验证，而非口号）

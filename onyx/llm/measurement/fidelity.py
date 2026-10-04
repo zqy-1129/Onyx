@@ -20,6 +20,11 @@ from onyx.core.types import (
 )
 from onyx.llm.measurement.heuristic import estimate_tokens
 
+#: fitted 档的最低样本量。门槛只承认这一处：计数（FittedCounter / text_counter）、
+#: 写入（calibrate.Calibration.usable）、体检（doctor）必须用同一个数——
+#: 分成两个数时，体检会宣称"没问题"而计数其实已经退回 heuristic/low。
+FITTED_MIN_SAMPLES = 30
+
 
 @dataclass(frozen=True, slots=True)
 class CounterContext:
@@ -112,10 +117,10 @@ class FittedCounter:
     default_confidence = Confidence.MEDIUM
 
     def count(self, req: GenerationRequest, gen: Generation, ctx: CounterContext) -> TokenSample | None:
-        if not ctx.fitted_ratio or ctx.fitted_n < 30:
+        if not ctx.fitted_ratio or ctx.fitted_n < FITTED_MIN_SAMPLES:
             return TokenSample(
                 source=self.name, ok=False, confidence=Confidence.LOW,
-                note=f"未标定或样本不足(n={ctx.fitted_n}，需≥30)",
+                note=f"未标定或样本不足(n={ctx.fitted_n}，需≥{FITTED_MIN_SAMPLES})",
             )
         out_text = (gen.text or "") + (gen.thinking or "")
         if ctx.fitted_cjk_ratio is not None and ctx.fitted_other_ratio is not None:
@@ -196,7 +201,7 @@ def text_counter(ctx: CounterContext) -> Callable[[str], int] | None:
             return round(cjk_ratio * cjk + other_ratio * other)
 
         return count_split
-    if ctx.fitted_ratio and ctx.fitted_n >= 30:
+    if ctx.fitted_ratio and ctx.fitted_n >= FITTED_MIN_SAMPLES:
         ratio = ctx.fitted_ratio
         return lambda text: round(len(text) * ratio)
     cjk = ctx.cjk_tokens_per_char

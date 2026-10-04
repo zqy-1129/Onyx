@@ -35,16 +35,17 @@ Onyx 的目标形态不是 SaaS，也不是通用 LLM 应用框架，而是：
 |---|---|---|
 | ~~`grep -rn "prune\|retention\|vacuum" onyx/` → 0~~ | **S17 已交付**：`onyx rotate` 默认 dry-run，摘五列重引用、回收无主 blob、每次运行落 `retention_run` 留痕 | 真机第一次 dry-run 就报出 6 个无人引用的 blob，并顺带查出 `args_ref` 泄漏（见 STATUS A 组）；`.data` 现在能自我约束 |
 | ~~`onyx db` 只有 `init` / `info`~~ | **S18 已交付**：`db backup`（WAL 一致快照 + 只装被引用的 blob + manifest）与 `db verify-backup`（逐字节 sha256、行数、"引用能否在备份里解析"） | "备份存在"与"备份可用"从此是两件事，而 verify 负责后者；只备库不备证据的备份会被那条具名检查抓出来 |
-| `doctor` 6 项里没有磁盘余量、tokenizer 档位可用性 | S7 检查项清单承诺过 | 磁盘写满是本地部署最典型故障；tokenizer 档位缺失会让 `hf_tokenizer/gguf_vocab` 两档静默不可用（只剩 heuristic/low）。blob 完整性项已在 S18 升级为具名报告（真机：删一个 blob ⇒ `1230/1231 可解析，缺：sha256:00…`，退出码 1） |
-| 迁移只有 `0001`→`0005` 单向 | 无降级/校验路径 | 升级失败只能手改库 |
+| ~~`doctor` 6 项里没有磁盘余量、tokenizer 档位可用性~~ | **S19 已交付**：两项都在，且 blob 完整性项与 rotate 共用同一份引用清单 | 磁盘写满时现在会红（阈值 2 GiB）；档位项直接说明"`hf_tokenizer`/`gguf_vocab` 本版本未实现，`tokens` extra 装了也不生效"——这句话以前只藏在 PROBES P9 里 |
+| 迁移只有 `0001`→`0005` 单向 | **S19 部分改善**：真要改 schema 前自动留 `backups/pre-migration-v{旧}.sqlite`（WAL 一致快照） | 仍然没有降级路径，但升级失败至少有一个明确的回滚点，不用手改库 |
 
 **出口判据**：~~`onyx rotate` 报得出会删多少、释放多少字节~~（S17 达成：默认 dry-run，
 真机报出 6 个可回收 blob / 955 B，且每次运行落 `retention_run`）；
 ~~`onyx db backup` + `verify-backup` 比对行数与 blob 摘要~~（S18 达成：真机 1231 个 blob 逐个重算
 sha256 全对得上，行数/schema/引用可解析共 9 项检查全绿）；
 ~~故意删一个 blob 文件后 `doctor` 能指名道姓报出来（不是笼统 500）~~（S18 达成，副本实测退出码 1）；
-`.data` 大小有上限曲线可查（待做，`retention_run.bytes_before/bytes_after` 已经是曲线的数据源）；
-磁盘余量与 tokenizer 档位体检 + 迁移前自动备份（待做）。
+~~`.data` 大小有上限曲线可查~~（S19 达成：`onyx db sizes` 从 `retention_run` 取点，跨度不足一天就说"问不出来"）；
+~~磁盘余量与 tokenizer 档位体检 + 迁移前自动备份~~（S19 达成：升级前留
+`backups/pre-migration-v{旧}.sqlite`，在 `.data` 副本上真升级 v6→v7 验过回滚点完好）。
 
 ### G2 配置、部署与发行（"给别人看"的前提）
 | 证据 | 现状 |
@@ -114,7 +115,7 @@ CI 上覆盖率有基线数字（不追高，只防跌）；契约矩阵增加"�
 
 | 里程碑 | 内容 | 步 | 出口判据 |
 |---|---|---|---|
-| **M7 跑得住** | G1 全部：`rotate`、`db backup/verify-backup`、`doctor` 补磁盘 + tokenizer 档位、迁移前自动备份、`.data` 体积报告 | **S17–S18 ✅**、S19 | 保留策略可 `--dry-run` 且落库审计 **已达成**；备份可验证恢复 **已达成**；`doctor` 在人为破坏后报具体项 **blob 项已达成**，磁盘/tokenizer 两项待做 |
+| **M7 跑得住** | G1 全部：`rotate`、`db backup/verify-backup`、`doctor` 补磁盘 + tokenizer 档位、迁移前自动备份、`.data` 体积报告 | **S17–S19 ✅** | 保留策略可 `--dry-run` 且落库审计 ✅ · 备份可验证恢复 ✅ · `doctor` 在人为破坏后报具体项 ✅（真机：删一个 blob ⇒ 具名 + 退出码 1）· 磁盘与档位两项体检 ✅ · `.data` 曲线 ✅ |
 | **M8 配置与发行** | G2：`onyx.yaml`（provider/锁/保留/白名单）+ 优先级与"写了不生效"检查；`--host` 非回环强制 token；LICENSE + CHANGELOG + 版本策略；GitHub Actions 全门禁；`uv tool install .` 冒烟 | S20–S22 | 新机器一条命令装好并 `doctor` 全绿；CI 能挡住 lint-imports/边界脚本违规；配置项与 flag 冲突时有明确解释 |
 | **M9 操作闭环** | G3：界面发起评测（锁排队 + 实时进度 + 取消）、数据集导入、工具注册/审计页（Tool Bench）、`models pull/rm` | S23–S26 | 不发一句命令就能完成"选模型 → 跑评测 → 看矩阵 → 下钻 trace"；被中断的 run 状态正确；触发型端点全部过机器级锁 |
 | **M10 观测触达** | G4：告警规则 + 两个出口（本地文件 / 通用 webhook）+ 触发历史页；多引擎观测形态定案（要么一进程多 provider，要么文档化"多实例 + 汇总视图"） | S27–S29 | 人为造一条 `CONTEXT_OVERFLOW` 能在 1 分钟内收到通知并能在界面看到"为什么触发" |
@@ -154,7 +155,9 @@ CI 上覆盖率有基线数字（不追高，只防跌）；契约矩阵增加"�
 ## 5. 核对方式
 
 ```bash
-grep -rn "prune\|retention\|vacuum" --include=*.py onyx/ | wc -l        # 23：保留策略已落地（S17）
+grep -rn "prune\|retention\|vacuum" --include=*.py onyx/ | wc -l        # 32：保留策略已落地（S17）
+grep -rln "create_backup\|verify_backup" --include=*.py onyx/ | wc -l    # 3：备份与验证（S18）
+sed -n '/^def doctor(/,/_echo_checks/p' onyx/cli.py | grep -c "checks.append"   # 8：体检项（S19 补齐磁盘与档位）
 grep -rn "@router.post" onyx/api/routes/*.py | wc -l                     # 2：界面只有两个写操作
 grep -rn "APIKey\|Authorization" onyx/api --include=*.py | wc -l         # 0：无鉴权
 grep -rln "webhook\|notify" --include=*.py onyx/ | wc -l                 # 0：异常只落库

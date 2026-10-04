@@ -1,11 +1,13 @@
 """Onyx CLI 入口。
 
-命令按子系统分组，随里程碑逐步补齐（见 IMPLEMENTATION.md S7）。
-当前已实现：`version` / `db init` / `db info` / `doctor`。
+命令按子系统分组：`db`(4) / `probe`(4) / `models`(2) / `traces`(3) / `tools`(9) /
+`eval`(8) 加顶层 7（chat / serve / doctor / plugins / version / calibrate / rotate）。
+分步交付记录见 IMPLEMENTATION.md，现状清单见 STATUS.md。
 """
 
 from __future__ import annotations
 
+import os
 import platform
 import sys
 from dataclasses import dataclass
@@ -15,6 +17,7 @@ import typer
 
 from onyx import __version__
 from onyx.eval.task import HEADLINE_METRICS
+from onyx.llm.measurement.fidelity import FITTED_MIN_SAMPLES
 from onyx.settings import Settings, load_settings
 from onyx.store.db import Database
 from onyx.store.retention import (
@@ -225,6 +228,104 @@ def _last_rotate(report: DiskReport) -> str:
     )
 
 
+@db_app.command("sizes")
+def db_sizes(
+    limit: int = typer.Option(30, "--limit", help="看最近多少个采样点"),
+    json_out: bool = typer.Option(False, "--json", help="机器可读输出（给 cron / CI 画曲线）"),
+    db: Path = typer.Option(None, "--db", help="数据库路径"),
+) -> None:
+    """`.data` 的体积现状与增长趋势：回答"照这么写还能撑多久"。
+
+    采样点只来自 `retention_run`（每次 `onyx rotate`，含 dry-run，都留一个点）。
+    没跑过 rotate 就没有趋势——把"现在多大"当成"会不会写满"的答案是自欺。
+    """
+    import json as _json
+    import shutil
+
+    from onyx.core.content import FileBlobStore
+    from onyx.store.retention import footprint_trend
+
+    settings = _settings()
+    path = _db_path(settings, db)
+    if not path.exists():
+        typer.echo(f"数据库不存在: {path}（先跑 onyx db init）", err=True)
+        raise typer.Exit(1)
+    with Database(path) as database:
+        report = disk_report(database, FileBlobStore(settings.blob_dir))
+        trend = footprint_trend(database, limit=max(2, limit))
+    try:
+        usage = shutil.disk_usage(settings.data_dir)
+        free = int(usage.free)
+    except OSError:
+        free = -1  # 问不出来就写 -1，不要假装余量无限
+
+    days_left = None
+    if free >= 0 and trend.enough and (trend.per_day_bytes or 0) > 0:
+        days_left = free / trend.per_day_bytes
+
+    if json_out:
+        typer.echo(_json.dumps({
+            "data_dir": str(settings.data_dir),
+            "now": {
+                "db_bytes": report.db_bytes, "wal_bytes": report.wal_bytes,
+                "blob_bytes": report.blob_bytes, "blob_files": report.blob_files,
+                "total_bytes": report.total_bytes,
+            },
+            "traces": report.traces, "oldest_trace_at": report.oldest_trace_at,
+            "dangling_refs": report.dangling_refs,
+            "retention_runs": report.retention_runs,
+            "disk_free_bytes": free,
+            "trend": {
+                "samples": trend.samples, "span_days": round(trend.span_days, 3),
+                "per_day_bytes": trend.per_day_bytes,
+                "days_until_full": days_left,
+                "points": [{"at": at, "bytes_after": size} for at, size in trend.points],
+            },
+        }, ensure_ascii=False, indent=2))
+        raise typer.Exit(0)
+
+    typer.echo(f"现在       : {_fmt_bytes(report.total_bytes)}"
+               f"（db {_fmt_bytes(report.db_bytes)} + wal {_fmt_bytes(report.wal_bytes)}"
+               f" + blob {_fmt_bytes(report.blob_bytes)} / {report.blob_files} 个）")
+    free_line = "未知（问不出来）" if free < 0 else _fmt_bytes(free)
+    typer.echo(f"磁盘余量     : {free_line}")
+    if not trend.enough:
+        span_hours = trend.span_days * 24
+        span_text = f"{span_hours * 60:.0f} 分钟" if 0 < span_hours < 1 else f"{span_hours:.1f} 小时"
+        reason = (
+            f"采样点只有 {trend.samples} 个（至少需要 2 个）" if trend.samples < 2
+            else f"最近两个点只跨 {span_text}，算不出日均"
+        )
+        typer.echo(
+            f"趋势         : 问不出来 · {reason}"
+            " · 定时跑 onyx rotate（可以只 dry-run）才会在 retention_run 里留下点"
+        )
+    else:
+        per_day = trend.per_day_bytes or 0.0
+        # 日均增速用带符号的"人话字节"：0.00 MiB/天 看起来像"没在长"，
+        # 而实际可能是每天 5 KB 的稳定泄漏。
+        rate = f"{'+' if per_day >= 0 else '-'}{_fmt_bytes(int(abs(per_day)))}/天"
+        runway = ""
+        if days_left is not None:
+            # 超过十年就别报具体天数："还能写约 143813053 天"是假精确，
+            # 人会误以为这个数字有意义。
+            runway = (
+                f" · 按此速度还能写约 {days_left:.0f} 天" if days_left < 3650
+                else " · 按此速度余量还很充裕（>10 年）"
+            )
+        typer.echo(
+            f"趋势         : {trend.samples} 个采样点跨 {trend.span_days:.1f} 天，{rate}"
+            + runway
+            + ("" if per_day >= 0 else "（在缩，不用管）")
+        )
+    if trend.points:
+        typer.echo("采样点       :")
+        for at, size in trend.points[-8:]:
+            typer.echo(f"  {at[:19]}  {_fmt_bytes(size)}")
+    else:
+        typer.echo("采样点       : 一个都没有 · onyx rotate 跑一次就有点了")
+
+
 # ── db backup / verify-backup ──────────────────────────────────────
 @db_app.command("backup")
 def db_backup(
@@ -424,13 +525,77 @@ def _extension_failures() -> list[str]:
     return [str(f) for f in failures()]
 
 
+#: 磁盘余量低于它就报错：`.data` 写满的表现是崩溃 + 半截 blob，不是"优雅失败"。
+MIN_FREE_BYTES = 2 * 1024 ** 3
+
+
+def _dir_bytes(path: Path) -> int:
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += (Path(root) / name).stat().st_size
+            except OSError:
+                continue  # 正被人删掉的文件不算故障：余量看的是此刻还算得出来的部分
+    return total
+
+
+def _check_disk(settings: Settings) -> CheckResult:
+    """磁盘余量与 `.data` 当前体积——本地部署最常见的故障就是把自己写满。"""
+    import shutil
+
+    try:
+        usage = shutil.disk_usage(settings.data_dir)
+    except OSError as exc:
+        return CheckResult(
+            "磁盘余量", False, f"问不出来：{type(exc).__name__}",
+            "数据目录可能已卸载或换过盘：检查 ONYX_DATA_DIR",
+        )
+    return CheckResult(
+        "磁盘余量", usage.free >= MIN_FREE_BYTES,
+        f"剩余 {_fmt_bytes(usage.free)} / 共 {_fmt_bytes(usage.total)}"
+        f" · .data 现占 {_fmt_bytes(_dir_bytes(settings.data_dir))}",
+        f"低于 {_fmt_bytes(MIN_FREE_BYTES)} 就别再往评测里投预算了："
+        "先 onyx rotate --apply 回收过期证据，或把 ONYX_DATA_DIR 挪到大盘"
+        "（备份也在这棵树下，verify 过的那份同样占余量）",
+    )
+
+
+def _check_token_tiers(database: Database) -> CheckResult:
+    """每个模型**实际落在哪一档**，而不是阶梯上一共有几档。
+
+    `hf_tokenizer` / `gguf_vocab` 在本版本没有实现：P9 实测 3 个模型里 2 个根本没有
+    chat template，T2 的"用 GGUF vocab 自建 BPE"没做。所以 `tokens` extra 装了也不生效——
+    这句话必须出现在体检里，而不是等人去翻 DESIGN 的表格。
+    """
+    rows = database.query("SELECT name, usage_ratio, usage_ratio_n FROM model ORDER BY name")
+    note = " · 未实现：hf_tokenizer / gguf_vocab（装了 tokens extra 也不生效，见 PROBES P9）"
+    if not rows:
+        return CheckResult(
+            "token 计量档位", True,
+            f"库里还没有模型 · 可用档位：engine（总计数）+ fitted 或 heuristic（分段归因）{note}",
+            "onyx models sync --url …",
+        )
+    weak = [
+        str(row["name"]) for row in rows
+        if not row["usage_ratio"] or int(row["usage_ratio_n"] or 0) < FITTED_MIN_SAMPLES
+    ]
+    return CheckResult(
+        "token 计量档位", not weak,
+        f"{len(rows)} 个模型：标定可用 {len(rows) - len(weak)} / 未标定 {len(weak)}"
+        + (f"（{', '.join(weak[:3])}）" if weak else "") + note,
+        f"未标定的模型分段归因只能 heuristic/low：onyx calibrate --model <名字>"
+        f"（需 ≥{FITTED_MIN_SAMPLES} 个样本）",
+    )
+
+
 @app.command()
 def doctor(
     db: Path = typer.Option(None, "--db", help="数据库路径"),
     ollama_url: str = typer.Option("http://127.0.0.1:11434", "--ollama-url", help="Ollama base url"),
     skip_network: bool = typer.Option(False, "--skip-network", help="跳过网络检查"),
 ) -> None:
-    """体检：环境、数据库、blob 一致性、Ollama 可达性。"""
+    """体检：环境、磁盘、数据库、blob 一致性、计量档位、插件、Ollama 可达性。"""
     settings = _settings()
     path = _db_path(settings, db)
     checks: list[CheckResult] = []
@@ -443,6 +608,7 @@ def doctor(
         "数据目录可写", _writable(settings.data_dir), str(settings.data_dir),
         "检查磁盘权限或设置 ONYX_DATA_DIR",
     ))
+    checks.append(_check_disk(settings))
 
     db_ok = path.exists()
     detail = "未初始化"
@@ -458,19 +624,20 @@ def doctor(
         from onyx.core.content import FileBlobStore
         from onyx.store.retention import referenced_refs
 
+        store = FileBlobStore(settings.blob_dir)
         with Database(path) as database:
             refs = referenced_refs(database)
-        store = FileBlobStore(settings.blob_dir)
-        missing = sorted(ref for ref in refs if not store.exists(ref))
-        checks.append(CheckResult(
-            # 引用清单与 rotate 用同一份定义（所有引用列），且必须指名道姓：
-            # 只报"3/5 可解析"会让人去猜是哪两个没了。
-            "blob 引用完整", not missing,
-            f"{len(refs) - len(missing)}/{len(refs)} 可解析"
-            + (f"，缺：{', '.join(r[:18] for r in missing[:3])}" if missing else ""),
-            "原始证据缺失：确认 .data/blobs 没被手工清理；"
-            "若是 rotate 之前丢的，跑 onyx db verify-backup 看最近备份能不能补回来",
-        ))
+            missing = sorted(ref for ref in refs if not store.exists(ref))
+            checks.append(CheckResult(
+                # 引用清单与 rotate 用同一份定义（所有引用列），且必须指名道姓：
+                # 只报"3/5 可解析"会让人去猜是哪两个没了。
+                "blob 引用完整", not missing,
+                f"{len(refs) - len(missing)}/{len(refs)} 可解析"
+                + (f"，缺：{', '.join(r[:18] for r in missing[:3])}" if missing else ""),
+                "原始证据缺失：确认 .data/blobs 没被手工清理；"
+                "若是 rotate 之前丢的，跑 onyx db verify-backup 看最近备份能不能补回来",
+            ))
+            checks.append(_check_token_tiers(database))
 
     bad_plugins = _extension_failures()
     checks.append(CheckResult(
@@ -1131,7 +1298,7 @@ def _tool_registry(db: Path | None, model: str | None):
         count_fn = text_counter(ctx)
         count_fn.source_name = (  # type: ignore[attr-defined]
             "gguf_vocab" if ctx.tokenizer is not None
-            else "fitted" if ctx.fitted_ratio and ctx.fitted_n >= 30
+            else "fitted" if ctx.fitted_ratio and ctx.fitted_n >= FITTED_MIN_SAMPLES
             else "heuristic"
         )
     return ToolRegistry(ToolRepo(database), count_fn=count_fn), database

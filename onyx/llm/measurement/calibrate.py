@@ -13,6 +13,8 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from onyx.llm.measurement.fidelity import FITTED_MIN_SAMPLES
+
 
 @dataclass(frozen=True, slots=True)
 class CalibrationResult:
@@ -44,7 +46,7 @@ class CalibrationResult:
         真机教训：R²=0.94 但最大相对误差 66% 的标定是**有害的**——它看起来可信，
         却会让短请求的估计差一倍。所以 max_rel_error 必须进门槛，不能只看 R²。
         """
-        return self.n >= 30 and self.r2 >= 0.90 and self.max_rel_error <= 0.20
+        return self.n >= FITTED_MIN_SAMPLES and self.r2 >= 0.90 and self.max_rel_error <= 0.20
 
     def predict(self, chars: int) -> int:
         return max(0, round(chars * self.ratio + self.intercept))

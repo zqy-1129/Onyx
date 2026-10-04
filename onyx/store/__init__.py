@@ -18,7 +18,16 @@ from .records import (
     UsageRecord,
 )
 from .repos import ModelRepo, TraceRepo, UsageRepo
-from .retention import DiskReport, Outcome, disk_report, history, parse_window, sweep
+from .retention import (
+    DiskReport,
+    Outcome,
+    Trend,
+    disk_report,
+    footprint_trend,
+    history,
+    parse_window,
+    sweep,
+)
 from .sinks import (
     EventFanout,
     EventSink,
@@ -51,12 +60,14 @@ __all__ = [
     "ToolCallRecord",
     "TraceRecord",
     "TraceRepo",
+    "Trend",
     "UsageAltRecord",
     "UsageRecord",
     "UsageRepo",
     "create_backup",
     "discover_migrations",
     "disk_report",
+    "footprint_trend",
     "history",
     "parse_window",
     "sweep",

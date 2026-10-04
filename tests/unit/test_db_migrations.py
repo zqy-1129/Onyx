@@ -86,6 +86,61 @@ def test_incremental_migration_applies_only_new(tmp_path):
         assert db.migrate(migrations) == []
 
 
+def test_migration_writes_a_rollback_snapshot_first(tmp_path):
+    """升级真的动了 schema 之前必须先留一份能退回去的库。
+
+    没有这一步，一次失败的迁移留下半套 schema，而唯一的选择是手改数据库——
+    那是观测系统里最不该发生的"只能靠人记着怎么修"的时刻。
+    """
+    migrations = tmp_path / "migrations"
+    shutil.copytree(MIGRATIONS_DIR, migrations)
+    path = tmp_path / "t.sqlite"
+
+    with Database(path, migrate=False) as db:
+        db.migrate(migrations)
+        db.execute(
+            "INSERT INTO provider(id, kind, base_url, api_style, created_at) VALUES('p','mock','','native','')"
+        )
+
+    (migrations / "0007_wider.sql").write_text(
+        "CREATE TABLE IF NOT EXISTS extra_note(id TEXT PRIMARY KEY, text TEXT NOT NULL);",
+        encoding="utf-8",
+    )
+    with Database(path, migrate=False) as db:
+        assert db.migrate(migrations) == [7]
+
+    snapshot = tmp_path / "backups" / f"pre-migration-v{EXPECTED_VERSION}.sqlite"
+    assert snapshot.exists(), "升级前必须留快照"
+    with Database(snapshot, migrate=False) as old:
+        assert old.version() == EXPECTED_VERSION, "快照是**升级前**的版本"
+        assert old.scalar("SELECT COUNT(*) FROM provider") == 1, "快照里数据完好才叫能退回"
+
+    # 再开一次不该又复制一份：同名快照就是那个回滚点
+    with Database(path, migrate=False) as db:
+        assert db.migrate(migrations) == []
+    assert sorted(p.name for p in (tmp_path / "backups").iterdir()) == [
+        f"pre-migration-v{EXPECTED_VERSION}.sqlite"
+    ]
+
+
+def test_empty_database_gets_no_snapshot(tmp_path):
+    """空库没有可回滚的东西：造一个 backups/ 目录只是噪音。"""
+    with Database(tmp_path / "fresh.sqlite") as db:
+        assert db.version() == EXPECTED_VERSION
+    assert not (tmp_path / "backups").exists()
+
+
+def test_memory_database_skips_snapshot(tmp_path, monkeypatch):
+    """`:memory:` 没有文件可拷——它必须在拼路径之前就返回，而不是往 cwd 写东西。"""
+    cwd_before = set(p.name for p in tmp_path.iterdir())
+    monkeypatch.chdir(tmp_path)
+
+    with Database(":memory:") as db:
+        assert db.version() == EXPECTED_VERSION
+
+    assert set(p.name for p in tmp_path.iterdir()) == cwd_before, "内存库不该留下文件"
+
+
 def test_backfill_only_runs_when_the_source_version_is_reachable(tmp_path):
     """回填型迁移的边界：跳级升级时它根本不会执行（前一个版本已被裁剪）。
 

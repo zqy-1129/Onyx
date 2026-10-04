@@ -172,7 +172,7 @@ class Outcome:
 
 @dataclass(frozen=True, slots=True)
 class DiskReport:
-    """`.data` 的体积现状：`db info`（以及后续 `doctor` 的磁盘项）从这里取数。"""
+    """`.data` 的体积现状：`db info` 与 `db sizes` 都从这里取数。"""
 
     db_bytes: int
     wal_bytes: int
@@ -399,6 +399,57 @@ def history(db: Database, *, limit: int = 10) -> list[dict[str, Any]]:
         "SELECT * FROM retention_run ORDER BY started_at DESC, id DESC LIMIT ?", (limit,)
     )
     return [dict(row) for row in rows]
+
+
+#: 算日均增速所需的最小时间跨度。两个相隔 72 秒的采样点当然能算出一个"每天数字"，
+#: 但那个数字是噪声除以时间——比"问不出来"更有害，因为它看起来像个测量结果。
+MIN_TREND_SPAN_DAYS = 1.0
+
+
+@dataclass(frozen=True, slots=True)
+class Trend:
+    """`.data` 体积曲线：采样点全部来自 `retention_run`。
+
+    没跑过 rotate 就是没有曲线——把"当前大小"当成趋势报出来，等于用一件事的快照
+    回答另一件事（会不会写满）的问题。
+    """
+
+    samples: int
+    points: tuple[tuple[str, int], ...]
+    span_days: float
+    per_day_bytes: float | None
+    latest_bytes: int
+
+    @property
+    def enough(self) -> bool:
+        return self.per_day_bytes is not None
+
+
+def footprint_trend(db: Database, *, limit: int = 200) -> Trend:
+    """按时间顺序取 blob 体积采样点，并算日均增速（跨度不足 1 天时拒绝给斜率）。"""
+    rows = db.query(
+        "SELECT started_at, bytes_after FROM retention_run ORDER BY started_at DESC, id DESC LIMIT ?",
+        (limit,),
+    )
+    points = tuple((str(row["started_at"]), int(row["bytes_after"])) for row in reversed(rows))
+    if len(points) < 2:
+        return Trend(
+            samples=len(points), points=points, span_days=0.0,
+            per_day_bytes=None, latest_bytes=points[-1][1] if points else 0,
+        )
+    first_at, first_bytes = points[0]
+    last_at, last_bytes = points[-1]
+    span = (datetime.fromisoformat(last_at) - datetime.fromisoformat(first_at)).total_seconds()
+    span_days = span / 86400
+    if span_days < MIN_TREND_SPAN_DAYS:
+        return Trend(
+            samples=len(points), points=points, span_days=span_days,
+            per_day_bytes=None, latest_bytes=last_bytes,
+        )
+    return Trend(
+        samples=len(points), points=points, span_days=span_days,
+        per_day_bytes=(last_bytes - first_bytes) / span_days, latest_bytes=last_bytes,
+    )
 
 
 def disk_report(db: Database, store: BlobStore) -> DiskReport:

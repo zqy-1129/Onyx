@@ -36,6 +36,7 @@ from onyx.store.repos import EvalRepo, ToolRepo, TraceRepo, UsageRepo
 from onyx.store.retention import (
     MAX_RECLAIM_RATIO,
     disk_report,
+    footprint_trend,
     history,
     parse_window,
     referenced_refs,
@@ -367,7 +368,74 @@ def test_vacuum_only_runs_when_something_was_deleted(db, store):
     assert idle.vacuum is False, "什么都没删就不该重写整个数据库文件"
 
 
-# ── CLI：onyx rotate / db info ─────────────────────────────────────
+# ── 体积曲线（`onyx db sizes` 的数据来源）──────────────────────────
+def _seed_run(db, *, started_at: str, before: int, after: int) -> None:
+    db.execute(
+        "INSERT INTO retention_run(id, started_at, finished_at, dry_run,"
+        " trace_after_d, raw_after_d, purge_traces, bytes_before, bytes_after)"
+        " VALUES(?,?,?,0,90,30,0,?,?)",
+        (new_trace_id(), started_at, started_at, before, after),
+    )
+
+
+def _hours_ago(hours: float) -> str:
+    reference = datetime.fromisoformat(NOW).astimezone(UTC)
+    return (reference - timedelta(hours=hours)).isoformat(timespec="microseconds")
+
+
+def test_trend_refuses_a_slope_from_a_two_minute_window(db):
+    """相隔 72 秒的两个点也"能"算出每天多少字节，但那是噪声除以时间。
+
+    一个荒谬的斜率比"问不出来"更有害：它看起来像测量结果。
+    """
+    _seed_run(db, started_at=_hours_ago(0.02), before=1_000, after=1_000)
+    _seed_run(db, started_at=NOW, before=1_000, after=1_400)
+
+    trend = footprint_trend(db)
+
+    assert trend.samples == 2
+    assert 0 < trend.span_days < 1, "跨度算对了，只是不够长"
+    assert trend.enough is False
+
+
+def test_trend_refuses_to_invent_a_slope(db):
+    """0 / 1 个采样点、以及同一时刻的两个点，都给不出日均增速。
+
+    硬算会得到 ±无穷大或一个凭空的斜率；而"照这个速度还能撑 N 天"这种话，
+    说错比不说更有害。
+    """
+    assert footprint_trend(db).enough is False
+
+    _seed_run(db, started_at=NOW, before=1000, after=1000)
+    assert footprint_trend(db).enough is False
+
+    _seed_run(db, started_at=NOW, before=2000, after=9000)
+    same_instant = footprint_trend(db)
+    assert same_instant.samples == 2 and same_instant.enough is False
+    assert same_instant.span_days == 0.0
+
+
+def test_trend_computes_a_daily_rate_and_keeps_the_latest_size(db):
+    _seed_run(db, started_at=_ago(10), before=1_000, after=1_000)
+    _seed_run(db, started_at=NOW, before=1_000, after=11_000)
+
+    trend = footprint_trend(db)
+
+    assert trend.enough is True
+    assert trend.samples == 2
+    assert trend.latest_bytes == 11_000
+    assert trend.per_day_bytes == pytest.approx(1_000.0)
+    assert trend.points[0][0] == _ago(10), "点必须按时间正序，否则曲线是反的"
+
+
+def test_trend_reports_shrinking_as_a_negative_rate(db):
+    _seed_run(db, started_at=_ago(5), before=9_000, after=9_000)
+    _seed_run(db, started_at=NOW, before=9_000, after=3_000)
+
+    assert footprint_trend(db).per_day_bytes == pytest.approx(-1_200.0)
+
+
+# ── CLI：onyx rotate / db info / db sizes ──────────────────────────
 @pytest.fixture
 def data_dir(tmp_path, monkeypatch):
     """数据目录进 tmp，命令默认的 <repo>/.data 一个字节都不许碰。"""
@@ -454,3 +522,51 @@ def test_db_info_says_whether_rotate_ever_ran(data_dir):
     after = _cli("db", "info")
     assert "dry-run" in after.output
     assert "rotate runs" in after.output
+
+
+def test_db_sizes_refuses_to_guess_a_trend(data_dir):
+    """一个采样点、或两个同一时刻的点，都不能推出"照这个速度还能撑 N 天"。"""
+    with Database(data_dir.db_path) as database:
+        _seed_run(database, started_at=NOW, before=1_000, after=1_000)
+
+    one_point = _cli("db", "sizes")
+    assert one_point.exit_code == 0, one_point.output
+    assert "问不出来" in one_point.output
+
+    with Database(data_dir.db_path) as database:
+        _seed_run(database, started_at=NOW, before=1_000, after=11_000)
+    same_instant = _cli("db", "sizes")
+    assert "问不出来" in same_instant.output, "两个点但同一时刻仍然给不出斜率"
+
+    with Database(data_dir.db_path) as database:
+        _seed_run(database, started_at=_ago(10), before=500, after=500)
+    grown = _cli("db", "sizes").output
+    assert "+1.0 KiB/天" in grown, grown
+    assert "还很充裕" in grown, "日均 1 KiB 不该报出'还能写 N 天'这种假精确"
+
+
+def test_db_sizes_gives_a_runway_when_the_disk_is_really_filling(data_dir):
+    """一天 10 GiB 的速度，任何单机都会在十年内写满——这时必须给出天数。"""
+    with Database(data_dir.db_path) as database:
+        _seed_run(database, started_at=_ago(2), before=0, after=0)
+        _seed_run(database, started_at=_ago(1), before=0, after=10 * 1024 ** 3)
+
+    urgent = _cli("db", "sizes").output
+
+    assert "还能写约" in urgent, urgent
+    assert "GiB/天" in urgent
+
+
+def test_db_sizes_json_is_machine_readable(data_dir):
+    with Database(data_dir.db_path) as database:
+        _seed_run(database, started_at=_ago(4), before=2_000, after=2_000)
+        _seed_run(database, started_at=NOW, before=2_000, after=6_000)
+
+    result = _cli("db", "sizes", "--json")
+
+    body = json.loads(result.output)
+    assert body["retention_runs"] == 2
+    assert body["trend"]["samples"] == 2
+    assert body["trend"]["per_day_bytes"] == pytest.approx(1_000.0)
+    assert body["now"]["total_bytes"] > 0
+    assert [p["bytes_after"] for p in body["trend"]["points"]] == [2_000, 6_000]
