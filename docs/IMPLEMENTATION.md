@@ -1815,6 +1815,86 @@ API：openapi 24 paths / 25 operations
 
 ---
 
+## S25 — Tool Bench 页：注册表 / 审计 / 开销 / 契约矩阵 / 运行历史 ✅
+
+**产出文件**
+```
+onyx/tools/matrix.py                  # 契约矩阵的构建处（CLI 的 --json 与 API 共用 as_dict）
+onyx/api/routes/tools.py              # GET /api/tools · /audit · /cost · /matrix · /runs
+onyx/runtime.py                       # build_tool_registry：注册表装配的唯一落点
+onyx/cli.py                           # tools contract 改为渲染 Matrix；tools run 写 tool_run 留痕
+onyx/tools/spec.py                    # cost_report：没传模板开销时 template_share 是 None 不是 0.0
+onyx/web/src/pages/ToolBench.tsx      # 五块面板 + 矩阵"点一次才跑"
+onyx/web/src/App.tsx                  # 第 7 个 rail 项 + /tools 路由
+onyx/web/src/{api/client,api/types}.ts
+tests/unit/test_tools_matrix.py（7）
+tests/unit/test_api_tools.py（11）
+tests/unit/test_cli_tools.py（+2 → 28）
+onyx/web/src/__tests__/toolBench.test.ts（9）
+```
+
+**先抽构建处再做界面**：契约矩阵的装配逻辑原本长在 `tools contract` 的命令体里
+（targets / 每列样本 / unavailable / pending / summarize）。看板要显示同一张矩阵，
+就得先把它抽成 `onyx/tools/matrix.py` —— 两处各写一遍的话，"CLI 说全过、界面说有一列挂了"
+这种分歧根本没法排查。抽取时一个既有测试把真差异顶了出来：内置 echo 有专用样本参数，
+而这个特例原本只看 `name == "echo"`，**必须连着出处一起判** —— 注册表里覆盖的同名 echo
+要用它自己的 examples，否则矩阵测的是内置定义、报告说的是注册版本。
+顺手把 `--args` 传非对象的情况从"每列都失败、看起来像执行器坏了"改成当场说清用法错。
+
+**注册表装配也只有一个落点**（`runtime.build_tool_registry`）：CLI 的 `_tool_registry`
+现在只负责挑 provider 档案与模型，计数档位与 `text_counter` 的接法在两处不再各写一份。
+工具库开销必须与 trace 归因的 `part=tool_defs` 是同一个量，否则"精简描述省了多少 token"
+这类结论会有两个版本。
+
+**做这一页时挖出来的真实缺口：`tool_run` 从来没有写入方。**
+表、`ToolRepo.insert_run/list_runs`、`retention` 里对 `tool_run.output_ref` 的保留规则、
+STATUS 里"运行历史"的位置全都存在，但没有任何一条路径写过一行 ——
+于是新面板会永远空着，而**空面板看起来像"没人试过"，真相是"试过的地方不记"**。
+现在 `onyx tools run` 会落一行（status / latency / 定义 hash / args 的键 / mock 档位），
+`deterministic`、`idempotent` 保持 None：跑一次测不出这两件事，填上就是猜。
+模型侧的调用不写这张表，它的证据是 trace + `tool_call`，面板 note 里把这句话写明。
+
+**三处"不许冒充"的形状**（都在 `ToolBench.tsx` 的纯函数里，被 vitest 钉住）
+- 矩阵一格只有三态：✓ 通过 / ✗ 失败 / `n/a` 不适用，**外加"这一列没跑"= `?`**。
+  没装 httpx 的 http 列进 `unavailable` 并带原因；`ollama_builtin` 进 `pending`。
+  两者都不许出现在 ✓ 里 —— 那等于把缺依赖写成质量保证。
+- 开销分两笔报：JSON 本身 + 模板脚手架。**没传 overhead 时占比是「—」不是 0%**
+  （`cost_report` 的这处修正是真 bug：原来 `0/(78)=0.0`，界面会读成"模板不花钱"，
+  而 P17 的实测结论恰恰相反）。
+- 未核算的工具 `tokens=None` → 「—」，不是 0 token。
+
+**本机验证**
+```bash
+uv run onyx tools import examples/tools.yaml --db .tmp/s25.sqlite   # 5 个工具，tokens=108..163
+uv run onyx tools run calculator --args '{"expr":"6*7"}' --db .tmp/s25.sqlite
+  → 留痕 : tool_run 01M43QNPNQZP…（表里真的有这一行，deterministic=None）
+uv run pytest   # 1216 passed, 1 skipped（S25 新增 19 条）
+uv run coverage run -m pytest -q && uv run coverage report   # 89%
+前端：tsc --noEmit · vitest 79 · vite build（228KB js）
+API：openapi 28 paths / 30 operations
+浏览器 #/tools（零 console 错误）：
+  注册表 5 行（类型/副作用/tokens/bytes/启用/hash）；
+  开销：JSON 本身 700 tok · 2,433 B / 模板脚手架 — / 每次请求实付 700 tok / 模板占比 — / 计数档位 heuristic + 提醒
+  审计：没有 error / warn 级问题 + "按当前注册表现算，不是历史快照"
+  矩阵点「跑一次」：4 列 × 8 断言，timeout_is_reported 在 mock 列是 n/a、
+    mock_policy_makes_no_real_call 在 python_fn 列是 n/a，ollama_builtin 整列 — 并标"未实现"；
+    样本出处 python_fn→echo / http→contract_http / mcp→contract_mcp，出处 builtin
+  运行历史：calculator ✓ ok · 确定性 — · 幂等 — · TRACE —（没猜成 ✓）
+```
+
+**没做以及为什么**：`tools fire` 不写 `tool_run`。它的证据已经是 trace + `tool_call`
+（带 parse_status / result_status / 参数与返回值），再抄一份进 tool_run 就是两个事实源；
+界面上"模型侧的调用"由 Traces 页承担，面板 note 里写明了这一点。
+
+**验收 DoD**：G3 里"工具审计/开销/契约矩阵/fire 结果目前只有 CLI"这条边界消失。
+
+**提交**：
+`refactor(tools): 契约矩阵从 CLI 抽成构建处（S25 第一步）`
+`feat(api): Tool Bench 读端点（S25 第二步）`
+`feat(web): Tool Bench 页 + tool_run 的写入方（S25 第三步）`
+
+---
+
 ## 附录 A — 每步自测速查
 
 | 步 | 命令 | 绿的条件 |
@@ -1843,6 +1923,7 @@ API：openapi 24 paths / 25 operations
 | S22 | `uv build && uv tool install --from dist/*.whl onyx`（隔离目录） | 干净环境装起来后 version / db init / chat / doctor 全通；CI 步数被测试钉住 |
 | S23 | 浏览器点「开始评测」＋另起进程占住 GPU 锁 | 提交立刻返回 run_id；进度逐条推进；等锁时看得见持有者与 ETA；取消后库里没有那条 run |
 | S24 | 浏览器导入 JSONL → 立刻用它发起评测 | run 记录里 `dataset_id`/`dataset_revision` 跟着结果走；覆盖旧 id 要显式确认；坏行报行号 |
+| S25 | 浏览器点 Tool Bench 的「跑一次」+ `onyx tools run` 后看看板 | 矩阵三态不互相冒充（n/a 与"没这列"都不是 ✓）；模板开销没传时占比是「—」；`tools run` 真的落 `tool_run` 一行 |
 | 门禁 | `make coverage`（`coverage run -m pytest -q`） | 离线套件分支覆盖率 ≥ 80%（S17 落地时 88%，S21 后 89%，S23 后仍 89%） |
 
 ## 附录 B — 架构自测（让"模块化"可验证，而非口号）

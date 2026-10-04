@@ -14,6 +14,8 @@ import pytest
 from typer.testing import CliRunner
 
 from onyx.cli import app
+from onyx.store.db import Database
+from onyx.store.repos import ToolRepo
 
 EXAMPLES = Path(__file__).resolve().parents[2] / "examples" / "tools.yaml"
 
@@ -182,6 +184,40 @@ def test_run_echo_returns_structured_success():
     assert "✓ ok" in result.output
     assert '"chars": 2' in result.output
     assert "耗时" in result.output
+
+
+def test_run_leaves_a_tool_run_record(tmp_path):
+    """`tool_run` 表、它的保留规则与看板的"运行历史"位置早就都有了，却没有写入方。
+
+    空面板看起来像"没人试过"，真相是"试过的地方不记"——那比没界面更坏，
+    因为它会让人以为这条证据不存在。
+    """
+    assert _run("tools", "run", "echo", "--args", '{"text": "hi"}').exit_code == 0
+    db = Database(tmp_path / "onyx.sqlite")
+    try:
+        rows = ToolRepo(db).list_runs(limit=5)
+    finally:
+        db.close()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.status == "ok" and row.tool_id == "echo"
+    assert row.tool_def_hash, "必须记下当时那份定义，否则事后无法复盘模型看到的是什么"
+    assert row.extra["arg_keys"] == ["text"]
+    # 跑一次测不出确定性与幂等，留 None 而不是猜一个 True
+    assert row.deterministic is None and row.idempotent is None
+
+
+def test_failed_run_records_the_error_kind(tmp_path):
+    """失败更要留痕：看板上"这工具最近老失败"必须是查得到的事。"""
+    result = _run("tools", "run", "echo", "--args", "{}")
+    assert result.exit_code == 1
+    db = Database(tmp_path / "onyx.sqlite")
+    try:
+        row = ToolRepo(db).list_runs(limit=5)[0]
+    finally:
+        db.close()
+    assert row.status == "arg_error" and row.error
+    assert "留痕" in result.output
 
 
 def test_run_reports_arg_error_with_a_nonzero_exit():

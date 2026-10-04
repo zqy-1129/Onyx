@@ -12,6 +12,7 @@ import { EvalRunsPage } from './pages/EvalRuns'
 import { FleetPage } from './pages/Fleet'
 import { ModelsPage } from './pages/Models'
 import { PlaygroundPage } from './pages/Playground'
+import { ToolBenchPage } from './pages/ToolBench'
 import { RegressionPage } from './pages/Regression'
 import { TracesPage } from './pages/Traces'
 import { TraceDetailPage } from './pages/TraceDetail'
@@ -29,6 +30,7 @@ const NAV: NavItem[] = [
   { path: '/playground', glyph: '▶', label: 'Playground' },
   { path: '/traces', glyph: '≡', label: 'Traces' },
   { path: '/usage', glyph: '∿', label: 'Token Ledger' },
+  { path: '/tools', glyph: '⚒', label: 'Tool Bench' },
   { path: '/eval', glyph: '◎', label: '评测' },
 ]
 
@@ -72,6 +74,8 @@ export function App() {
     content = <PlaygroundPage />
   } else if (page === 'usage') {
     content = <UsagePage />
+  } else if (page === 'tools') {
+    content = <ToolBenchPage />
   } else if (page === 'eval' && segments[1] === 'matrix') {
     content = <EvalMatrixPage />
   } else if (page === 'eval' && segments[1] === 'regression') {

@@ -439,6 +439,83 @@ export interface ComparisonView {
   cases: PairedCase[]
 }
 
+/** Tool Bench（S25）：注册表 / 审计 / 开销 / 契约矩阵 / 运行历史 */
+export interface ToolDefView {
+  name: string
+  version: number
+  kind: string
+  side_effect: string
+  /** null = 还没核算过，不是 0 token */
+  tokens: number | null
+  bytes: number | null
+  enabled: boolean
+  hash: string
+  impl_ref: string | null
+  timeout_ms: number | null
+  description: string
+  tags: string[]
+  n_examples: number
+}
+
+export interface ToolAuditFinding {
+  tool: string
+  rule: string
+  severity: string
+  message: string
+  fix: string
+  path: string
+  meaning: string
+}
+
+export interface ToolAuditView {
+  findings: ToolAuditFinding[]
+  counts: Record<string, number>
+  computed_at: string
+  note: string
+}
+
+export interface ToolCostView {
+  tools: Array<{ name: string; tokens: number; bytes: number; kind: string; side_effect: string }>
+  json_tokens: number
+  json_bytes: number
+  template_overhead_tokens: number
+  effective_tokens: number
+  /** null = 没传模板开销，占比问不出来（0% 会被读成"模板不花钱"） */
+  template_share: number | null
+  count_source: string
+  model: string
+  hint: string
+}
+
+export interface ToolMatrixView {
+  tool: string
+  source: string
+  assertions: string[]
+  valid_args: Record<string, unknown>
+  samples: Record<string, string>
+  sample_notes: Record<string, string>
+  executors: Record<string, Record<string, { passed: boolean; applicable: boolean; detail: string }>>
+  unavailable: Record<string, string>
+  pending: Record<string, string>
+  summary: Record<string, { passed: number; failed: number; not_applicable: number }>
+  failed: number
+}
+
+export interface ToolRunView {
+  id: string
+  tool_id: string | null
+  tool_def_hash: string | null
+  test_id: string | null
+  trace_id: string | null
+  status: string
+  started_at: string
+  latency_ms: number | null
+  error: string | null
+  deterministic: boolean | null
+  idempotent: boolean | null
+  output_ref: string | null
+}
+
 export interface GpuStatusView {
   busy: boolean
   owner: string | null

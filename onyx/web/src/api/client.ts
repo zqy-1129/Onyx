@@ -82,6 +82,11 @@ import type {
   RunView,
   SubmitView,
   TaskView,
+  ToolAuditView,
+  ToolCostView,
+  ToolDefView,
+  ToolMatrixView,
+  ToolRunView,
   TraceDetail,
   TracePage,
   UsageSummaryView,
@@ -122,6 +127,18 @@ export const api = {
       body: JSON.stringify(body),
     }),
   demoTools: () => request<{ tools: Array<{ key: string; name: string; description: string }> }>('/api/tools/demo'),
+  /** Tool Bench（S25）：注册表 / 审计 / 开销 / 契约矩阵 / 运行历史。全部只读，与 CLI 同源 */
+  toolDefs: (params: { enabled_only?: boolean; kind?: string | null } = {}) =>
+    request<ToolDefView[]>(`/api/tools${qs(params)}`),
+  toolAudit: (model?: string | null) =>
+    request<ToolAuditView>(`/api/tools/audit${qs({ model })}`),
+  toolCost: (params: { model?: string | null; overhead?: number } = {}) =>
+    request<ToolCostView>(`/api/tools/cost${qs(params)}`),
+  /** 矩阵会在离线样本上真跑一遍各执行器：给人点一次，不给界面轮询 */
+  toolMatrix: (params: { tool?: string; args?: string | null } = {}) =>
+    request<ToolMatrixView>(`/api/tools/matrix${qs(params)}`),
+  toolRuns: (params: { tool_id?: string | null; limit?: number } = {}) =>
+    request<ToolRunView[]>(`/api/tools/runs${qs(params)}`),
   unload: (name: string) =>
     request<{ ok: boolean }>(`/api/admin/models/unload${qs({ name, confirm: 1 })}`, {
       method: 'POST',

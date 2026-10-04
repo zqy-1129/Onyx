@@ -1876,6 +1876,47 @@ def tools_contract(
             database.close()
 
 
+def _record_tool_run(database, definition, result, *, mock: str, call_args) -> str | None:
+    """把一次手工试跑落进 `tool_run`。
+
+    这张表、它的 `output_ref` 保留规则与看板的"运行历史"位置早就有了，
+    但**从来没有写入方**——空面板看起来像"没人试过"，真相是"试过的地方不记"。
+    `deterministic` / `idempotent` 留 None：跑一次测不出这两件事，填上就是猜。
+    """
+    from onyx.core.clock import utc_now_iso
+    from onyx.core.ids import new_trace_id
+    from onyx.store.records import ToolRunRecord
+    from onyx.store.repos import ToolRepo
+
+    if definition is None:
+        return None
+    status = "ok" if result.ok else (result.error_kind or "error")
+    latency = (result.extra or {}).get("latency_ms")
+    record = ToolRunRecord(
+        id=new_trace_id(), tool_id=definition.name, tool_def_hash=definition.hash,
+        started_at=utc_now_iso(), status=str(status),
+        latency_ms=float(latency) if latency is not None else None,
+        error=None if result.ok else (result.error or "")[:500] or None,
+        deterministic=None, idempotent=None,
+        extra={
+            "mock": mock, "bytes": result.bytes, "mocked": bool(result.mocked),
+            "kind": str(definition.kind), "side_effect": str(definition.side_effect),
+            "arg_keys": sorted(call_args) if isinstance(call_args, dict) else [],
+        },
+    )
+    if database is not None:
+        ToolRepo(database).insert_run(record)
+        return record.id
+    # 内置定义那条路径上根本没有打开过的库（`_resolve_tool_def` 找不到注册定义时会关掉连接），
+    # 但留痕与"它来自注册表还是内置"无关：不写进默认库，这次试过的事情就彻底查不到了
+    own = Database(_db_path(_settings(), None))
+    try:
+        ToolRepo(own).insert_run(record)
+    finally:
+        own.close()
+    return record.id
+
+
 @tools_app.command("run")
 def tools_run(
     tool: str = typer.Argument(..., help="工具名（内置或已注册）"),
@@ -1932,6 +1973,9 @@ def tools_run(
             if result.extra.get("detail"):
                 typer.echo(f"细节      : {_json.dumps(result.extra['detail'], ensure_ascii=False, default=str)}")
         typer.echo(f"耗时      : {result.extra.get('latency_ms', '—')} ms")
+        run_id = _record_tool_run(database, definition, result, mock=mock, call_args=call_args)
+        if run_id:
+            typer.echo(f"留痕      : tool_run {run_id}（看板 Tool Bench → 运行历史）")
         if not result.ok:
             raise typer.Exit(1)
     finally:
