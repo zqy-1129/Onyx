@@ -17,6 +17,7 @@ from .records import (
     UsageRecord,
 )
 from .repos import ModelRepo, TraceRepo, UsageRepo
+from .retention import DiskReport, Outcome, disk_report, history, parse_window, sweep
 from .sinks import (
     EventFanout,
     EventSink,
@@ -31,6 +32,7 @@ from .sinks import (
 __all__ = [
     "AnomalyRecord",
     "Database",
+    "DiskReport",
     "EventFanout",
     "EventSink",
     "JsonlEventSink",
@@ -38,6 +40,7 @@ __all__ = [
     "ModelRepo",
     "NullEventSink",
     "NullRecordSink",
+    "Outcome",
     "ProviderRecord",
     "RecordFanout",
     "RecordSink",
@@ -50,4 +53,8 @@ __all__ = [
     "UsageRecord",
     "UsageRepo",
     "discover_migrations",
+    "disk_report",
+    "history",
+    "parse_window",
+    "sweep",
 ]

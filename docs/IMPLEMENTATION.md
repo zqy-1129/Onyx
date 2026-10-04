@@ -1315,6 +1315,63 @@ onyx tools fire --tools demo__weather --mock live --expect-args '{"city":"北京
 
 ---
 
+## S17 — 数据生命周期：`onyx rotate` + 覆盖率门禁（M7 第一步）✅
+
+**产出文件**
+```
+onyx/store/retention.py                    # parse_window / sweep / history / disk_report
+onyx/store/migrations/0006_retention.sql   # retention_run：保留策略自己的留痕表
+onyx/core/content.py                       # BlobStore 维护面：delete / iter_refs / total_bytes
+onyx/cli.py                                # onyx rotate（默认 dry-run）+ db info 体积现状
+pyproject.toml / Makefile                  # 第五道门禁：coverage fail_under=80（branch）
+tests/unit/test_retention.py（22）+ test_content.py（+5）
+```
+
+**设计取舍（都是"删错了回不来"逼出来的）**
+- **分数永久、证据有限期**：摘的是 `raw_request_ref / raw_response_ref / rendered_prompt_ref /
+  tool_call.result_ref / tool_run.output_ref` 五列重 payload；trace 行与 messages/tools/output 留着，
+  下钻与 `traces replay` 不受影响。删行只在 `--purge-traces` 时发生，且被
+  `grade.trace_id / tool_run.trace_id / trace.eval_run_id` 引用的行永不删除。
+- **dry-run 与 apply 共用一段代码**：dry-run 真的执行删除，只在事务末尾回滚，文件一个都不碰。
+  估算与删除各写一套，迟早会对不上——而"报得出会删多少"是这个命令的全部价值。
+- **事实与估算分列**：审计表的 `refs_cleared / traces_deleted / blobs_deleted` 写**事实**
+  （dry-run 与被拦下时都是 0），估算只活在 `per_rule` 与 `detail_json`。混在一起等于让审计表说谎。
+- **回收上限**：单次回收超过现有 blob 体积 60% 直接拦住（退出码非 0，且真的什么都没动），
+  要人明确加 `--force`。文件删除严格排在事务提交之后——反过来的顺序会留下
+  "引用还在、文件已没了"的证据空洞。
+- **字节口径统一**：`stat().size`、`delete()` 返回值、`total_bytes()` 都只算内容，不含 media 侧车与
+  `.tmp`。曾经"释放了多少"与"盘上小了多少"两个数对不上，而它们都自称 blob 体积。
+- `iter_refs()` 只承认 `sha256:<64 hex>` 的文件名：目录里被人放一个 README 不该变成"一个可回收的 blob"。
+
+**覆盖率门禁（本步同时落地）**：`coverage run -m pytest`（离线套件，branch 覆盖）+ `fail_under=80`，
+实测基线 **88%**（1018 项离线用例；最低的是 `probe/checks.py` 17%，那些只在 `-m live/probe` 里跑）。
+留 8 个点余量：贴线的门禁会在下一次正常改动时被绕过。
+
+**自测（全部实际执行）**
+```bash
+uv run pytest                         # 1018 passed, 1 skipped
+uv run ruff check . && uv run lint-imports     # clean / 3 kept
+uv run coverage run -m pytest -q && uv run coverage report    # 88% ≥ 80%
+uv run python scripts/check_extension_boundary.py --staged    # ✓ 未触碰受保护内核
+
+uv run onyx rotate                    # 真机 .data：dry-run，报出 6 个无人引用的 blob / 955 B
+uv run onyx rotate --json             # 机器可读，dry_run=true、refs_cleared=0
+uv run onyx db info                   # .data 合计 + oldest trace + dangling 0 + rotate 留痕一行
+```
+`--apply` 端到端在 `tests/unit/test_retention.py` 里用**真实 FileBlobStore（临时目录 + 真文件）**验的，
+没有拿仓库的 `.data` 做删除实验。
+
+**顺带查出来的一个真实泄漏**：`TOOL_EXEC_START` 事件带 `args_ref`（loop 写了 blob），
+但 schema 里没有任何列存它（`tool_call` 存的是内联 `args_json`）⇒ 每次工具循环泄漏一个小 blob。
+真机 dry-run 报出的 6 个孤儿就是它。保留策略能把它们回收掉，但**正确的修法是别再写或者把它落库**，
+记在这里，别让它在"rotate 能删孤儿"的表象下变成永久行为。
+
+**验收 DoD**：M7 出口判据的 rotate 一半（可 dry-run、落库审计、报得出释放多少字节）。
+
+**提交**：`feat(store): 数据生命周期 onyx rotate —— 分数永久证据有限期 + 覆盖率门禁 80%`
+
+---
+
 ## 附录 A — 每步自测速查
 
 | 步 | 命令 | 绿的条件 |
@@ -1335,6 +1392,8 @@ onyx tools fire --tools demo__weather --mock live --expect-args '{"city":"北京
 | S14 | `onyx eval run --task tool_selection --k 3` | skip 带原因；resume 不重复计费 |
 | S15 | `onyx eval compare A B` | 配对净变化 + CI；n 小有警告 |
 | S16 | `scripts/check_extension_boundary.sh` | 接入新 provider/task 未碰内核 |
+| S17 | `onyx rotate && onyx rotate --apply` | 默认不删任何东西；两次数字一致；每次运行有留痕 |
+| 门禁 | `make coverage`（`coverage run -m pytest -q`） | 离线套件分支覆盖率 ≥ 80%（基线 88%） |
 
 ## 附录 B — 架构自测（让"模块化"可验证，而非口号）
 

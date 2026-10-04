@@ -39,6 +39,7 @@ uv run onyx db init         # 初始化 .data/onyx.sqlite
 | M4 评测 | ✅ | 评测内核（task/grade/runner + 指标层 + bootstrap CI）· 6 个评分器 + 类型感知参数比对 · 236 条中文意图集 + 97 条工具调用集 · `intent_classification` 与 `tool_selection` 各一次真机运行 · BFCL 导入器 · GPU 独占锁（跨进程 + 心跳 + ETA），eval/Playground/live 测试互相排队 |
 | M5 对比 | ✅ | 模型 × 任务矩阵 + 配对回归 diff（净改善/净劣化 + 配对 bootstrap CI + 劣化清单）· Eval / 矩阵 / 回归三页已在真实浏览器实测 · md/csv/自包含 html 报告导出 · 每次运行带数据集来历 |
 | M6 扩展 | ✅ | 六个扩展点接 entry points（一处实现语义：坏插件隔离 + 失败可见 + 同名覆盖可查）· 两个真外部插件样板（任务 / provider）· 第二 provider：OpenAI 兼容通道（vLLM / LM Studio / Ollama `/v1`）· MCP 执行器（stdio + JSON-RPC，纯 stdlib）· OTLP 导出 sink · provider/sink/插件三套契约测试 · `scripts/check_extension_boundary.py` 把"接实现不改内核"变成构建门禁 |
+| M7 跑得住 | 🚧 | **S17 ✅** `onyx rotate`：默认 dry-run、只摘五列重 payload（分数指向的 trace 行永不删）、回收无主 blob、每次运行落 `retention_run` 留痕、单次回收超 60% 直接拦住 · 第五道质量门：离线套件分支覆盖率 ≥ 80%（基线 88%）· 待做：`db backup/verify-backup`、`doctor` 磁盘余量与 tokenizer 档位 |
 
 **M3 执行层的核心保证**（`onyx tools contract`，离线、零真实网络）：
 8 条契约断言在 3 个执行器上全部适用并通过（各列的 n/a 都写明原因）；
@@ -106,6 +107,11 @@ tool 消息**——少一条，之后每次请求的上下文都永久错位，�
 顺带立了另一条：**隔离机制会掩盖故障**，所以坏插件不再只是"跳过"——
 它进台账，`onyx plugins` / `onyx eval tasks` 会打印出来并以退出码 1 结束，
 `onyx doctor` 也多了一项体检。只隔离不报告，等于把"插件没生效"伪装成"插件正常工作"。
+
+**第五道质量门是覆盖率**（`make coverage`）：离线套件分支覆盖 **≥ 80%**，基线实测 88%。
+门禁挂在门禁上而不是文档里——`fail_under` 让 `coverage report` 直接以非 0 退出。
+用分支覆盖而不是语句覆盖，是因为这个项目的正确性大量住在 `if x is None` 的分岔上
+（"未知"与"没有"必须走两条路），只数语句会让"两岔只走过一岔"的文件显得很像样。
 
 **M1 已在真机达成**：`onyx chat` 一次对话即落库完整 trace —— 引擎计数（in=19/out=47，
 source=engine，confidence=high）、分段归因（`msg:0=8 + template_ctl=11 == 19`，

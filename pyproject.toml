@@ -11,7 +11,7 @@ tokens = ["minja>=0.3", "tokenizers>=0.20", "gguf>=0.10"]
 api = ["fastapi>=0.115", "uvicorn[standard]>=0.30", "pydantic>=2.7"]
 bench = ["rapidfuzz>=3.9", "datasets>=3.0"]
 analysis = ["duckdb>=1.1"]
-dev = ["pytest>=8.3", "pytest-asyncio>=0.24", "ruff>=0.6", "import-linter>=2.0", "respx>=0.21"]
+dev = ["pytest>=8.3", "pytest-asyncio>=0.24", "ruff>=0.6", "import-linter>=2.0", "respx>=0.21", "coverage>=7.6"]
 
 [project.scripts]
 onyx = "onyx.cli:main"
@@ -51,6 +51,27 @@ ignore = ["E501", "RUF001", "RUF002", "RUF003"]
 "onyx/api/**/*.py" = ["B008"]
 # 测试里故意制造异常与畸形输入
 "tests/**/*.py" = ["BLE001", "B017"]
+
+[tool.coverage.run]
+source = ["onyx"]
+# 分支覆盖：本项目大量正确性在 `if ... is None` 这类分岔上（未知≠0），
+# 只数"语句有没有被执行"会让"两岔只走过一岔"的文件看起来覆盖率很高
+branch = true
+
+[tool.coverage.report]
+# 门禁是 80%，但**必须用离线套件量**：CI 机器上不一定有 Ollama。
+# 基线（2026-10-04，离线 1018 项 / 分支覆盖）= 88%，最低的是 probe/checks 17%
+# （那些代码只在 `-m live` / `-m probe` 里跑，离线量不到）。
+# 留 8 个点的余量：低到刚好贴线的门禁会在下一次正常改动时被绕过。
+fail_under = 80
+show_missing = true
+skip_covered = false
+exclude_lines = [
+  "pragma: no cover",
+  "if TYPE_CHECKING:",
+  "raise NotImplementedError",
+  "if __name__ == .__main__.:",
+]
 
 [tool.importlinter]
 root_packages = ["onyx"]

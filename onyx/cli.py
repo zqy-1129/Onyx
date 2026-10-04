@@ -17,6 +17,14 @@ from onyx import __version__
 from onyx.eval.task import HEADLINE_METRICS
 from onyx.settings import Settings, load_settings
 from onyx.store.db import Database
+from onyx.store.retention import (
+    DEFAULT_RAW_AFTER,
+    DEFAULT_TRACE_AFTER,
+    MAX_RECLAIM_RATIO,
+    DiskReport,
+    disk_report,
+    sweep,
+)
 
 app = typer.Typer(
     name="onyx",
@@ -166,17 +174,29 @@ def db_init(
 def db_info(
     db: Path = typer.Option(None, "--db", help="数据库路径"),
 ) -> None:
-    """打印 schema 版本、表清单与行数。"""
+    """打印 schema 版本、表清单、行数与 `.data` 体积现状。"""
+    from onyx.core.content import FileBlobStore
+
     settings = _settings()
     path = _db_path(settings, db)
     if not path.exists():
         typer.echo(f"数据库不存在: {path}（先跑 onyx db init）", err=True)
         raise typer.Exit(1)
     database = Database(path)
+    report = disk_report(database, FileBlobStore(settings.blob_dir))
     typer.echo(f"path           : {path}")
     typer.echo(f"schema_version : {database.version()}")
     typer.echo(f"size           : {path.stat().st_size / 1024:.1f} KiB")
-    typer.echo(f"blobs          : {_blob_count(settings)}")
+    # 一个体积口径只有一处来源：曾经同时打印"文件数/总字节"与"内容字节"两个数，
+    # 两个都自称 blob 体积却对不上（侧车与 .tmp 的差），读的人不知道该信谁。
+    typer.echo(
+        f".data 合计       : {_fmt_bytes(report.total_bytes)}"
+        f"（db {_fmt_bytes(report.db_bytes)} + wal {_fmt_bytes(report.wal_bytes)}"
+        f" + blob {_fmt_bytes(report.blob_bytes)} / {report.blob_files} 个）"
+    )
+    typer.echo(f"oldest trace     : {report.oldest_trace_at or '—'}")
+    typer.echo(f"dangling refs    : {report.dangling_refs}")
+    typer.echo(f"rotate runs      : {report.retention_runs}{_last_rotate(report)}")
     typer.echo("tables         :")
     for name in database.table_names():
         if name == "schema_version":
@@ -187,12 +207,120 @@ def db_info(
     database.close()
 
 
-def _blob_count(settings: Settings) -> str:
-    if not settings.blob_dir.exists():
-        return "0 files / 0 B"
-    files = [p for p in settings.blob_dir.rglob("*") if p.is_file()]
-    total = sum(p.stat().st_size for p in files)
-    return f"{len(files)} files / {total / 1024:.1f} KiB"
+def _last_rotate(report: DiskReport) -> str:
+    """最近一次保留策略运行的一行摘要；从没跑过就明说"从没跑过"。"""
+    if report.last_run is None:
+        return "（从没跑过 onyx rotate——.data 会一直长）"
+    run = report.last_run
+    if run["dry_run"]:
+        return (
+            f"，最近 {run['started_at'][:19]} · dry-run"
+            f" · 算出 {run['orphans_found']} 个可回收 blob（没删任何东西）"
+        )
+    freed = max(0, int(run["bytes_before"]) - int(run["bytes_after"]))
+    return (
+        f"，最近 {run['started_at'][:19]} · apply"
+        f" · 摘引用 {run['refs_cleared']} · 删 blob {run['blobs_deleted']}"
+        f" · 释放 {_fmt_bytes(freed)}"
+    )
+
+
+# ── rotate（数据生命周期）───────────────────────────────────────────
+@app.command()
+def rotate(
+    raw_after: str = typer.Option(
+        DEFAULT_RAW_AFTER, "--raw-after",
+        help="超出这个窗口的原始 body / 渲染 prompt / 工具返回值引用会被摘掉（行保留）",
+    ),
+    trace_after: str = typer.Option(
+        DEFAULT_TRACE_AFTER, "--trace-after",
+        help="trace 行的保留窗口，只有配合 --purge-traces 才生效",
+    ),
+    apply: bool = typer.Option(False, "--apply", help="真的删除；不加这个 flag 就只是算一遍"),
+    purge_traces: bool = typer.Option(
+        False, "--purge-traces", help="删除超窗且没被任何结论引用的 trace 行",
+    ),
+    vacuum: bool = typer.Option(
+        False, "--vacuum", help="删过东西之后 VACUUM 数据库（重写整个 .sqlite）",
+    ),
+    force: bool = typer.Option(
+        False, "--force", help=f"允许单次回收超过 {int(MAX_RECLAIM_RATIO * 100)}% 的 blob 体积",
+    ),
+    json_out: bool = typer.Option(False, "--json", help="机器可读输出"),
+    db: Path = typer.Option(None, "--db", help="数据库路径"),
+) -> None:
+    """保留策略：**默认 dry-run**，只报"会删多少"，一个字节都不碰。
+
+    分数永久、证据有限期：摘的是重 payload 的引用，trace 行与 messages/output 留着；
+    被 grade / tool_run / eval_run 引用的 trace 永不删行。每次运行（含 dry-run）都落
+    `retention_run`，所以"三周前那次原始 body 怎么没了"有记录可查。
+    """
+    import json as _json
+
+    from rich.console import Console
+
+    from onyx.core.content import FileBlobStore
+
+    settings = _settings()
+    path = _db_path(settings, db)
+    if not path.exists():
+        typer.echo(f"数据库不存在: {path}（先跑 onyx db init）", err=True)
+        raise typer.Exit(1)
+    with Database(path) as database:
+        store = FileBlobStore(settings.blob_dir)
+        try:
+            result = sweep(
+                database, store,
+                raw_after=raw_after, trace_after=trace_after,
+                purge_traces=purge_traces, dry_run=not apply, force=force, vacuum=vacuum,
+            )
+        except ValueError as exc:
+            typer.echo(f"窗口写法不对：{exc}", err=True)
+            raise typer.Exit(2) from exc
+
+    if json_out:
+        typer.echo(_json.dumps(result.as_dict(), ensure_ascii=False, indent=2))
+        raise typer.Exit(1 if result.blocked else 0)
+
+    console = Console()
+    verb = "已" if result.applied else "预计"
+    console.print(
+        f"[bold]{'apply' if result.applied else 'dry-run'}[/] · "
+        f"raw>{raw_after} 行>{trace_after} · cutoff "
+        f"{result.raw_cutoff[:19]} / {result.trace_cutoff[:19]}"
+    )
+    console.print(
+        f"引用摘除 : {verb} {sum(result.per_rule.values())} 处"
+        f"（{', '.join(f'{k} {v}' for k, v in result.per_rule.items() if v)}）"
+    )
+    console.print(
+        f"blob 回收 : {verb} {result.orphans_found} 个 / "
+        f"{_fmt_bytes(result.reclaimable_bytes)}"
+        f"（盘上无人引用的 blob，含崩溃残留）"
+    )
+    console.print(
+        f"trace 行  : 窗口内 {result.traces_aged} 条 · {verb}删除 {result.traces_deleted} 条"
+        f"（连带子表 {result.child_rows_deleted} 行）· 被结论保护 {result.protected_kept} 条"
+    )
+    console.print(
+        f"体积      : {_fmt_bytes(result.bytes_before)} → {_fmt_bytes(result.bytes_after)}"
+        f" · 本次释放 {_fmt_bytes(result.freed_bytes)}"
+        f" · 引用悬空 {result.dangling_refs} 个"
+    )
+    console.print(f"[dim]留痕      : retention_run {result.run_id}[/dim]")
+    if not result.applied:
+        console.print("[yellow]未删除任何东西。确认数字后加 --apply。[/yellow]")
+    if result.blocked:
+        console.print(f"[red]✗ 被拦住：{result.blocked}[/red]")
+    raise typer.Exit(1 if result.blocked else 0)
+
+
+def _fmt_bytes(value: int) -> str:
+    """体积口径统一：KiB/MiB/GiB 二选一按大小走，0 就写 0 B（空目录不是"未知"）。"""
+    for unit, scale in (("GiB", 1024 ** 3), ("MiB", 1024 ** 2), ("KiB", 1024)):
+        if value >= scale:
+            return f"{value / scale:.1f} {unit}"
+    return f"{value} B"
 
 
 # ── doctor ─────────────────────────────────────────────────────────

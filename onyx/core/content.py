@@ -36,12 +36,37 @@ class BlobStat:
 
 @runtime_checkable
 class BlobStore(Protocol):
-    """可替换：本地目录 / 只读快照 / 对象存储都实现这四个方法即可。"""
+    """可替换：本地目录 / 只读快照 / 对象存储实现这七个方法即可。
+
+    后三个是**维护面**（`onyx/store/retention.py` 依赖它）：只读镜像可以枚举
+    （列前缀）却删不掉，那种实现让 `delete` 抛 `NotImplementedError` 即可——
+    静默返回 0 会让保留策略以为"回收成功"，而磁盘照样在长。
+    """
 
     def put(self, data: bytes | str, *, media: str = "application/octet-stream") -> str: ...
     def get(self, ref: str) -> bytes: ...
     def exists(self, ref: str) -> bool: ...
     def stat(self, ref: str) -> BlobStat: ...
+
+    def delete(self, ref: str) -> int:
+        """删掉一个 blob，返回**释放的字节数**（0 = 本来就不存在）。
+
+        为什么要返回字节：保留策略要说清"这次回收了多少空间"，
+        而"文件已删"与"空间已回收"在只读快照/对象存储上可以不是同一回事。
+        """
+        ...
+
+    def iter_refs(self) -> list[str]:
+        """盘上现有的 ref（含没人引用的孤儿）。"""
+        ...
+
+    def total_bytes(self) -> int:
+        """blob 内容字节总量，用于回答"这次真的变小了吗"。
+
+        与 `stat().size`、`delete()` 同一口径（不含元数据侧车），
+        否则"释放了多少"和"盘上小了多少"会对不上。
+        """
+        ...
 
 
 class FileBlobStore:
@@ -109,15 +134,39 @@ class FileBlobStore:
         return BlobStat(ref=ref, size=path.stat().st_size, media=media, path=path)
 
     # ── 维护 ──────────────────────────────────────────────────────
+    def delete(self, ref: str) -> int:
+        path = self._path_for(ref)  # 非法 ref 在这里就炸，绝不拿它去拼路径删文件
+        if not path.exists():
+            return 0
+        size = path.stat().st_size
+        path.unlink()
+        sidecar = self._sidecar(path)
+        if sidecar.exists():
+            sidecar.unlink()  # 侧车留着就是垃圾：它的存在与否不能影响下一个同内容 blob
+        return size
+
     def iter_refs(self) -> list[str]:
         out: list[str] = []
         for path in self.root.rglob("*"):
-            if path.is_file() and not path.name.endswith((".tmp", ".meta.json")):
+            if not path.is_file() or path.name.endswith((".tmp", ".meta.json")):
+                continue
+            # 只承认形如 sha256:<64 hex> 的文件名：目录里被人放过一个 README 不算 blob，
+            # 把它当 blob 会让回收步骤拿着非法 ref 去删。
+            if _REF_RE.match(f"sha256:{path.name}"):
                 out.append(f"sha256:{path.name}")
         return out
 
     def total_bytes(self) -> int:
-        return sum(p.stat().st_size for p in self.root.rglob("*") if p.is_file())
+        """blob 内容字节，**不含** media 侧车与 `.tmp`。
+
+        口径必须与 `stat().size`、`delete()` 的返回值一致，否则"这次回收了多少"
+        和"盘上小了多少"两个数字对不上——在计量产品里这种对不上比不准更伤信任。
+        """
+        return sum(
+            p.stat().st_size
+            for p in self.root.rglob("*")
+            if p.is_file() and not p.name.endswith((".meta.json", ".tmp"))
+        )
 
     # ── 内部 ──────────────────────────────────────────────────────
     def _path_for(self, ref: str) -> Path:
@@ -177,6 +226,19 @@ class MemoryBlobStore:
     def stat(self, ref: str) -> BlobStat:
         raw = self.get(ref)
         return BlobStat(ref=ref, size=len(raw), media=self._media.get(ref, ""), path=Path(ref))
+
+    def delete(self, ref: str) -> int:
+        if not _REF_RE.match(ref or ""):
+            raise InvalidBlobRef(f"非法 blob ref: {ref!r}", detail={"ref": ref})
+        raw = self._data.pop(ref, None)
+        self._media.pop(ref, None)
+        return len(raw) if raw is not None else 0
+
+    def iter_refs(self) -> list[str]:
+        return list(self._data)
+
+    def total_bytes(self) -> int:
+        return sum(len(raw) for raw in self._data.values())
 
     def __len__(self) -> int:
         return len(self._data)

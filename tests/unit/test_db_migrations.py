@@ -15,7 +15,7 @@ def db(tmp_path) -> Database:
 
 #: 仓库里的迁移数量。新增迁移时这个数会变，测试随之更新——
 #: 它是"迁移有没有被意外删掉/改名"的一道哨兵
-EXPECTED_VERSION = 5
+EXPECTED_VERSION = 6
 
 
 def test_fresh_db_applies_migrations(db):
@@ -23,7 +23,8 @@ def test_fresh_db_applies_migrations(db):
     tables = set(db.table_names())
     assert {"provider", "model", "trace", "usage", "usage_alt", "token_part", "tool_call",
             "anomaly", "tool_def", "tool_test", "tool_run",
-            "dataset", "eval_case", "eval_task", "eval_run", "grade"} <= tables
+            "dataset", "eval_case", "eval_task", "eval_run", "grade",
+            "retention_run"} <= tables
     columns = {r["name"] for r in db.query("PRAGMA table_info(usage)")}
     assert {"prefill_mode", "prefill_ms_per_token"} <= columns, "P11 的冷/热分列必须落库"
 
@@ -144,7 +145,7 @@ def test_dataset_provenance_is_backfilled_for_existing_runs(tmp_path):
             )
 
     with Database(path, migrate=False) as db:
-        assert db.migrate(MIGRATIONS_DIR) == [5], "只应用 0005"
+        assert db.migrate(MIGRATIONS_DIR) == [5, 6], "0005 回填 + 0006 留痕表都要应用上"
         run = EvalRepo(db).get_run("run-old")
         assert run is not None
         assert run.dataset_id == "intent_zh-v1", "历史 run 的数据集必须被回填出来"

@@ -1,7 +1,7 @@
 # Onyx 常用命令。Windows 无 make 时，直接用等价的 `uv run ...`（见每行注释）。
 UV := uv run --extra dev --extra runtime
 
-.PHONY: sync test test-live probe lint format typecheck dev doctor db-init clean
+.PHONY: sync test test-live probe coverage lint format typecheck dev doctor db-init clean
 
 sync:            ## 安装依赖（含 dev/runtime extras）
 	$(UV) python -c "print('deps ok')"
@@ -18,6 +18,10 @@ probe:           ## 语义实测（写 docs/PROBES.md）	→ uv run pytest -m pr
 lint:            ## 代码风格 + 架构边界契约		→ uv run ruff check . && uv run lint-imports
 	$(UV) ruff check .
 	$(UV) lint-imports
+
+coverage:         ## 覆盖率门禁（离线套件，fail_under=80）	→ uv run coverage run -m pytest -q && uv run coverage report
+	$(UV) coverage run -m pytest -q
+	$(UV) coverage report
 
 format:          ## 自动修复可修项			→ uv run ruff check --fix .
 	$(UV) ruff check --fix .
