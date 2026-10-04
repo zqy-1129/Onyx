@@ -1372,6 +1372,57 @@ uv run onyx db info                   # .data 合计 + oldest trace + dangling 0
 
 ---
 
+## S18 — 可验证备份 + doctor 具名报告（M7 第二步）✅
+
+**产出文件**
+```
+onyx/store/backup.py            # create_backup / verify_backup / manifest
+onyx/store/db.py                # Database.backup_to —— 在线备份 API，不是 cp
+onyx/cli.py                     # onyx db backup --to / db verify-backup [+ --json]
+                                # doctor 的 blob 项改用统一引用清单并指名道姓
+tests/unit/test_backup.py（18）
+```
+
+**为什么不是 `cp .data/onyx.sqlite`**
+- **WAL 下直接拷主文件会安静地少一段**：最近的事务可能还在 `-wal` 里，拷出来的库
+  打开不报错、行数还"看着合理"。必须用 `Connection.backup()` 取一致快照，
+  且整个过程持有单写者锁。测试 `test_backup_contains_rows_still_in_the_wal` 盯的就是这条。
+- **备份必须一个文件就能恢复**：源库的头一页写着 WAL，复制出来的目标也是 WAL——
+  那等于宣称可恢复却还依赖一个没被拷走的 `-wal`。落地时切回 DELETE 日志模式。
+- **只备库不算备过**：证据在 blob 目录里。备份装的是**被引用到的** blob（孤儿不占体积），
+  verify 检查"备份库里的每个引用都能在备份里解析"——只备库不备证据的备份就是这样暴露的。
+- **备份会在没人看的时候坏**：verify 逐字节重算每个 blob 的 sha256 与文件名比对
+  （内容寻址在这里免费提供了一个完整性校验器），并对「ref+大小」集合取摘要，
+  于是"备份目录被动过 / 备份没做完"和"少了一个文件"是两条不同的具名检查。
+- **备份之后库又长了数据不是错误**：`drift` 单独报"备份点之后当前库多出多少行"，
+  而 `manifest.unresolved_refs` 会留下"备份当时就有 N 个引用解析不了"——
+  证据在备份之前就丢了，备份修不回它，只能如实带上这件事。
+- 目标目录已有备份 ⇒ 拒绝覆盖并退出 1：覆盖一个恢复点通常要等到真需要恢复时才发现。
+
+**顺带补上 S7 承诺的另一半**：`doctor` 的 blob 完整性项以前只看 `raw_response_ref`，
+现在与 `rotate` 共用同一份引用清单（`ALL_REF_COLUMNS`），并把缺的 ref **指名道姓**列出来。
+"3/5 可解析"会让人去猜是哪两个没了。
+
+**自测（全部实际执行）**
+```bash
+uv run pytest                        # 1036 passed, 1 skipped
+uv run ruff check . && uv run lint-imports    # clean / 3 kept
+uv run onyx db backup --to .tmp/backup-s18    # 真机：1231 个 blob / 469.6 KiB / 17 张表 16619 行
+uv run onyx db verify-backup .tmp/backup-s18  # 9 项检查全 ✓，退出码 0
+uv run onyx db verify-backup ... --json       # ok=true / checks=8 / drift.current_refs=1231
+
+cp -r .data .tmp/data-copy && rm .tmp/data-copy/blobs/00/20/... # 在副本上人为删一个 blob
+ONYX_DATA_DIR=.tmp/data-copy uv run onyx doctor                 # ✗ blob 引用完整 1230/1231
+                                                                #   缺：sha256:00…  退出码 1
+```
+真机那次备份正好验证了 S17 报出的 6 个孤儿：盘上 1237 个文件，备份只装 1231 个被引用的。
+
+**验收 DoD**：M7 出口判据的备份一半（备份可验证恢复；人为破坏后 doctor 报出具体 ref，不是笼统 500）。
+
+**提交**：`feat(store): 可验证备份 db backup/verify-backup —— WAL 一致快照 + blob 逐字节校验`
+
+---
+
 ## 附录 A — 每步自测速查
 
 | 步 | 命令 | 绿的条件 |
@@ -1393,6 +1444,7 @@ uv run onyx db info                   # .data 合计 + oldest trace + dangling 0
 | S15 | `onyx eval compare A B` | 配对净变化 + CI；n 小有警告 |
 | S16 | `scripts/check_extension_boundary.sh` | 接入新 provider/task 未碰内核 |
 | S17 | `onyx rotate && onyx rotate --apply` | 默认不删任何东西；两次数字一致；每次运行有留痕 |
+| S18 | `onyx db backup --to D && onyx db verify-backup D` | 9 项检查全绿；人为删一个 blob 后 verify 与 `doctor` 都报出具体 ref |
 | 门禁 | `make coverage`（`coverage run -m pytest -q`） | 离线套件分支覆盖率 ≥ 80%（基线 88%） |
 
 ## 附录 B — 架构自测（让"模块化"可验证，而非口号）

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from .backup import BackupInfo, create_backup, verify_backup
 from .db import Database, discover_migrations
 from .records import (
     AnomalyRecord,
@@ -31,6 +32,7 @@ from .sinks import (
 
 __all__ = [
     "AnomalyRecord",
+    "BackupInfo",
     "Database",
     "DiskReport",
     "EventFanout",
@@ -52,9 +54,11 @@ __all__ = [
     "UsageAltRecord",
     "UsageRecord",
     "UsageRepo",
+    "create_backup",
     "discover_migrations",
     "disk_report",
     "history",
     "parse_window",
     "sweep",
+    "verify_backup",
 ]

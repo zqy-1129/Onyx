@@ -125,6 +125,28 @@ class Database:
             row = self._conn.execute("SELECT COALESCE(MAX(version),0) AS v FROM schema_version").fetchone()
         return int(row["v"])
 
+    def backup_to(self, path: Path | str) -> None:
+        """复制一份**一致**的库到 `path`（SQLite 在线备份 API）。
+
+        不能直接 cp：WAL 模式下最近的事务可能还在 `-wal` 里，拷出来的库打开不报错、
+        看起来正常，却少了最后一段数据——而备份最危险的失败正是"安静地少一块"。
+        整个过程持有单写者锁，所以快照不会被并发写撕开。
+
+        落地后把目标切回 DELETE 日志模式：备份必须是一个自足的单文件。
+        留在 WAL 就等于宣称"这个文件能恢复"，而它其实还依赖一个没被拷走的 `-wal`。
+        """
+        target_path = Path(path)
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._lock:
+            target = sqlite3.connect(str(target_path))
+            try:
+                self._conn.backup(target)
+                if str(target.execute("PRAGMA journal_mode=DELETE").fetchone()[0]) != "delete":
+                    raise MigrationError(f"备份库 {target_path} 无法退出 WAL 模式")
+                target.commit()
+            finally:
+                target.close()
+
     def table_names(self) -> list[str]:
         rows = self.query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
         return sorted(str(r["name"]) for r in rows)

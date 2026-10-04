@@ -5,8 +5,8 @@
 `README.md` 的进度表、`docs/IMPLEMENTATION.md` 的分步档案是历史沿革，
 **这里回答的是"现在有什么、能干什么、还欠什么"**。
 
-一句话：**M0–M6 全部达成，计划里的四个里程碑出口判据都有真机证据；M7 开了一步（保留策略）；
-欠的是 S7 剩下的运维交付物（备份校验 / 磁盘体检 / usage 报表）、Tool Bench 网页，
+一句话：**M0–M6 全部达成，计划里的四个里程碑出口判据都有真机证据；M7 走了两步（保留策略 + 可验证备份）；
+欠的是 S7 剩下的运维交付物（磁盘与 tokenizer 体检 / usage 报表）、Tool Bench 网页，
 以及一批"带原因推迟"的项。**
 
 ---
@@ -21,7 +21,8 @@ sha256 内容寻址的 blob 存储、单调钟 + 墙钟双时间、事件契约�
 17 张表、schema v6（迁移可重复执行、`0005` 回灌了数据集来历、`0006` 是保留策略的留痕表）、
 WAL + 批量 sink（队列满丢样本但 `dropped` 计数可见）、
 三种事件 sink：`jsonl` / `null` / `otlp`（OTLP/HTTP JSON 编码）、
-**数据生命周期 `store/retention.py`**：摘重引用 / 删无主 blob / 每次运行落 `retention_run`。
+**数据生命周期 `store/retention.py`**：摘重引用 / 删无主 blob / 每次运行落 `retention_run`、
+**可验证备份 `store/backup.py`**：WAL 一致快照 + 被引用的 blob + 逐字节 sha256 校验。
 
 ### L2 引擎接入 `onyx/llm/`
 - **咽喉点只有一个**：所有模型调用必经 `gateway.py`（评测也不例外，所以每个分数能下钻到真实 trace）
@@ -59,8 +60,8 @@ WAL + 批量 sink（队列满丢样本但 `dropped` 计数可见）、
 - 数据集导入：`--source bfcl`、JSONL、`file:<路径>`；来历（upstream/revision/license）参与可比性判定
 
 ### L6 接口
-- **CLI 35 条命令**：顶层 7（`chat` / `serve` / `doctor` / `plugins` / `version` / `calibrate` / `rotate`）
-  + 分组 28（`db 2` / `probe 4` / `models 2` / `traces 3` / `tools 9` / `eval 8`）
+- **CLI 37 条命令**：顶层 7（`chat` / `serve` / `doctor` / `plugins` / `version` / `calibrate` / `rotate`）
+  + 分组 30（`db 4` / `probe 4` / `models 2` / `traces 3` / `tools 9` / `eval 8`）
 - **API 19 个端点**（18 REST + `GET /api/stream` SSE）
 - **Web 9 页**：Fleet / Models / Traces / TraceDetail / Token Ledger / Playground / 评测 / 矩阵 / 回归
   ——手写 CSS token 与手写 SVG，无组件库无图表库；每页都实测过（零 console 错误）
@@ -114,10 +115,9 @@ MCP 工具经 `tools fire --mock live` 判定 **PASS**（模型 → 循环 → s
 ### A. 计划里承诺、但确实没做的（S7 的运维交付物 + 一个页面）
 | 缺什么 | 计划出处 | 为什么算事 |
 |---|---|---|
-| `onyx db backup` / `db verify-backup` | S7 自测命令 | 观测数据没有备份与"备份可恢复"的验证手段，`doctor` 只能查引用完整、不能证明可恢复 |
 | `onyx report usage --since 7d --format md` + `report/exporters/{csv,md,jsonl}` | S7 产出文件 | 只有 `eval report`（评测报告）；**用量周报**没有。今天要看一周吞吐只能自己写 SQL |
 | `onyx token explain <trace>`（多源对比表） | S7 / 附录 A 的自测命令 | 功能其实存在但埋在 `traces show` 的对账表里，没有独立入口；对照"某个数字为什么被采信"这个高频问题，命令行入口是必要的 |
-| `doctor` 的两项检查：磁盘余量、tokenizer 档位可用性 | S7 检查项清单 | 磁盘写满是本地部署最常见的故障；tokenizer 档位决定 `hf_tokenizer/gguf_vocab` 两档可不可用，缺了就只能出事后才发现 |
+| `doctor` 的两项检查：磁盘余量、tokenizer 档位可用性 | S7 检查项清单 | 磁盘写满是本地部署最常见的故障；tokenizer 档位决定 `hf_tokenizer/gguf_vocab` 两档可不可用，缺了就只能出事后才发现。（第三项"blob 引用完整"已在 S18 升级：与 rotate 共用同一份引用清单，并把缺的 ref 指名道姓列出来） |
 | `TOOL_EXEC_START` 事件的 `args_ref` 无处落库 | S17 真机 dry-run 查出来的 | 循环每次工具调用都写一个 args blob，但 schema 里没有任何列存它（`tool_call` 存的是内联 `args_json`）⇒ **每次工具循环泄漏一个小 blob**。`rotate` 能把孤儿回收掉，但正确的修法是别再写或者把它落库——别让"能删孤儿"掩盖"一直在造孤儿" |
 | Tool Bench 网页 | S10–S12 计划（后端已交付） | 工具审计、开销、契约矩阵、fire 结果目前只有 CLI；`GET /api/tools/demo` 也只服务 Playground 的下拉。看板上看"工具库上下文开销随版本变化"这件事没有界面 |
 | `-m e2e` 用例（附录 A 的 S9 自测行） | 附录 A | 现在 **0 个 e2e 用例**：浏览器验证是手工做的（`take_snapshot` + 读 console）。手工是唯一一次 SSE 静默失效被发现的途径，但也意味着**没人记得住的那些路径**没有回归保护 |
@@ -152,8 +152,8 @@ MCP 工具经 `tools fire --mock live` 判定 **PASS**（模型 → 循环 → s
 要成为"完整产品"的差距分析与 M7–M12 排期见 [`ROADMAP.md`](ROADMAP.md)（含三条需要决策的问题）。
 
 
-1. ~~保留策略~~（S17 已交付 `onyx rotate`）+ **备份校验**：`.data` 现在能自我约束，
-   但"坏了能不能恢复"仍然没有可验证的答案。
+1. ~~保留策略 + 备份校验~~（S17 / S18 已交付：`.data` 能自我约束，备份能被验证）。
+   M7 只剩 `doctor` 的磁盘与 tokenizer 两项 + 迁移前自动备份。
 2. **`-m e2e` 用例**：把已经手工验证过的六页路径固化成回归（SSE 联通、矩阵分母显示、劣化清单下钻）。
 3. **Tool Bench 页**：后端齐了（`tools ls/audit/cost/contract/fire` 的数据都在库里），缺的是把它摆上看板。
 4. **`token explain` + `doctor` 两项检查 + `report usage`**：都属于"每天都在用但入口缺失"。

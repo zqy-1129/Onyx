@@ -39,7 +39,7 @@ uv run onyx db init         # 初始化 .data/onyx.sqlite
 | M4 评测 | ✅ | 评测内核（task/grade/runner + 指标层 + bootstrap CI）· 6 个评分器 + 类型感知参数比对 · 236 条中文意图集 + 97 条工具调用集 · `intent_classification` 与 `tool_selection` 各一次真机运行 · BFCL 导入器 · GPU 独占锁（跨进程 + 心跳 + ETA），eval/Playground/live 测试互相排队 |
 | M5 对比 | ✅ | 模型 × 任务矩阵 + 配对回归 diff（净改善/净劣化 + 配对 bootstrap CI + 劣化清单）· Eval / 矩阵 / 回归三页已在真实浏览器实测 · md/csv/自包含 html 报告导出 · 每次运行带数据集来历 |
 | M6 扩展 | ✅ | 六个扩展点接 entry points（一处实现语义：坏插件隔离 + 失败可见 + 同名覆盖可查）· 两个真外部插件样板（任务 / provider）· 第二 provider：OpenAI 兼容通道（vLLM / LM Studio / Ollama `/v1`）· MCP 执行器（stdio + JSON-RPC，纯 stdlib）· OTLP 导出 sink · provider/sink/插件三套契约测试 · `scripts/check_extension_boundary.py` 把"接实现不改内核"变成构建门禁 |
-| M7 跑得住 | 🚧 | **S17 ✅** `onyx rotate`：默认 dry-run、只摘五列重 payload（分数指向的 trace 行永不删）、回收无主 blob、每次运行落 `retention_run` 留痕、单次回收超 60% 直接拦住 · 第五道质量门：离线套件分支覆盖率 ≥ 80%（基线 88%）· 待做：`db backup/verify-backup`、`doctor` 磁盘余量与 tokenizer 档位 |
+| M7 跑得住 | 🚧 | **S17 ✅** `onyx rotate`：默认 dry-run、只摘五列重 payload（分数指向的 trace 行永不删）、回收无主 blob、每次运行落 `retention_run` 留痕、单次回收超 60% 直接拦住 · **S18 ✅** `onyx db backup` / `verify-backup`：WAL 一致快照（不是 cp）、只装被引用的 blob、逐字节重算 sha256、"引用能否在备份里解析"专抓只备库不备证据 · `doctor` 的 blob 项现在指名道姓 · 第五道质量门：离线套件分支覆盖率 ≥ 80%（基线 88%）· 待做：`doctor` 磁盘余量与 tokenizer 档位、迁移前自动备份 |
 
 **M3 执行层的核心保证**（`onyx tools contract`，离线、零真实网络）：
 8 条契约断言在 3 个执行器上全部适用并通过（各列的 n/a 都写明原因）；

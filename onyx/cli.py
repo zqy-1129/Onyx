@@ -56,12 +56,12 @@ def _db_path(settings: Settings, db: Path | None) -> Path:
     return Path(db).resolve() if db else settings.db_path
 
 
-def _echo_checks(checks: list[CheckResult]) -> bool:
+def _echo_checks(checks: list[CheckResult], title: str = "Onyx doctor") -> bool:
     from rich.console import Console
     from rich.table import Table
 
     console = Console()
-    table = Table(title=f"Onyx doctor · v{__version__}", show_lines=False, pad_edge=False)
+    table = Table(title=f"{title} · v{__version__}", show_lines=False, pad_edge=False)
     table.add_column("", width=2)
     table.add_column("检查项", style="bold")
     table.add_column("结果")
@@ -225,6 +225,91 @@ def _last_rotate(report: DiskReport) -> str:
     )
 
 
+# ── db backup / verify-backup ──────────────────────────────────────
+@db_app.command("backup")
+def db_backup(
+    to: Path = typer.Option(..., "--to", help="备份目录：onyx.sqlite + blobs/ + manifest.json"),
+    db: Path = typer.Option(None, "--db", help="数据库路径"),
+) -> None:
+    """备份库 + **被引用到的** blob，并写下可比对的清单。
+
+    用 SQLite 的在线备份 API，不是 cp：WAL 下直接拷 `.sqlite` 会安静地少掉最后一段事务。
+    """
+    from onyx.core.content import FileBlobStore
+    from onyx.store.backup import create_backup
+
+    settings = _settings()
+    path = _db_path(settings, db)
+    if not path.exists():
+        typer.echo(f"数据库不存在: {path}（先跑 onyx db init）", err=True)
+        raise typer.Exit(1)
+    with Database(path) as database:
+        try:
+            info = create_backup(
+                database, FileBlobStore(settings.blob_dir), to, app_version=__version__
+            )
+        except FileExistsError as exc:
+            typer.echo(f"拒绝覆盖已有备份：{exc}", err=True)
+            raise typer.Exit(1) from exc
+    typer.echo(f"备份目录   : {info.root}")
+    typer.echo(f"schema     : v{info.schema_version} · 库 {info.db_bytes} B")
+    typer.echo(
+        f"blob       : {info.blobs} 个 / {_fmt_bytes(info.blob_bytes)}"
+        f"（只装被引用的，孤儿不进备份）"
+    )
+    typer.echo(f"行数       : {sum(info.tables.values())} 行 / {len(info.tables)} 张表")
+    typer.echo(f"摘要       : {info.digest[:19]}…（verify 用它比对集合是否被动过）")
+    if info.unresolved:
+        typer.echo(
+            f"[!] 备份当时就有 {len(info.unresolved)} 个引用解析不了："
+            f"{', '.join(r[:18] for r in info.unresolved[:3])}",
+            err=True,
+        )
+        typer.echo("    证据在备份之前就已经丢了——备份修不回它，只能如实带上这件事。", err=True)
+
+
+@db_app.command("verify-backup")
+def db_verify_backup(
+    root: Path = typer.Argument(..., help="备份目录"),
+    db: Path = typer.Option(None, "--db", help="当前库（用于报告备份点之后长出的数据）"),
+    json_out: bool = typer.Option(False, "--json", help="机器可读输出"),
+) -> None:
+    """证明一份备份**可用**：库自检、行数、每个 blob 的 sha256、引用能否在备份里解析。
+
+    "备份文件存在"不等于"能恢复"。最后一条检查专门抓"只备了库没备证据"——
+    那种备份恢复出来是个引用全是空洞的看板，而它看起来完全正常。
+    """
+    from onyx.store.backup import verify_backup
+
+    settings = _settings()
+    live: Database | None = None
+    path = _db_path(settings, db)
+    if path.exists():
+        live = Database(path)
+    try:
+        report = verify_backup(root, live=live)
+    finally:
+        if live is not None:
+            live.close()
+
+    if json_out:
+        import json as _json
+
+        typer.echo(_json.dumps(report.as_dict(), ensure_ascii=False, indent=2))
+        raise typer.Exit(0 if report.ok else 1)
+
+    checks = [CheckResult(c.name, c.ok, c.detail) for c in report.checks]
+    if report.drift:
+        grown = report.drift.get("tables_grown") or {}
+        checks.append(CheckResult(
+            "备份点之后的增量", True,
+            "备份之后当前库没有新增行" if not grown
+            else "、".join(f"{n} +{d}" for n, d in sorted(grown.items())),
+        ))
+    ok = _echo_checks(checks, title=f"Onyx db verify-backup · {report.root}")
+    raise typer.Exit(0 if ok else 1)
+
+
 # ── rotate（数据生命周期）───────────────────────────────────────────
 @app.command()
 def rotate(
@@ -370,22 +455,21 @@ def doctor(
     checks.append(CheckResult("数据库已迁移", db_ok and version_no >= 1, detail, "onyx db init"))
 
     if db_ok:
-        database = Database(path)
-        refs = [
-            row[0]
-            for row in database.query(
-                "SELECT raw_response_ref FROM trace WHERE raw_response_ref IS NOT NULL"
-            )
-        ]
-        database.close()
         from onyx.core.content import FileBlobStore
+        from onyx.store.retention import referenced_refs
 
+        with Database(path) as database:
+            refs = referenced_refs(database)
         store = FileBlobStore(settings.blob_dir)
-        missing = [r for r in refs if not store.exists(r)]
+        missing = sorted(ref for ref in refs if not store.exists(ref))
         checks.append(CheckResult(
+            # 引用清单与 rotate 用同一份定义（所有引用列），且必须指名道姓：
+            # 只报"3/5 可解析"会让人去猜是哪两个没了。
             "blob 引用完整", not missing,
-            f"{len(refs) - len(missing)}/{len(refs)} 可解析",
-            "原始证据缺失，检查 .data/blobs 是否被清理",
+            f"{len(refs) - len(missing)}/{len(refs)} 可解析"
+            + (f"，缺：{', '.join(r[:18] for r in missing[:3])}" if missing else ""),
+            "原始证据缺失：确认 .data/blobs 没被手工清理；"
+            "若是 rotate 之前丢的，跑 onyx db verify-backup 看最近备份能不能补回来",
         ))
 
     bad_plugins = _extension_failures()
