@@ -66,15 +66,22 @@ class TokenSource(StrEnum):
 
 
 #: 采信优先级：越靠前越可信。reconciler 按此顺序挑第一个 ok 的来源。
+#:
+#: `COMPAT` 的位置有两个事实，不是一个：
+#: - P14 实测 `/v1` 与原生通道对同一份 prompt 计数不同（−2/+16）⇒ **有原生计数时
+#:   ENGINE 一定赢**，compat 只作交叉验证（口径分裂的证据）；
+#: - 但对 `openai-compat` 这类只有兼容层的通道（vLLM / LM Studio / Ollama `/v1`），
+#:   compat 是**服务器对自己实际消耗的报告**，比任何本地估计都贴近真相；
+#:   把它排除掉、改用 heuristic 估计，等于放着卡尺不用去拃。所以它排在所有
+#:   本地复算档之后、heuristic 之前，并带 LOW 置信度（模板口径与消息级归因不一致）。
 SOURCE_PRIORITY: tuple[TokenSource, ...] = (
     TokenSource.ENGINE,
     TokenSource.HF_TOKENIZER,
     TokenSource.GGUF_VOCAB,
     TokenSource.FITTED,
+    TokenSource.COMPAT,
     TokenSource.HEURISTIC,
 )
-#: 只用于交叉验证、不参与采信
-CROSSCHECK_SOURCES: frozenset[TokenSource] = frozenset({TokenSource.COMPAT})
 
 
 class Cap(StrEnum):

@@ -130,11 +130,17 @@ def infer_caps(
 
     # 1) 引擎自报
     engine_caps = {ENGINE_CAP_MAP[c] for c in engine_capabilities if c in ENGINE_CAP_MAP}
+    # 空清单的含义是"**这个通道不上报 capabilities**"（OpenAI 兼容的 /v1/models 就是这样），
+    # 不是"上报了且什么都不支持"。把它读成 missing 会显示一排 ✗，
+    # 而 ✗ 的处置是"评测直接 skip"，?的处置是"先跑探针"——两者相反（DESIGN §9.1）。
+    reported = bool(engine_capabilities)
     for cap in (Cap.CHAT, Cap.TOOLS, Cap.THINKING, Cap.VISION, Cap.EMBED):
         if cap in engine_caps:
             put(cap, "confirmed", f"引擎自报 capabilities 含 {cap}")
-        else:
+        elif reported:
             put(cap, "missing", "引擎 capabilities 未列出")
+        else:
+            put(cap, "unknown", "该通道不汇报 per-model capabilities，未经实测不能判不支持")
 
     # 2) 通道/引擎层面的已知事实
     if kind is ProviderKind.OLLAMA and style is ApiStyle.NATIVE:

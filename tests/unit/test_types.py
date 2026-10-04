@@ -101,9 +101,17 @@ def test_generation_derived_metrics_absent_when_data_missing():
     assert gen.usage_from(TokenSource.COMPAT) is None
 
 
-def test_source_priority_excludes_compat():
+def test_source_priority_places_compat_last_of_the_reported_counts():
+    """compat 在阶梯里的位置同时锁住两件事：
+
+    1. 有原生计数时 ENGINE 一定赢（P14：两通道模板不同，compat 只作交叉验证）；
+    2. compat 仍高于 heuristic —— vLLM/LM Studio/Ollama `/v1` 这类通道只有这个数字，
+       放着服务器自报的数不用去拃字符，是把测量降级成猜测。
+    """
     assert SOURCE_PRIORITY[0] is TokenSource.ENGINE
-    assert TokenSource.COMPAT not in SOURCE_PRIORITY, "兼容层只作交叉验证，不参与采信"
+    assert SOURCE_PRIORITY.index(TokenSource.COMPAT) > SOURCE_PRIORITY.index(TokenSource.FITTED)
+    assert SOURCE_PRIORITY.index(TokenSource.COMPAT) < SOURCE_PRIORITY.index(TokenSource.HEURISTIC)
+    assert SOURCE_PRIORITY[-1] is TokenSource.HEURISTIC, "heuristic 永远是最后一档"
 
 
 def test_loaded_model_offload_detection():

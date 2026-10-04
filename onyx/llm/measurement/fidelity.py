@@ -89,7 +89,12 @@ class EngineCounter:
 
 
 class CompatCounter:
-    """T4：OpenAI 兼容层。P14 实测与原生差 −2/+16 ⇒ **只记录、永不采信**。"""
+    """T4：OpenAI 兼容层计数。
+
+    P14 实测与原生差 −2/+16 ⇒ **有原生计数时只作交叉验证**（ENGINE 优先级更高，
+    reconciler 永远先挑它）；但 `openai-compat` 这类通道只有这个数字，它是服务器对
+    自己实际消耗的报告，比本地估计可信，所以排在 heuristic 之前、带 LOW 置信。
+    """
 
     name = TokenSource.COMPAT
     priority = 90

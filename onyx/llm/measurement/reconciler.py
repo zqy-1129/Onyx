@@ -65,7 +65,9 @@ def reconcile(
     notes: list[str] = []
 
     engine = by_source.get(TokenSource.ENGINE)
-    if engine is None:
+    if engine is None and TokenSource.COMPAT not in by_source:
+        # 兼容层通道（vLLM / LM Studio / Ollama `/v1`）报的计数也是"引擎侧报告"：
+        # 明明有服务器的数字却喊"没有引擎计数"，会把注意力引向一个不存在的问题
         anomalies.append(("NO_ENGINE_COUNT", {"available": sorted(str(k) for k in by_source)}))
 
     chosen = next((by_source[s] for s in SOURCE_PRIORITY if s in by_source), None)
@@ -98,15 +100,20 @@ def reconcile(
         anomalies.append(("LOW_CONFIDENCE_USAGE", {"source": str(chosen.source)}))
 
     cross = by_source.get(TokenSource.COMPAT)
-    if cross is not None and chosen.in_tokens and cross.in_tokens:
+    if cross is not None and chosen.source is not TokenSource.COMPAT \
+            and chosen.in_tokens and cross.in_tokens:
         delta = cross.in_tokens - chosen.in_tokens
         # 任何偏差都记录：P14 实测原生 22 vs 兼容层 20（−9%），
         # 若套用 drift 阈值(10%) 就会漏掉这条真实存在的口径分裂。
         if delta:
             notes.append(
                 f"compat 层输入计数偏差 {delta:+d}"
-                f"（{delta / chosen.in_tokens:+.1%}；P14：两通道模板不同，永不采信）"
+                f"（{delta / chosen.in_tokens:+.1%}；P14：两通道模板不同，"
+                "有原生计数时 compat 只作交叉验证）"
             )
+    elif cross is not None and chosen.source is TokenSource.COMPAT:
+        notes.append("该通道只有兼容层计数（openai-compat 系），按 LOW 置信采信；"
+                     "本地模板级归因不可用，分段残差会偏大")
 
     return ReconcileResult(
         usage=ReconciledUsage(

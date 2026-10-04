@@ -350,12 +350,29 @@ def test_attribution_uses_split_counter_end_to_end():
     assert report.template_ctl_tokens < 12, "残差不该超过标定的模板固定开销量级"
 
 
-def test_compat_is_never_chosen():
-    """P14：兼容层与原生不一致 ⇒ 永不采信，哪怕它是唯一来源。"""
-    result = reconcile((TokenSample(source=TokenSource.COMPAT, in_tokens=20),))
-    assert result.usage.source is not TokenSource.COMPAT
-    assert "NO_USAGE_SOURCE" in [c for c, _ in result.anomalies]
-    assert result.usage.in_tokens is None, "宁可空着也不填一个不可信的数字"
+def test_compat_is_adopted_only_when_it_is_the_only_engine_side_count():
+    """P14 的两面：兼容层与原生口径不同，但它是 vLLM/LM Studio 唯一的服务器自报数。
+
+    - 有原生计数：ENGINE 赢，compat 只作交叉验证（旧结论，仍是主场景）；
+    - 只有 compat：过去这里宁可不采信也不采用 ⇒ 看板上变成 heuristic 猜的数，
+      而"服务器自己说消耗 512 tok"明明比字符加权估计更贴近真相。
+      采信，但带 LOW 置信度（模板口径与消息级归因不一致）。
+    """
+    with_native = reconcile((
+        TokenSample(source=TokenSource.ENGINE, in_tokens=22, out_tokens=5),
+        TokenSample(source=TokenSource.COMPAT, in_tokens=20, out_tokens=5),
+    ))
+    assert with_native.usage.source is TokenSource.ENGINE
+    assert with_native.usage.confidence is Confidence.HIGH
+
+    only_compat = reconcile((TokenSample(source=TokenSource.COMPAT, in_tokens=20,
+                                        out_tokens=7),))
+    assert only_compat.usage.source is TokenSource.COMPAT
+    assert only_compat.usage.confidence is Confidence.LOW
+    assert only_compat.usage.in_tokens == 20
+    assert only_compat.usage.out_tokens == 7
+    assert "NO_ENGINE_COUNT" not in [c for c, _ in only_compat.anomalies], \
+        "有服务器自报的兼容层计数时，不许喊「没有引擎计数」"
 
 
 def test_compat_deviation_is_noted():

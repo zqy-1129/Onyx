@@ -111,6 +111,28 @@ def test_openai_compat_channel_supports_tool_choice():
     assert report.state(Cap.ADMIN) == "unknown", "该通道没实现控制面就不该声称支持"
 
 
+def test_absent_capability_list_is_unknown_not_missing():
+    """`/v1/models` 不汇报 per-model capabilities ⇒ 空清单的含义是「没上报」。
+
+    读成 missing 会给出 ✗，而 ✗ 的处置是「评测直接 skip」；? 的处置才是「先跑探针」。
+    把不报告写成不支持，等于让看板替服务器撒谎——这条是在真机 `/v1` 上
+    跑第二个 provider 时暴露的。
+    """
+    report = infer_caps(
+        engine_capabilities=(), api_style=ApiStyle.OPENAI,
+        provider_kind=ProviderKind.OPENAI_COMPAT,
+    )
+    assert report.state(Cap.CHAT) == "unknown"
+    assert report.state(Cap.TOOLS) == "unknown"
+    assert Cap.CHAT not in report.missing
+    assert "不汇报" in report.reasons[str(Cap.CHAT)]
+
+    # 反向保证：真的上报了且不含某项，才允许判 missing
+    reported = infer_caps(engine_capabilities=["completion"], api_style=ApiStyle.NATIVE)
+    assert reported.state(Cap.CHAT) == "confirmed"
+    assert reported.state(Cap.TOOLS) == "missing"
+
+
 def test_dict_roundtrip():
     report = _ollama(probe_findings={"structured": "enforced"})
     restored = CapReport.from_dict(report.as_dict())
