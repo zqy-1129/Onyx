@@ -1788,40 +1788,6 @@ def tools_cost(
         database.close()
 
 
-#: mock 执行器结构上不触达真实实现，deadline 无从生效——豁免必须写明原因（不许静默跳过）
-_MOCK_CONTRACT_EXEMPTIONS = {
-    "timeout_is_reported": (
-        "mock 执行器不导入也不调用真实实现，deadline 无从生效；"
-        "这条保证由 python_fn 上的同名断言覆盖"
-    )
-}
-
-
-def _http_contract_target():
-    """http 列的离线契约样本（MockTransport + `.invalid` 域名，零真实网络）。
-
-    惰性导入：httpx 属于 `runtime` extra，没装时这一列必须显示"未安装"，
-    而不是让整个 `tools contract` 命令崩掉。
-    """
-    try:
-        from onyx.tools.executors.http import contract_target
-    except ImportError:  # pragma: no cover - 取决于安装的 extras
-        return None
-    return contract_target()
-
-
-def _mcp_contract_target():
-    """mcp 列的离线契约样本（假连接：不起子进程、不碰任何真实 server）。
-
-    惰性导入的理由与 http 一样：导入失败要显示"未知"，不能让整条矩阵崩掉。
-    """
-    try:
-        from onyx.tools.executors.mcp import contract_target
-    except ImportError:  # pragma: no cover - 取决于安装
-        return None
-    return contract_target()
-
-
 def _resolve_tool_def(tool: str, db: Path | None):
     """查定义：**注册表优先，内置兜底**。返回 (定义, 出处, 需要关闭的 Database 或 None)。
 
@@ -1860,123 +1826,63 @@ def tools_contract(
     from rich.console import Console
     from rich.table import Table
 
-    from onyx.tools.builtin.defs import BUILTIN_DEFS, CONTRACT_SAMPLE_ARGS
-    from onyx.tools.contract import CONTRACT_NAMES, run_contracts, sample_args, summarize
-    from onyx.tools.executors import MockReplayExecutor, PythonFnExecutor
+    from onyx.core.errors import ToolUnknown
+    from onyx.tools.contract import CONTRACT_NAMES
+    from onyx.tools.matrix import SAMPLE_SOURCE_NOTE, build_matrix
 
     definition, source, database = _resolve_tool_def(tool, db)
     try:
-        if definition is None:
-            names = ", ".join(item.name for item in BUILTIN_DEFS)
-            typer.echo(f"找不到工具 {tool!r}；内置可选: {names}，或用 tools import 先注册", err=True)
-            raise typer.Exit(2)
-        if args:
-            valid_args = _json.loads(args)
-        elif definition.name == "echo" and source == "builtin":
-            valid_args = dict(CONTRACT_SAMPLE_ARGS)
-        else:
-            valid_args = sample_args(definition)
-
-        # 每一列是 (标签, 样本定义, 工厂, 合法参数, fixtures, 豁免, synth)
-        targets: list[tuple] = [
-            ("python_fn", definition, PythonFnExecutor, valid_args, None, {}, None),
-            ("mock", definition, MockReplayExecutor, valid_args,
-             {definition.name: {"__contract_mock__": True, "tool": definition.name}},
-             _MOCK_CONTRACT_EXEMPTIONS, None),
-        ]
-        http = _http_contract_target()
-        unavailable: dict[str, str] = {}
-        if http is None:
-            unavailable["http"] = "未安装 httpx（uv sync --extra runtime）——未知，不是通过"
-        else:
-            http_sample, http_factory, http_args, http_synth = http
-            targets.append(("http", http_sample, http_factory, http_args, None, {}, http_synth))
-        mcp = _mcp_contract_target()
-        if mcp is None:
-            unavailable["mcp"] = "MCP 执行器导入失败——未知，不是通过"
-        else:
-            mcp_sample, mcp_factory, mcp_args, mcp_synth = mcp
-            targets.append(("mcp", mcp_sample, mcp_factory, mcp_args, None, {}, mcp_synth))
-        # "还剩哪些种类没实现"必须从注册表推导，不能在这里写死：
-        # 写死的版本会在实现完成之后继续宣称"未实现"，而这句话看起来总是合理的
-        from onyx.tools.executors import PENDING_KINDS
-
-        pending = {k: v for k, v in PENDING_KINDS.items() if k not in unavailable}
-
-        matrix: dict[str, dict[str, object]] = {}
-        samples: dict[str, str] = {}
-        for name, sample, factory, target_args, fixtures, exemptions, synth in targets:
-            results = run_contracts(
-                factory, sample, valid_args=target_args,
-                fixtures=fixtures, exemptions=exemptions, synth=synth,
-            )
-            matrix[name] = {item.name: item for item in results}
-            samples[name] = sample.name
+        given = _json.loads(args) if args else None
+        if args and not isinstance(given, dict):
+            # 参数必须是 JSON 对象。塞进字符串或数组时每一列都会失败，
+            # 看起来像"执行器坏了"，而实际是用法错了——这里必须当场说清
+            typer.echo('--args 必须是一个 JSON 对象，例如 \'{"text": "hi"}\'', err=True)
+            raise typer.Exit(2) from None
+        try:
+            matrix = build_matrix(definition, source=source, valid_args=given, tool_label=tool)
+        except ToolUnknown as exc:
+            typer.echo(exc.message, err=True)
+            raise typer.Exit(2) from None
 
         if json_out:
-            typer.echo(_json.dumps({
-                "tool": definition.name, "source": source, "valid_args": valid_args,
-                "assertions": list(CONTRACT_NAMES),
-                "samples": samples,
-                "executors": {
-                    name: {
-                        item: {
-                            "passed": matrix[name][item].passed,
-                            "applicable": matrix[name][item].applicable,
-                            "detail": matrix[name][item].detail,
-                        }
-                        for item in CONTRACT_NAMES
-                    }
-                    for name in matrix
-                },
-                "unavailable": unavailable,
-                "pending": pending,
-                "summary": {name: summarize(list(matrix[name].values())) for name in matrix},
-            }, ensure_ascii=False, indent=2, default=str))
+            typer.echo(_json.dumps(matrix.as_dict(), ensure_ascii=False, indent=2, default=str))
             return
 
         console = Console()
         table = Table(title="执行器契约矩阵", pad_edge=False)
         table.add_column("断言", style="bold")
-        for name in matrix:
+        for name in matrix.columns:
             table.add_column(name, justify="center")
-        for name in (*unavailable, *pending):
+        for name in (*matrix.unavailable, *matrix.pending):
             table.add_column(name, justify="center", style="dim")
         for item in CONTRACT_NAMES:
             row = [item]
-            for name in matrix:
-                result = matrix[name][item]
+            for name in matrix.columns:
+                result = matrix.results[name][item]
                 row.append("✓" if result.passed else ("n/a" if not result.applicable else "✗"))
-            row.extend("—" for _ in range(len(unavailable) + len(pending)))
+            row.extend("—" for _ in range(len(matrix.unavailable) + len(matrix.pending)))
             table.add_row(*row)
         console.print(table)
 
         typer.echo("样本出处（每一列测的定义可能不同，必须写清楚）：")
-        for name, sample_name in samples.items():
-            note = {"mock": "（注册表/内置）", "python_fn": "（注册表/内置）",
-                    "http": "（离线 MockTransport）",
-                    "mcp": "（离线假连接，不起子进程）"}.get(name, "（自带样本）")
-            typer.echo(f"  {name:<12} {sample_name} {note}")
+        for name, sample_name in matrix.samples.items():
+            typer.echo(f"  {name:<12} {sample_name} {SAMPLE_SOURCE_NOTE.get(name, '（自带样本）')}")
 
-        failed = 0
-        for name in matrix:
-            counts = summarize(list(matrix[name].values()))
-            failed += counts["failed"]
+        counts = matrix.counts()
+        for name in matrix.columns:
             typer.echo(
-                f"{name:<12} 通过 {counts['passed']} · 失败 {counts['failed']} · "
-                f"不适用 {counts['not_applicable']}"
+                f"{name:<12} 通过 {counts[name]['passed']} · 失败 {counts[name]['failed']} · "
+                f"不适用 {counts[name]['not_applicable']}"
             )
-        for name in matrix:
-            for item in CONTRACT_NAMES:
-                result = matrix[name][item]
-                if not result.passed:
-                    prefix = "不适用" if not result.applicable else "失败"
-                    typer.echo(f"  [{name}] {prefix} {item}: {result.detail}")
-        for name, reason in unavailable.items():
+        for row_item in matrix.failures():
+            prefix = "不适用" if row_item["status"] == "not_applicable" else "失败"
+            typer.echo(f"  [{row_item['executor']}] {prefix} {row_item['assertion']}: "
+                       f"{row_item['detail']}")
+        for name, reason in matrix.unavailable.items():
             typer.echo(f"  [{name}] {reason}")
-        for name, milestone in pending.items():
+        for name, milestone in matrix.pending.items():
             typer.echo(f"  [{name}] 未实现，计划在 {milestone}")
-        if failed:
+        if matrix.failed:
             raise typer.Exit(1)
     finally:
         if database is not None:
