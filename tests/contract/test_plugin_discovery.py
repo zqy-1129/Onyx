@@ -284,11 +284,26 @@ def test_builtin_jsonl_sink_still_works(entry_points_env, tmp_path):
 
 
 def test_missing_sink_points_at_the_broken_plugin(entry_points_env):
-    """`--sink otlp` 而插件坏了：报错要指到坏插件，而不是只说"未知 sink"。"""
-    entry_points_env.install(GROUP_SINKS, "otlp=no_such_pkg:X")
+    """`--sink langfuse` 而插件坏了：报错要指到坏插件，而不是只说"未知 sink"。
+
+    用 `langfuse` 而不是 `otlp` 举例是有意的：坏插件与内建同名时会**退回内建**
+    （内建仍可用），那种情况下"未知 sink"反而是正确回答。
+    """
+    entry_points_env.install(GROUP_SINKS, "langfuse=no_such_pkg:X")
     with pytest.raises(KeyError) as exc:
-        build_event_sink("otlp")
-    assert "otlp" in str(exc.value) and "加载失败" in str(exc.value)
+        build_event_sink("langfuse")
+    assert "langfuse" in str(exc.value) and "加载失败" in str(exc.value)
+
+
+def test_broken_plugin_shares_name_with_builtin_falls_back_to_builtin(entry_points_env):
+    """同名坏插件：跳过它、内建照常工作，而失败记录仍然可见。
+
+    坏插件不该把内建一起拖死；但它坏过这件事不许消失（`failures()`）。
+    """
+    entry_points_env.install(GROUP_SINKS, "otlp=no_such_pkg:X")
+    sink = build_event_sink("otlp", endpoint="http://collector.test:4318")
+    assert sink.name == "otlp"
+    assert [f.name for f in failures() if f.group == GROUP_SINKS] == ["otlp"]
 
 
 # ── tool executors ─────────────────────────────────────────────────

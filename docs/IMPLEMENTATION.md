@@ -1182,6 +1182,78 @@ onyx serve --provider openai-compat --url … --port 8791  +  vite dev
 
 ---
 
+### S16c 已交付（OTLP 导出 sink，验证 Sink 抽象）
+
+**实际产出**
+```
+onyx/store/sinks/otlp.py                     # EventSink 的第二个真实实现：OTLP/HTTP JSON
+onyx/store/sinks/registry.py                 # _LAZY_SINKS（otlp 需要 httpx ⇒ 惰性）+ builtin_sink_names()
+onyx/llm/providers/…、pyproject.toml          # import-linter 契约登记例外（见下）
+tests/contract/test_sink_contract.py          # 4 个实现（jsonl/null/otlp/插件）同一套断言
+tests/unit/test_sink_otlp.py                  # OTLP JSON 映射细节
+```
+**三条刻意的取舍**（都写在模块 docstring 里，不藏在代码里）
+- 编码用 **OTLP/HTTP JSON** 而不是 protobuf：不新增依赖，代价是不能声称"任何 collector 都能吃"。
+  所以把 `onyx.encoding=json` 导成资源属性，接收端看一眼就知道面对的是什么。
+- **一个 trace 只导结构 span**（根 span + 每次工具执行一个子 span），其余事件折成计数属性
+  `onyx.events={"text_delta": 2, …}`。逐 token 变成逐 span 会把 collector 打满，
+  而且那等于在 collector 里重建第二个 Onyx。
+- **默认不导工具参数值**，只导键名与数量（`onyx.tool.arg_keys` / `arg_count`）；
+  参数里常有地址、身份、内部 ID，把它们原样发到外部可观测栈不是"导出 trace"而是数据出境。
+  确实需要时显式 `include_args=True`。
+
+**契约测试挖出来的实现问题**（都有断言钉住）
+- `int64` 在 OTLP JSON 里必须是**字符串**，发数字会被多数 collector 拒收；
+- dict 属性必须 `json.dumps`，不能用 `str(dict)`——Python repr 是单引号，
+  对面 `loads` 失败而我们这边"看起来导出成功了"；
+- OTLP 没有嵌套 span：中间形状里的 `children` 必须摊平成同级 span 才能外发；
+- id 宽度：onyx 的 26 字符 ULID 不是 W3C 的 128-bit trace id ⇒ **派生**（sha256）而不是截断，
+  截断会让两条无关调用链有概率画成同一条；同时把 `onyx.trace_id` 留在属性里保证可回跳；
+- 时间只从 `wall_iso` 换算，**不用 `ts_ns`**（单调钟换台机器就没有意义，
+  导出成 1970 年附近的数比直接报错更难发现）；
+- `close()` 不许抛：它站在 `finally` 里，抛出会盖掉真正让进程出错的那条异常，
+  而数据并没有丢（SQLite 才是权威存储），欠着的 span 仍能在 `stats` 里看到；
+- 发送失败时把 **span 原样退回队列**（编码是纯函数，重试不需要伪造数据），
+  只"记一笔欠账"的重试第二次就没东西可发，那是把故障伪装成"已经尽力"；
+- 队列上限在**入队时**生效（不是等 flush），否则一次长评测会把一整夜的 span 堆在内存里；
+  丢最老的但 `dropped` 必须计数（与 sqlite sink 同一纪律）；
+- 落在"没有开着的 trace"上的事件计入 `orphans`：它增长说明装配或事件顺序错了，
+  而不是网络问题。没有这个计数，"接上了但一条都没导出去"就看不出来
+  ——SSE broker 事故的那个形状。
+
+**隔离不许掩盖故障，这条在 sink 上有两处具体体现**
+`EventFanout` 每次 flush 记一次错误（不是每个事件），而 sink 自己记累计 `failures` 与
+`pending`；契约测试同时断言两个数，防止"看起来只失败了一次"其实一直在失败。
+
+**新增了一条 lint 例外**：`onyx.store.sinks.otlp -> httpx`。
+`import-linter` 立刻把"store 层不许碰网络"判为 BROKEN，这是设计意图而不是噪音——
+处置方式与 `executors.http` 一致：**惰性导入**（`_LAZY_SINKS`，只有 `--sink otlp` 才 import 到
+httpx）+ 在 `pyproject.toml` 里显式登记并写明理由，契约名同步改成
+`network IO confined to llm, executors.http and sinks.otlp`。
+`onyx.store` 其余部分在零三方依赖下仍必须能 import（有契约守着）。
+
+**自测（全部实际执行）**
+```bash
+uv run pytest                    # 939 passed, 1 skipped
+uv run pytest -m live             # 20 passed
+uv run ruff check . && uv run lint-imports   # clean / 3 kept（1 ignored import ×2）
+uv run onyx plugins               # onyx.sinks 内建 = jsonl, null, otlp
+onyx chat --sink otlp             # 未配端点 ⇒ 直接报错退出，说清该设 OTEL_EXPORTER_OTLP_ENDPOINT
+# 端到端（同进程起一个假 collector，收 POST）：
+#   exit 0 · 收到 1 次 POST /v1/traces · content-type application/json
+#   span 名 "chat mock/echo" · traceId 32hex / spanId 16hex
+#   时间 1791089873739949056 → …742945792（2026-10-04，不是 1970）
+#   资源属性 service.name=onyx · onyx.encoding=json · onyx.app_version=0.1.0
+#   onyx.trace_id 原样保留（可从 collector 跳回 onyx）· provider_id=mock-local
+#   onyx.events 折成计数 JSON 字符串（first_token/generation_end/model_load/usage_* 各计数）
+```
+**顺手发现并如实记录**：`RECONCILED` 事件在契约与 `PAYLOAD_REQUIRED` 里都存在，
+`obs/visitors/token.py` 也消费它，但 **gateway 从不发它**（采信结果算完直接落库）。
+sink 因此不编造 `onyx.usage.source`，只导出事件流里真出现过的 `onyx.usage.engine.*` 原始报告。
+这个"契约里有、生产侧不发"的空洞留给 S16 之后的观测一致性检查处理，记在这里而不是留在代码里。
+
+---
+
 ## 附录 A — 每步自测速查
 
 | 步 | 命令 | 绿的条件 |

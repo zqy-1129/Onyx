@@ -13,6 +13,7 @@ sink 是**只写**的观测出口，任何 sink 崩了都由 `EventFanout` 隔�
 
 from __future__ import annotations
 
+import importlib
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -44,15 +45,28 @@ BUILTIN_SINKS: dict[str, Builder] = {
     "null": _builtin_null,
 }
 
+#: 需要惰性导入的 sink。otlp 依赖 httpx（`runtime` extra），而 `onyx.store`
+#: 其余部分在零三方依赖下也必须能 import——与 `tools/executors/http` 同一条款。
+_LAZY_SINKS: dict[str, str] = {"otlp": "onyx.store.sinks.otlp:build"}
+
+
+def builtin_sink_names() -> tuple[str, ...]:
+    """内建 sink 的名字（含需要惰性导入的）。诊断列用它，避免 `--sink otlp`
+    明明可用却在"内建"一列里看不见。"""
+    return tuple(sorted({*BUILTIN_SINKS, *_LAZY_SINKS}))
+
 
 def sink_names() -> tuple[str, ...]:
-    return tuple(sorted(discover(GROUP_SINKS, BUILTIN_SINKS)))
+    return tuple(sorted({*builtin_sink_names(), *discover(GROUP_SINKS, {})}))
 
 
 def build_event_sink(name: str, **options: Any) -> EventSink:
     """按名字构造一个事件 sink。未知名字报错并列出可选项（静默不导出比不导出更糟）。"""
     registry = discover(GROUP_SINKS, BUILTIN_SINKS)
     builder = registry.get(name)
+    if builder is None and name in _LAZY_SINKS:
+        module_name, _, attr = _LAZY_SINKS[name].partition(":")
+        builder = getattr(importlib.import_module(module_name), attr)
     if builder is None:
         broken = [f.name for f in failures() if f.group == GROUP_SINKS]
         hint = f"；该组有插件加载失败: {broken}（onyx plugins 有详情）" if broken else ""

@@ -101,7 +101,7 @@ def plugins() -> None:
     from onyx.llm.registry import BUILTIN as BUILTIN_PROVIDERS
     from onyx.llm.registry import available_kinds
     from onyx.obs.visitors import builtin_visitors, default_visitors
-    from onyx.store.sinks import BUILTIN_SINKS, sink_names
+    from onyx.store.sinks import builtin_sink_names, sink_names
     from onyx.tools.executors import EXECUTOR_KINDS, executor_kinds
 
     # (group, 内建名, 装配后的全量名字)；listing 为 None 表示这个组还没接线
@@ -109,7 +109,7 @@ def plugins() -> None:
         (GROUP_PROVIDERS, sorted(BUILTIN_PROVIDERS), available_kinds),
         (GROUP_TASKS, sorted(BUILTIN_TASKS), lambda: sorted(specs())),
         (GROUP_GRADERS, [], None),
-        (GROUP_SINKS, sorted(BUILTIN_SINKS), sink_names),
+        (GROUP_SINKS, sorted(builtin_sink_names()), sink_names),
         (GROUP_TOOL_EXECUTORS, sorted(EXECUTOR_KINDS), executor_kinds),
         (GROUP_OBSERVERS, sorted(v.name for v in builtin_visitors()),
          lambda: sorted(v.name for v in default_visitors())),
