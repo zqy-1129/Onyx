@@ -281,3 +281,51 @@ with httpx.Client(transport=httpx.MockTransport(handler), timeout=httpx.Timeout(
 > 这条发现推翻了原计划的一个假设，也正好验证了"保真阶梯 + 置信度标注"这个设计的必要性：
 > 如果没有它，看板会对 2/3 的模型显示一个看起来精确、实际无从复算的数字。
 
+
+### P23 · Ollama 的 `/v1` 无法关闭 thinking，推理字段名是 `reasoning` ✅（S16b 实测）
+
+```bash
+# qwen3.5:9b，max_tokens=64
+curl -s http://127.0.0.1:11434/v1/chat/completions   -d '{"model":"qwen3.5:9b","messages":[{"role":"user","content":"1+1=?"}],"max_tokens":64,"think":false}'
+curl -s http://127.0.0.1:11434/v1/chat/completions   -d '{"…","chat_template_kwargs":{"thinking":false}}'
+# 两次都返回：{"content": "", "reasoning": "Thinking Process:
+
+1. **Analyze the Req…"}
+```
+
+| 假设（来自文档/直觉） | 实测 |
+|---|---|
+| `think:false` 能关推理（原生通道的键名） | ✗ 无效，照样产出推理内容 |
+| `chat_template_kwargs.thinking:false` 能关（vLLM 的键名） | ✗ Ollama `/v1` 不认 |
+| 推理内容在 `delta.reasoning_content`（DeepSeek 系形状） | 非流式实际是 `message.reasoning` |
+| `/v1` 报 `total_duration` 等分段时序 | ✗ 只有 `usage`，没有纳秒分段 |
+
+**处置**：`openai-compat` provider 在 `req.thinking` 被设值且未声明 `thinking_via` 时
+**显式拒绝**（`CapabilityMissing`），而不是"发一个可能被忽略的字段"。
+理由是可比性：thinking 开着跑出来的分数与关着跑出来的分数不是同一个量，
+静默忽略会让两次评测看起来同构而实际不同（P12 的教训在另一个通道上重演）。
+服务器确实支持时，用 `thinking_via="chat_template_kwargs.thinking"` 声明键位即可。
+解析侧同时吃 `reasoning` 与 `reasoning_content`，`streaming.py` 的 openai 分支
+`delta` 与 `message` 都接受（只认 `delta` 时非流式解析成空正文，
+而空正文与"模型真的没输出"在评测里长得一模一样）。
+
+### P24 · 兼容层的 `usage` 是该通道唯一可信的引擎自报 ✅（S16b 实测）
+
+同一请求（prompt「用一句话解释什么是 KV cache」，`max_tokens=400`）：
+
+| 出处 | in | out | 备注 |
+|---|---|---|---|
+| `compat`（服务器 `usage`） | 16 | 400 | `finish_reason=length` ⇒ 400 与预算**自洽** |
+| `heuristic`（本地字符加权） | 15 | 602 | 估高了 20% |
+| `fitted` | 未标定 | 未标定 | 该通道没有模板，标定档不可用 |
+
+P14 的结论（`/v1` 与原生计数口径不同，差 −2/+16）没有被推翻：它约束的是
+**有原生数字时该信谁**。而 vLLM / LM Studio / Ollama `/v1` 只有 compat 这个数字，
+把它排除、改用字符估计，等于放着卡尺不用去拃。所以
+`SOURCE_PRIORITY = (ENGINE, HF_TOKENIZER, GGUF_VOCAB, FITTED, COMPAT, HEURISTIC)`
+——compat 在所有本地复算档之后、heuristic 之前，并带 LOW 置信度。
+
+**顺带实测到**：`/v1/models` **不返回** per-model `capabilities`、体积与上下文长度
+（`{"id","created","owned_by"}` 而已）。所以"空 capabilities 清单"的含义是
+**该通道不上报**，不是"上报了且什么都不支持"。看板原先会因此显示一排 ✗，
+而 ✗ 的处置是"评测直接 skip"、? 的处置才是"先跑探针"——两个相反的结论被压成了同一个符号。

@@ -1118,10 +1118,67 @@ uv run --with-editable plugins_example/example_provider \
 `onyx/core/**`、`onyx/llm/gateway.py`、`onyx/obs/**` 未被修改 —— 由脚本判定，不靠人 review。
 
 **已知小缺口（记在这里，不藏）**
-- `onyx.serve --provider X` 还没有对应 flag（serve 只走 ollama）；
+- ~~`onyx.serve --provider X` 还没有对应 flag~~ → S16b 已补；
 - 非 ollama provider 的 `base_url` 仍记录 CLI `--url` 的默认值（`http://127.0.0.1:11434`），
   修它需要把散在 6 处的 url 默认值提成常量并区分"用户没填"，属于独立一次改动；
-- `onyx.providers add/list`（计划自测里提到的命令）尚未存在，与 S16b 的第二 provider 一起做。
+- ~~`onyx.providers add/list`（计划自测里提到的命令）尚未存在~~ → 仍未做，见 S16b 的"遗留"。
+
+---
+
+### S16b 已交付（第二个 provider：openai-compat）
+
+**实际产出**
+```
+onyx/llm/providers/openai_compat.py     # 只实现 LlmProvider：/v1/models + /v1/chat/completions
+onyx/llm/registry.py                    # BUILTIN 增加 openai-compat
+onyx/llm/streaming.py                   # openai 分支同时吃 delta（流式）与 message（非流式）
+onyx/core/types.py                      # SOURCE_PRIORITY 加入 COMPAT；删掉零消费者的 CROSSCHECK_SOURCES
+onyx/llm/caps.py                        # 空 capabilities 清单 ⇒ unknown，不是 missing
+onyx/llm/measurement/{reconciler,fidelity}.py
+onyx/api/{schemas.py,routes/fleet.py,app.py}   # loaded / size_gb / loaded_known 的"未知"
+onyx/cli.py                             # models ls 状态三态；serve --provider/--sink；chat --provider
+onyx/web/src/{api/types.ts,format.ts,pages/Models.tsx,pages/Fleet.tsx}
+tests/contract/test_provider_contract.py（4 个实现跑同一套断言）+ tests/unit/test_provider_openai_compat.py
+docs/PROBES.md P23/P24
+```
+**三次提交的顺序是有意的**：需要改内核的口径修正**先落地**（`fix(measurement)`），
+再接入实现（`feat(llm)`），最后才是实现暴露出来的显示问题（`fix(web,api)`）。
+反过来的话 `check_extension_boundary.py` 会把"改内核"与"加实现"混在一次提交里判失败，
+而那条门禁从此就会被人对付性绕过——一次性的绕过比没有门禁更糟。
+
+**抽象泄漏的判定与处置**（计划里那条"记 issue + 补契约，不许在 gateway 加 if"）
+- 接入过程中确实需要动 `core/types.py`（采信阶梯）与 `llm/caps.py`（三态推断）。
+  两处都不是"为 openai_compat 开小灶"，而是**原口径在第二个通道上不成立**：
+  前者把 compat 排除在采信之外（真机对照：compat 400 与 finish=length 自洽，
+  heuristic 估成 602）；后者把"不上报"读成"不支持"（看板对正在服务 chat 的通道显示 ✗）。
+  所以按 §13 的规矩处理：改契约 + 写进 PROBES（P23/P24），`gateway.py` 一行未动。
+- **没有**按 `base_url`/服务器名字猜行为。专有参数走 `req.extra`，
+  thinking 键位走显式声明的 `thinking_via`，不支持的输入（图片、`keep_alive`、
+  无法表达的 `thinking`）一律 `CapabilityMissing` 并给出修法。
+
+**真机自测（全部实际执行，零外部网络）**
+```bash
+uv run pytest                     # 899 passed, 1 skipped
+uv run pytest -m live              # 20 passed
+uv run ruff check . && uv run lint-imports    # clean / 3 contracts kept
+uv run python scripts/check_extension_boundary.py --staged
+                                  # ✓ 接入 1 个实现未触碰受保护的内核文件
+onyx chat --provider openai-compat --url http://127.0.0.1:11434/v1 -m qwen3.5:9b
+                                  # provider_id=openai-compat-local · usage=compat/low in=16 out=400
+                                  # drift 6.25%（对照 heuristic）· 吞吐/TTFT 显示「—」而不是 0
+onyx eval run --task intent_classification --provider openai-compat … --limit 3
+                                  # 未声明 thinking_via ⇒ 逐条 CapabilityMissing + 修法
+                                  # （主分数全部「—」而不是 0，run 记录仍可下钻）
+onyx serve --provider openai-compat --url … --port 8791  +  vite dev
+                                  # /api/fleet loaded_known=false · installed_models=3
+                                  # /api/models loaded=null, size_gb=null, caps.missing=[]
+                                  # 模型页：参数/量化/磁盘/驻留全「—」，能力位是 ? 而不是 ✗
+                                  # 控制台 0 条错误
+```
+**遗留（S16 内继续处理）**：`onyx providers add/list` 仍未做（多 provider 并存时的登记入口）；
+兼容通道的探针套件（`onyx probe`）目前大量依赖 ollama 原生端点，
+因此 compat 通道上 structured_output/stream_usage 会长期停在「未实测」——这是事实而不是缺陷，
+但要在 `docs/eval-recipes.md` 里写清楚，否则用户会以为是 bug。
 
 ---
 
