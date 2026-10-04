@@ -8,6 +8,8 @@ __pycache__/
 *.egg-info/
 .data/
 .tmp/
+# 部署配置是每台机器自己的取舍；模板 onyx.example.toml 才进版本库
+onyx.toml
 reports/
 node_modules/
 dist/

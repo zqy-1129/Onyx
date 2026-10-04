@@ -624,7 +624,9 @@ CONTRACT_VERSION = 1
   按名字/前缀猜能力会让外部实现一进来就被误判，且 skip 记录里的 `missing` 会变成假信息。
 - `plugins_example/`（仓库根，独立可安装的两个小包）就是上面这些契约的活体测试：
   内核若不能容纳一个外部实现，`scripts/check_extension_boundary.py` 会直接把这次提交判失败。
-- 所有契约带版本与能力协商；配置外置 `onyx.yaml`（providers、keep_alive 策略、GPU 锁、数据集缓存、sandbox 白名单）。
+- 所有契约带版本与能力协商；配置外置 `onyx.toml`（providers、GPU 锁、保留策略、sandbox 白名单、serve 绑定）。
+  落地时把设计稿里的 `.yaml` 换成 `.toml`：`tomllib` 是标准库，而"零运行时基础依赖"是本项目的立身之本——
+  为一配置文件引入 PyYAML 会把依赖面扩大在一个最不该扩的地方。承诺（配置外置、优先级一条规则）没变。
 
 ---
 

@@ -65,8 +65,11 @@ WAL + 批量 sink（队列满丢样本但 `dropped` 计数可见）、
 - 数据集导入：`--source bfcl`、JSONL、`file:<路径>`；来历（upstream/revision/license）参与可比性判定
 
 ### L6 接口
-- **CLI 38 条命令**：顶层 7（`chat` / `serve` / `doctor` / `plugins` / `version` / `calibrate` / `rotate`）
-  + 分组 31（`db 5` / `probe 4` / `models 2` / `traces 3` / `tools 9` / `eval 8`）
+- **CLI 39 条命令**：顶层 7（`chat` / `serve` / `doctor` / `plugins` / `version` / `calibrate` / `rotate`）
+  + 分组 32（`db 5` / `probe 4` / `models 2` / `traces 3` / `tools 9` / `eval 8` / `config 1`）
+- **部署配置 `onyx.toml`**（S20）：provider / GPU 锁 / 保留窗口 / sandbox / serve 绑定收在一处。
+  优先级只有一条规则 **flag > 环境 > 文件 > 默认**；`onyx config show` 逐项标出它来自哪一层，
+  `onyx doctor` 把"写了不生效"的未知键与坏类型报成红项（模板见 `onyx.example.toml`）
 - **API 19 个端点**（18 REST + `GET /api/stream` SSE）
 - **Web 9 页**：Fleet / Models / Traces / TraceDetail / Token Ledger / Playground / 评测 / 矩阵 / 回归
   ——手写 CSS token 与手写 SVG，无组件库无图表库；每页都实测过（零 console 错误）
@@ -96,12 +99,15 @@ WAL + 批量 sink（队列满丢样本但 `dropped` 计数可见）、
 ## 2. 质量门与规模
 
 ```
-uv run pytest            # 990 passed, 1 skipped（tests/unit 901 + tests/contract 90）
+uv run pytest            # 1082 passed, 1 skipped（含 S17–S20 新增：retention 28 / backup 20 / doctor 9 / config 25）
 uv run pytest -m live     # 20 passed（真打 qwen3.5:9b，与评测共用机器级 GPU 锁）
 uv run pytest -m probe     # 4 passed（P 系列实验的可重跑版本）
 uv run ruff check .         # All checks passed（`ruff format` 不是门禁）
 uv run lint-imports          # 3 contracts kept（两条网络例外显式登记）
+uv run coverage run -m pytest -q && uv run coverage report   # 88% ≥ 80%（分支覆盖，离线套件）
 uv run python scripts/check_extension_boundary.py   # 接入实现未触碰受保护内核文件
+uv run onyx doctor            # 9 项体检：配置 / Python / 可写 / 磁盘 / 迁移 / blob / 档位 / 插件 / 引擎
+uv run onyx config show       # 每一项生效值标出来自 flag/环境/文件/默认哪一层
 前端：tsc --noEmit / vitest 44 / vite build（203KB js）+ 浏览器 take_snapshot
 ```
 

@@ -10,12 +10,26 @@ from __future__ import annotations
 import os
 import platform
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
 import typer
 
 from onyx import __version__
+from onyx.config import (
+    CONFIG_NAME,
+    DEFAULT_BASE_URL,
+    DEFAULT_HOST,
+    DEFAULT_PORT,
+    DEFAULT_PROVIDER_KIND,
+    Config,
+    ConfigError,
+    config_path,
+    effective,
+    load_config,
+    pick,
+)
 from onyx.eval.task import HEADLINE_METRICS
 from onyx.llm.measurement.fidelity import FITTED_MIN_SAMPLES
 from onyx.settings import Settings, load_settings
@@ -36,6 +50,8 @@ app = typer.Typer(
     add_completion=False,
     context_settings={"help_option_names": ["-h", "--help"]},
 )
+config_app = typer.Typer(help="部署配置：看每一项生效值从哪一层来", no_args_is_help=True)
+app.add_typer(config_app, name="config")
 db_app = typer.Typer(help="数据库：迁移、体检、备份", no_args_is_help=True)
 app.add_typer(db_app, name="db")
 probe_app = typer.Typer(help="语义实测探针：把引擎行为变成可复现的结论", no_args_is_help=True)
@@ -52,6 +68,26 @@ class CheckResult:
 
 def _settings() -> Settings:
     return load_settings().ensure_dirs()
+
+
+def _engine_url(url: str | None) -> str:
+    """需要直接跟引擎说话的命令（探针、serve、doctor）走同一个回落。
+
+    留着它们各自写死 `127.0.0.1:11434`，配置文件里的 `[provider].base_url`
+    就会在这几条命令上静默失效——同一份配置时而有效时而无效，比没有配置更难查。
+    """
+    return pick(url, _config().provider.base_url, DEFAULT_BASE_URL)
+
+
+def _config() -> Config:
+    """本次命令的配置。
+
+    故意不缓存：缓存会造出一整类"改了没生效"的故障（同一进程里先后读到不同环境时最明显），
+    而一份几 KB 的 TOML 读两三次在任何机器上都不构成开销。
+    `--config` 由根回调写进 `ONYX_CONFIG`，所以它对所有下层（settings/lock/serve）一致生效，
+    不需要每个函数都多接一个参数。
+    """
+    return load_config()
 
 
 def _db_path(settings: Settings, db: Path | None) -> Path:
@@ -81,6 +117,37 @@ def _echo_checks(checks: list[CheckResult], title: str = "Onyx doctor") -> bool:
 
 
 # ── version ────────────────────────────────────────────────────────
+#: 读不出配置文件时仍然要能跑的入口：它们是唯一"诊断这份文件"的命令。
+#: 其它命令一律先验证再动手——一份坏掉却被忽略的配置，比没有配置危险得多：
+#: 每个值都能从更高优先级的来源拿到，于是没有任何一条命令会去读它，
+#: 而人以为 `[serve].port` 已经生效了。
+_CONFIG_TOLERANT = frozenset({"doctor", "config"})
+
+
+@app.callback()
+def _root(
+    ctx: typer.Context,
+    config: Path = typer.Option(
+        None, "--config",
+        help="配置文件路径；默认 $ONYX_CONFIG，再退到 <仓库根>/onyx.toml。"
+             "等价于设置 ONYX_CONFIG（确实就是这么实现的）",
+    ),
+) -> None:
+    """所有命令共用的入口：把 `--config` 落到环境里，并在动手之前验证这份文件。"""
+    import os
+
+    if config is not None:
+        os.environ["ONYX_CONFIG"] = str(Path(config).resolve())
+    if ctx.invoked_subcommand in _CONFIG_TOLERANT:
+        return
+    try:
+        load_config()
+    except ConfigError as exc:
+        typer.echo(f"配置文件有问题：{exc}", err=True)
+        typer.echo("修好它，或用 --config 指一份能读的；onyx doctor 会列出具体问题。", err=True)
+        raise typer.Exit(2) from None
+
+
 @app.command()
 def version() -> None:
     """打印版本与运行环境。"""
@@ -88,6 +155,56 @@ def version() -> None:
 
 
 # ── plugins（扩展点体检，DESIGN §13）────────────────────────────────
+@config_app.command("show")
+def config_show(
+    json_out: bool = typer.Option(False, "--json", help="机器可读输出"),
+) -> None:
+    """列出每一项**不带 flag 时的生效值**，并写明它来自配置文件、环境变量还是默认。
+
+    这个命令的存在理由只有一个：让人能证明"配置真的生效了"。
+    报告与命令实际使用的回落共用 `config.effective()`，两处不是两套逻辑。
+    """
+    import json as _json
+
+    from onyx.config import ENV_CONFIG_PATH
+
+    path = config_path()
+    try:
+        cfg = _config()
+    except ConfigError as exc:
+        typer.echo(f"配置文件读不出来：{exc}", err=True)
+        raise typer.Exit(2) from None
+
+    rows = effective(cfg)
+    if json_out:
+        typer.echo(_json.dumps({
+            "file": str(path) if path else None,
+            "loaded": cfg.loaded,
+            "unknown": list(cfg.unknown),
+            "problems": list(cfg.problems),
+            "effective": {r.key: r.value for r in rows},
+            "source": {r.key: r.source for r in rows},
+        }, ensure_ascii=False, indent=2, default=str))
+        raise typer.Exit(0)
+
+    if cfg.loaded:
+        typer.echo(f"配置文件     : {path}")
+    else:
+        typer.echo(
+            f"配置文件     : 没有（放一份 {CONFIG_NAME} 到仓库根，或设 {ENV_CONFIG_PATH}）"
+        )
+    for row in rows:
+        mark = {"file": "文件", "env": "环境", "default": "默认"}.get(row.source, row.source)
+        # "未设"就是未设：不同键的后续行为不一样（有的停下来问、有的用自己的默认），
+        # 在这里统一写成"会停下来问"会对 gpu.lock_path 说假话。
+        value = "—（未设）" if row.value is None else row.value
+        typer.echo(f"  {row.key:<34} {value}  [{mark}]")
+    for key in cfg.unknown:
+        typer.echo(f"  ! {key} 写了但内核不认识 —— 不会生效", err=True)
+    for problem in cfg.problems:
+        typer.echo(f"  ! {problem} —— 已回落到默认值", err=True)
+
+
 @app.command()
 def plugins() -> None:
     """列出六个扩展点的实际装配结果：内建 / 已注册插件 / 覆盖 / 加载失败。
@@ -415,12 +532,13 @@ def db_verify_backup(
 @app.command()
 def rotate(
     raw_after: str = typer.Option(
-        DEFAULT_RAW_AFTER, "--raw-after",
-        help="超出这个窗口的原始 body / 渲染 prompt / 工具返回值引用会被摘掉（行保留）",
+        None, "--raw-after",
+        help="超出这个窗口的原始 body / 渲染 prompt / 工具返回值引用会被摘掉（行保留）。"
+             "默认取配置文件 [retention].raw_after，再退到 30d",
     ),
     trace_after: str = typer.Option(
-        DEFAULT_TRACE_AFTER, "--trace-after",
-        help="trace 行的保留窗口，只有配合 --purge-traces 才生效",
+        None, "--trace-after",
+        help="trace 行的保留窗口，只有配合 --purge-traces 才生效。默认取配置文件再退到 90d",
     ),
     apply: bool = typer.Option(False, "--apply", help="真的删除；不加这个 flag 就只是算一遍"),
     purge_traces: bool = typer.Option(
@@ -448,6 +566,9 @@ def rotate(
     from onyx.core.content import FileBlobStore
 
     settings = _settings()
+    cfg = _config()
+    raw_after = pick(raw_after, cfg.retention.raw_after, DEFAULT_RAW_AFTER)
+    trace_after = pick(trace_after, cfg.retention.trace_after, DEFAULT_TRACE_AFTER)
     path = _db_path(settings, db)
     if not path.exists():
         typer.echo(f"数据库不存在: {path}（先跑 onyx db init）", err=True)
@@ -589,16 +710,56 @@ def _check_token_tiers(database: Database) -> CheckResult:
     )
 
 
+def _check_config() -> CheckResult:
+    """配置文件的三件事：读没读到、写了不生效的键、类型不对的键。
+
+    "写了不生效"是配置系统最典型的死法——文件躺在磁盘上、命令照样用默认值，
+    而没人会怀疑自己配错了的那个键其实根本没被读到。所以这里既报未知键，
+    也报类型不对的键（它会静默回落到默认值）。
+    """
+    try:
+        cfg = _config()
+    except ConfigError as exc:
+        return CheckResult("配置文件", False, str(exc), "改好这一份文件；其余项都靠它定位")
+    if not cfg.loaded:
+        return CheckResult(
+            "配置文件", True, "没有配置文件（全部用内建默认与 flag）",
+            f"想固定这台机器的取舍就建一个 {CONFIG_NAME}（onyx config show 看有哪些键）",
+        )
+    if cfg.unknown or cfg.problems:
+        bits = [f"不认识的键：{', '.join(cfg.unknown)}"] if cfg.unknown else []
+        bits += [f"类型不对：{p}" for p in cfg.problems]
+        return CheckResult(
+            "配置文件", False, f"{cfg.sources[0].name} · " + "；".join(bits),
+            "这些键写了也不会生效——照 schema 改名或删掉（onyx config show）",
+        )
+    return CheckResult(
+        "配置文件", True, f"{cfg.sources[0]} · 全部键都被内核消费",
+        "",
+    )
+
+
 @app.command()
 def doctor(
     db: Path = typer.Option(None, "--db", help="数据库路径"),
-    ollama_url: str = typer.Option("http://127.0.0.1:11434", "--ollama-url", help="Ollama base url"),
+    ollama_url: str = typer.Option(
+        None, "--ollama-url", help="引擎 base url（默认为配置文件 [provider].base_url）"
+    ),
     skip_network: bool = typer.Option(False, "--skip-network", help="跳过网络检查"),
 ) -> None:
-    """体检：环境、磁盘、数据库、blob 一致性、计量档位、插件、Ollama 可达性。"""
-    settings = _settings()
+    """体检：环境、配置、磁盘、数据库、blob 一致性、计量档位、插件、Ollama 可达性。"""
+    checks: list[CheckResult] = [_check_config()]
+    try:
+        settings = _settings()
+    except ConfigError as exc:
+        # 配置文件读不出来时，数据目录/引擎地址全都无从判断。
+        # 与其打印一堆"看起来正常"的其它项，不如只报这一条并退出。
+        checks.append(CheckResult(
+            "其余检查", False, "配置文件不可读，无法判断", str(exc),
+        ))
+        raise typer.Exit(0 if _echo_checks(checks, title="Onyx doctor") else 1) from None
+
     path = _db_path(settings, db)
-    checks: list[CheckResult] = []
 
     checks.append(CheckResult(
         "Python ≥ 3.12", sys.version_info >= (3, 12),
@@ -647,7 +808,7 @@ def doctor(
     ))
 
     if not skip_network:
-        checks.append(_check_ollama(ollama_url))
+        checks.append(_check_ollama(_engine_url(ollama_url)))
 
     raise typer.Exit(0 if _echo_checks(checks) else 1)
 
@@ -693,13 +854,14 @@ def probe_list() -> None:
 def probe_run(
     model: str = typer.Option(..., "--model", help="要实测的模型名"),
     suite: str = typer.Option("all", "--suite", help="逗号分隔的探针名，或 all"),
-    url: str = typer.Option("http://127.0.0.1:11434", "--url", help="Ollama base url"),
+    url: str = typer.Option(None, "--url", help="Ollama base url（默认为配置文件 [provider].base_url）"),
     write: Path = typer.Option(None, "--append-to", help="把 markdown 结论追加到该文件"),
 ) -> None:
     """对真实引擎跑语义实验。单 GPU 独占 ⇒ 探针串行执行。"""
     from onyx.llm.providers.ollama import OllamaProvider
     from onyx.probe import registered_probes, render_markdown, run_suite
 
+    url = _engine_url(url)
     names = registered_probes() if suite == "all" else [s.strip() for s in suite.split(",") if s.strip()]
     provider = OllamaProvider(base_url=url)
     if not provider.client.is_reachable():
@@ -731,27 +893,50 @@ traces_app = typer.Typer(help="trace：列表、详情、重放", no_args_is_hel
 app.add_typer(traces_app, name="traces")
 
 
+def _resolved_model(model: str | None, command: str) -> str:
+    """`--model` 没给就用配置文件 `[provider].model`；两处都没有就停下来问。
+
+    停下来而不是猜：默认模型打错，代价是一整轮跑在错的机器上并留下一堆好看的数字。
+    """
+    chosen = pick(model, _config().provider.model)
+    if chosen is None:
+        typer.echo(
+            f"{command} 需要模型名：加 --model，或在配置文件里写 [provider].model", err=True
+        )
+        raise typer.Exit(2)
+    return chosen
+
+
 def _runtime(
-    url: str, db: Path | None, *, sample_gpu: bool = True, provider_kind: str = "ollama",
-    event_sinks: tuple[str, ...] = (),
+    url: str | None, db: Path | None, *, sample_gpu: bool = True,
+    provider_kind: str | None = None, event_sinks: Sequence[str] | None = None,
 ):
     """构造运行时。
 
     `provider_kind` 与 `event_sinks` 是 DESIGN §13 的扩展点在 CLI 上的出口：
     前者换成 `mock` 就能在没有引擎的机器上跑通整条链路（含工具循环与评测，
     这也是离线测试的依据），后者让事件流多路导出到任一已注册的 sink。
+
+    这里是"引擎地址与 kind 从哪来"的唯一收口：flag > 配置文件 > 内建默认。
+    每条命令各自回落的话，早晚会有某条命令悄悄用回 11434，而配置文件里写着别的端口。
     """
     from onyx.runtime import build_runtime
 
+    cfg = _config()
+    kind = pick(provider_kind, cfg.provider.kind, DEFAULT_PROVIDER_KIND)
+    base_url = pick(url, cfg.provider.base_url, DEFAULT_BASE_URL)
+    # `--sink` 没给才用配置里的默认导出；给了就以命令行为准（不要往用户点名的列表里塞东西）
+    sinks = tuple(event_sinks) if event_sinks else tuple(cfg.sinks or ())
+
     # provider_id 必须跟着 kind 走：用 `--provider mock`/插件跑出来的 trace 若仍记成
     # "ollama-local"，那"这个数字来自哪个引擎"就是假的——而它是整个看板的立身之本。
-    provider_id = "ollama-local" if provider_kind == "ollama" else f"{provider_kind}-local"
+    provider_id = "ollama-local" if kind == DEFAULT_PROVIDER_KIND else f"{kind}-local"
     try:
         return build_runtime(
-            provider_kind=provider_kind, provider_id=provider_id, base_url=url,
+            provider_kind=kind, provider_id=provider_id, base_url=base_url,
             db_path=str(db) if db else None,
-            sample_gpu=sample_gpu and provider_kind == "ollama", event_log=False,
-            event_sinks=event_sinks,
+            sample_gpu=sample_gpu and kind == DEFAULT_PROVIDER_KIND, event_log=False,
+            event_sinks=sinks,
         )
     except (KeyError, ValueError) as exc:
         # 扩展点写错名字（provider/sink）是配置错误：报出可选项然后退出，
@@ -762,7 +947,7 @@ def _runtime(
 
 @models_app.command("sync")
 def models_sync(
-    url: str = typer.Option("http://127.0.0.1:11434", "--url"),
+    url: str = typer.Option(None, "--url", help="引擎 base url（默认为配置文件 [provider].base_url）"),
     db: Path = typer.Option(None, "--db"),
 ) -> None:
     """从引擎拉取模型清单并落库。"""
@@ -779,7 +964,7 @@ def models_sync(
 
 @models_app.command("ls")
 def models_ls(
-    url: str = typer.Option("http://127.0.0.1:11434", "--url"),
+    url: str = typer.Option(None, "--url", help="引擎 base url（默认为配置文件 [provider].base_url）"),
     db: Path = typer.Option(None, "--db"),
 ) -> None:
     """列出已安装模型与当前载入状态（显存 / 上下文 / keep-alive 剩余）。"""
@@ -837,10 +1022,12 @@ DEMO_TOOLS = {
 @app.command()
 def chat(
     prompt: str = typer.Argument(..., help="用户消息"),
-    model: str = typer.Option(..., "--model", "-m"),
-    url: str = typer.Option("http://127.0.0.1:11434", "--url"),
+    model: str = typer.Option(
+        None, "--model", "-m", help="模型名（默认为配置文件 [provider].model）"
+    ),
+    url: str = typer.Option(None, "--url", help="引擎 base url（默认为配置文件 [provider].base_url）"),
     provider: str = typer.Option(
-        "ollama", "--provider", help="ollama | mock | 插件 kind（onyx plugins 看全量）"
+        None, "--provider", help="ollama | mock | 插件 kind（onyx plugins 看全量；默认取配置文件）"
     ),
     db: Path = typer.Option(None, "--db"),
     stream: bool = typer.Option(False, "--stream"),
@@ -859,6 +1046,7 @@ def chat(
     from onyx.runtime import sync_models
 
     console = Console()
+    model = _resolved_model(model, "onyx chat")
     runtime = _runtime(url, db, provider_kind=provider, event_sinks=tuple(sink))
     try:
         sync_models(runtime)
@@ -1064,7 +1252,7 @@ def traces_replay(
 
 @probe_app.command("matrix")
 def probe_matrix(
-    url: str = typer.Option("http://127.0.0.1:11434", "--url"),
+    url: str = typer.Option(None, "--url", help="引擎 base url（默认为配置文件 [provider].base_url）"),
     db: Path = typer.Option(None, "--db"),
     markdown: Path = typer.Option(None, "--markdown", help="把矩阵追加到该 markdown 文件"),
 ) -> None:
@@ -1112,7 +1300,7 @@ def probe_matrix(
 def probe_write_back(
     model: str = typer.Option(..., "--model"),
     suite: str = typer.Option("all", "--suite"),
-    url: str = typer.Option("http://127.0.0.1:11434", "--url"),
+    url: str = typer.Option(None, "--url", help="引擎 base url（默认为配置文件 [provider].base_url）"),
     db: Path = typer.Option(None, "--db"),
 ) -> None:
     """跑探针并把结论回灌到模型档案（tool_format / capabilities / 三态能力位）。"""
@@ -1161,7 +1349,7 @@ def probe_write_back(
 def calibrate(
     model: str = typer.Option(..., "--model"),
     n: int = typer.Option(40, "--n", help="样本数（不同长度的 prompt）"),
-    url: str = typer.Option("http://127.0.0.1:11434", "--url"),
+    url: str = typer.Option(None, "--url", help="引擎 base url（默认为配置文件 [provider].base_url）"),
     db: Path = typer.Option(None, "--db"),
     write: bool = typer.Option(True, "--write/--no-write", help="把标定结果写回模型档案"),
 ) -> None:
@@ -1246,16 +1434,17 @@ def calibrate(
 # ── serve ──────────────────────────────────────────────────────────
 @app.command()
 def serve(
-    host: str = typer.Option("127.0.0.1", "--host"),
-    port: int = typer.Option(8000, "--port"),
-    url: str = typer.Option("http://127.0.0.1:11434", "--url", help="引擎 base url"),
+    host: str = typer.Option(None, "--host", help="绑定地址（默认为配置文件 [serve].host）"),
+    port: int = typer.Option(None, "--port", help="端口（默认为配置文件 [serve].port）"),
+    url: str = typer.Option(None, "--url", help="引擎 base url（默认为配置文件 [provider].base_url）"),
     provider: str = typer.Option(
-        "ollama", "--provider", help="ollama | openai-compat | mock | 插件 kind（onyx plugins 看全量）"
+        None, "--provider",
+        help="ollama | openai-compat | mock | 插件 kind（onyx plugins 看全量；默认取配置文件）",
     ),
     db: Path = typer.Option(None, "--db"),
     gpu_lock_path: Path = typer.Option(
         None, "--gpu-lock",
-        help="GPU 锁文件路径；默认机器级路径。多卡机器用它给每个服务一条锁"
+        help="GPU 锁文件路径；默认机器级路径或配置文件 [gpu].lock_path。多卡机器给每个服务一条"
     ),
     sink: list[str] = typer.Option(
         [], "--sink", help="额外的事件导出 sink（onyx.sinks 注册表），可重复；如 jsonl"
@@ -1265,13 +1454,22 @@ def serve(
     import uvicorn
 
     from onyx.api.app import create_app
+    from onyx.eval.gpu_lock import DEFAULT_GPU_STALE_AFTER_S
 
-    provider_id = "ollama-local" if provider == "ollama" else f"{provider}-local"
-    app_obj = create_app(base_url=url, provider_kind=provider, provider_id=provider_id,
+    cfg = _config()
+    host = pick(host, cfg.serve.host, DEFAULT_HOST)
+    port = pick(port, cfg.serve.port, DEFAULT_PORT)
+    kind = pick(provider, cfg.provider.kind, DEFAULT_PROVIDER_KIND)
+    sinks = tuple(sink) if sink else tuple(cfg.sinks or ())
+    lock = pick(gpu_lock_path, cfg.gpu.lock_path)
+    provider_id = "ollama-local" if kind == DEFAULT_PROVIDER_KIND else f"{kind}-local"
+    app_obj = create_app(base_url=_engine_url(url), provider_kind=kind, provider_id=provider_id,
                          db_path=str(db) if db else None,
                          # 显存采样是引擎专有的：非 ollama 通道不去猜
-                         sample_gpu=provider == "ollama",
-                         gpu_lock_path=gpu_lock_path, event_sinks=tuple(sink))
+                         sample_gpu=kind == DEFAULT_PROVIDER_KIND,
+                         gpu_lock_path=lock,
+                         gpu_stale_after_s=pick(cfg.gpu.stale_after_s, DEFAULT_GPU_STALE_AFTER_S),
+                         event_sinks=sinks)
     typer.echo(f"Onyx API: http://{host}:{port}/api/docs")
     uvicorn.run(app_obj, host=host, port=port, log_level="info")
 
@@ -1291,10 +1489,16 @@ def _tool_registry(db: Path | None, model: str | None):
     from onyx.tools.registry import ToolRegistry
 
     settings = _settings()
+    cfg = _config()
+    # 开销也要按"这台机器实际在打哪个引擎"来算：写死 ollama-local 的话，
+    # 配置文件把 kind 换成 openai-compat 之后，这里会去查一个根本不存在的 provider 档案。
+    kind = pick(cfg.provider.kind, DEFAULT_PROVIDER_KIND)
+    provider_id = "ollama-local" if kind == DEFAULT_PROVIDER_KIND else f"{kind}-local"
+    model = pick(model, cfg.provider.model)
     database = Database(_db_path(settings, db))
     count_fn = None
     if model:
-        ctx = counter_ctx_factory(database, "ollama-local")(model)
+        ctx = counter_ctx_factory(database, provider_id)(model)
         count_fn = text_counter(ctx)
         count_fn.source_name = (  # type: ignore[attr-defined]
             "gguf_vocab" if ctx.tokenizer is not None
@@ -1432,15 +1636,19 @@ def tools_mcp_import(
 def _mcp_pool(config: Path | None):
     """拿 MCP 连接池；配置缺失/写错时报可读错误而不是堆栈。"""
     from onyx.core.errors import ToolUnknown
-    from onyx.tools.executors.mcp import config_path, default_pool
+
+    # 起别名：模块级已经有一个 `config_path`（找 onyx.toml），两个"配置文件路径"混在一个
+    # 名字里迟早会读错——MCP 那份是 server 清单，与部署配置毫无关系。
+    from onyx.tools.executors.mcp import config_path as mcp_config_path
+    from onyx.tools.executors.mcp import default_pool
 
     try:
         pool = default_pool(path=config) if config else default_pool()
     except (ToolUnknown, ValueError, OSError) as exc:
         typer.echo(str(exc), err=True)
-        typer.echo(f"（查找路径：{config or config_path()}）", err=True)
+        typer.echo(f"（查找路径：{config or mcp_config_path()}）", err=True)
         raise typer.Exit(2) from None
-    typer.echo(f"MCP 配置：{config or config_path()} · server: {', '.join(sorted(pool.servers))}")
+    typer.echo(f"MCP 配置：{config or mcp_config_path()} · server: {', '.join(sorted(pool.servers))}")
     return pool
 
 
@@ -1794,10 +2002,12 @@ def tools_run(
 @tools_app.command("fire")
 def tools_fire(
     instruction: str = typer.Argument(..., help="给模型的指令"),
-    model: str = typer.Option(..., "--model"),
-    url: str = typer.Option("http://127.0.0.1:11434", "--url"),
+    model: str = typer.Option(None, "--model", help="模型名；不写就用配置文件 [provider].model"),
+    url: str = typer.Option(None, "--url", help="引擎 base url（默认为配置文件 [provider].base_url）"),
     db: Path = typer.Option(None, "--db"),
-    provider: str = typer.Option("ollama", "--provider", help="ollama | mock（离线跑通整条链路）"),
+    provider: str = typer.Option(
+        None, "--provider", help="ollama | mock（离线跑通整条链路；默认取配置文件）"
+    ),
     tools: str = typer.Option(None, "--tools", help="逗号分隔的工具名；不给就用全部已启用的"),
     expect: str = typer.Option(None, "--expect", help="期望调用的工具名；默认取 --tools 的第一个"),
     expect_args: str = typer.Option(None, "--expect-args", help="期望参数 JSON；默认取该工具 examples[0]"),
@@ -1837,6 +2047,7 @@ def tools_fire(
     from onyx.tools.verify import Verdict, verify_case
 
     console = Console()
+    model = _resolved_model(model, "onyx tools fire")
     runtime = _runtime(url, db, provider_kind=provider)
     try:
         sync_models(runtime)
@@ -1969,24 +2180,37 @@ def _fire_expectation(definition, expected_tool: str, expect_args: str | None, e
 
 
 def _policy_from_cli(allow: str | None):
+    """默认最严（只允许 read）。`--allow` 是逐次放开，配置文件 `[sandbox].allowed_side_effects` 是常驻放开。
 
-    """默认最严（只允许 read）。`--allow` 是显式的、逐次生效的放开。"""
-    from onyx.tools.sandbox import PERMISSIVE_POLICY, SandboxPolicy
+    常驻放开同样清掉 `require_approval`：配置文件是人手工编辑的，那次编辑就是审批本身——
+    再要求一个审批回调只会让工具永远被拒，而"为什么被拒"没人说得清。
+    """
+    from onyx.tools.sandbox import DEFAULT_ALLOWED_IMPL_PREFIXES, DEFAULT_TIMEOUT_MS, SandboxPolicy
     from onyx.tools.spec import SideEffect
 
-    if not allow:
-        return SandboxPolicy()
-    wanted = {piece.strip() for piece in allow.split(",") if piece.strip()}
+    cfg = _config().sandbox
+    names = pick(tuple(piece.strip() for piece in allow.split(",")) if allow else None,
+                 cfg.allowed_side_effects)
+    prefixes = cfg.allowed_impl_prefixes or DEFAULT_ALLOWED_IMPL_PREFIXES
+    timeout = pick(cfg.default_timeout_ms, DEFAULT_TIMEOUT_MS)
+    if names is None:
+        return SandboxPolicy(allowed_impl_prefixes=prefixes, default_timeout_ms=timeout)
+    wanted = {piece for piece in names if piece}
     try:
         effects = {SideEffect(piece) for piece in wanted}
-    except ValueError:
-        typer.echo("--allow 取值非法（可选 read/write/network/exec）", err=True)
-        raise typer.Exit(2) from None
+    except ValueError as exc:
+        bad = sorted(piece for piece in wanted if piece not in {e.value for e in SideEffect})
+        typer.echo(
+            f"副作用名字非法：{', '.join(bad)}"
+            "（可选 read/write/network/exec；来自 --allow 或配置文件 [sandbox].allowed_side_effects）",
+            err=True,
+        )
+        raise typer.Exit(2) from exc
     return SandboxPolicy(
         allowed_side_effects=frozenset({SideEffect.READ, *effects}),
-        # CLI 是人在操作，--allow 本身就是审批动作；不再二次弹窗
         require_approval=frozenset(),
-        allowed_impl_prefixes=PERMISSIVE_POLICY.allowed_impl_prefixes,
+        allowed_impl_prefixes=prefixes,
+        default_timeout_ms=timeout,
     )
 
 
@@ -1995,9 +2219,14 @@ eval_app = typer.Typer(help="评测：数据集、任务、运行、分数下钻
 app.add_typer(eval_app, name="eval")
 
 
-def _eval_runtime(url: str, db: Path | None, provider_kind: str = "ollama"):
-    """评测跑在真实 runtime 上：分数与 trace 共用同一套存储与观测。"""
-    return _runtime(url, db, sample_gpu=provider_kind == "ollama", provider_kind=provider_kind)
+def _eval_runtime(url: str | None, db: Path | None, provider_kind: str | None = None):
+    """评测跑在真实 runtime 上：分数与 trace 共用同一套存储与观测。
+
+    `sample_gpu` 的判定放在这里而不是各调用点：显存采样是 ollama 专有的，
+    配置文件把 kind 换成 openai-compat 时不该照着猜。
+    """
+    kind = pick(provider_kind, _config().provider.kind, DEFAULT_PROVIDER_KIND)
+    return _runtime(url, db, sample_gpu=kind == DEFAULT_PROVIDER_KIND, provider_kind=kind)
 
 
 @eval_app.command("ls")
@@ -2210,10 +2439,10 @@ def eval_import(
 @eval_app.command("run")
 def eval_run(
     task: str = typer.Option("intent_classification", "--task"),
-    model: str = typer.Option(..., "--model"),
-    url: str = typer.Option("http://127.0.0.1:11434", "--url"),
+    model: str = typer.Option(None, "--model", help="模型名；不写就用配置文件 [provider].model"),
+    url: str = typer.Option(None, "--url", help="引擎 base url（默认为配置文件 [provider].base_url）"),
     db: Path = typer.Option(None, "--db"),
-    provider: str = typer.Option("ollama", "--provider", help="ollama | mock（离线跑通管道）"),
+    provider: str = typer.Option(None, "--provider", help="ollama | mock（离线跑通管道；默认取配置文件）"),
     dataset: str = typer.Option(None, "--dataset", help="数据集 id 或 file:<路径>；默认用任务自带的"),
     k: int = typer.Option(1, "--k", help="每条样本采样次数（pass^k / pass@k）"),
     limit: int = typer.Option(None, "--limit", help="只跑前 N 条"),
@@ -2254,13 +2483,15 @@ def eval_run(
     from rich.console import Console
 
     from onyx.core.errors import GpuLockBusy
-    from onyx.eval.gpu_lock import GpuLock, default_lock_path
+    from onyx.eval.gpu_lock import DEFAULT_GPU_STALE_AFTER_S, GpuLock, default_lock_path
     from onyx.eval.metrics import jsonable
     from onyx.eval.runner import EvalRunner, RunConfig, wait_for
     from onyx.eval.tasks import build_task, load_dataset
     from onyx.store.repos import EvalRepo
 
     console = Console()
+    model = _resolved_model(model, "onyx eval run")
+    cfg = _config()
     try:
         loaded = load_dataset(dataset, task_id=task)
         overrides = {"max_tokens": max_tokens} if max_tokens else {}
@@ -2277,11 +2508,13 @@ def eval_run(
             def progress(done: int, total: int, case_id: str, grade) -> None:
                 typer.echo(f"\r  {done}/{total}  {case_id[:18]}  {grade.verdict}", nl=False)
 
-        # 默认用机器级路径：GPU 是整台机器一块，锁跟着可覆盖的数据目录走就锁不住多实例
-        lock_path = Path(gpu_lock_path) if gpu_lock_path else default_lock_path()
+        # 默认用机器级路径：GPU 是整台机器一块，锁跟着可覆盖的数据目录走就锁不住多实例。
+        # 配置文件 [gpu].lock_path 是同一件事的常驻版本（多卡机器不必每条命令都带 --gpu-lock）。
+        lock_path = Path(pick(gpu_lock_path, cfg.gpu.lock_path) or default_lock_path())
         lock = GpuLock(
             lock_path, owner=f"eval:{task}@{model}",
-            stale_after_s=600.0,  # 必须大于单条样本的最长耗时，否则会误伤活着的持有者
+            # 必须大于单条样本的最长耗时，否则会误伤活着的持有者（两处调用点共用同一个数）
+            stale_after_s=pick(cfg.gpu.stale_after_s, DEFAULT_GPU_STALE_AFTER_S),
         )
         runner = EvalRunner(
             runtime.gateway, repo, instance, dataset=loaded,
@@ -2830,7 +3063,14 @@ def _force_utf8_stdio() -> None:
 
 def main() -> None:
     _force_utf8_stdio()
-    app()
+    try:
+        app()
+    except ConfigError as exc:
+        # 配置读不出来就别跑：继续用默认值跑一次评测，事后没人记得数字来自哪套配置。
+        # （`onyx doctor` 自己会捕获同一个异常，所以诊断入口仍然可用。）
+        typer.echo(f"配置文件有问题：{exc}", err=True)
+        typer.echo("修好它，或用 --config 指一份能读的；onyx doctor 会列出具体问题。", err=True)
+        raise SystemExit(2) from None
 
 
 if __name__ == "__main__":

@@ -41,6 +41,23 @@ def _clean_discovery():
     reset_failures()
 
 
+@pytest.fixture(autouse=True)
+def _isolated_config(tmp_path_factory, monkeypatch):
+    """测试不许读到开发者机器上的 `onyx.toml`。
+
+    配置系统最阴的测试陷阱就是"在我机器上是绿的"：仓库根放一份本地配置，
+    整个套件就悄悄跑在那份偏好上（引擎端口、保留窗口、锁路径全被改过），
+    于是同一份代码在 CI 上与在写它的人机器上测的是两回事。
+    假根目录放在 `tmp_path` **之外**：有测试会断言"锁的父目录被我清干净了"，
+    往里塞一个目录会让那条断言假红。
+    需要配置文件的测试自己再 setenv——函数级 monkeypatch 在本夹具之后生效，覆盖得掉。
+    """
+    root = tmp_path_factory.mktemp("onyx-config-root")
+    (root / "pyproject.toml").write_text('[project]\nname = "onyx-test-root"\n', encoding="utf-8")
+    monkeypatch.delenv("ONYX_CONFIG", raising=False)
+    monkeypatch.setenv("ONYX_ROOT", str(root))
+
+
 @pytest.fixture
 def clock() -> FakeClock:
     return FakeClock()

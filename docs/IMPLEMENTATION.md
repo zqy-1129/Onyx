@@ -1478,6 +1478,68 @@ uv run onyx db sizes              # 现在 6.5 MiB · 趋势问不出来（两�
 
 ---
 
+## S20 — 部署配置 `onyx.toml`（M8 第一步）✅
+
+**产出文件**
+```
+onyx/config.py                     # Config + schema + load_config / config_path / pick / effective
+onyx/settings.py                   # data_dir 三层优先级；project_root 迁到 config（一份实现）
+onyx/example 模板 → onyx.example.toml # 进版本库的模板；onyx.toml 本身进 .gitignore
+onyx/cli.py                        # 根回调 --config + 验证；每条命令的 flag 默认改 None
+onyx/api/{app,deps}.py             # gpu_stale_after_s 注入，不在装配层读全局配置
+tests/conftest.py                  # _isolated_config：测试永不读开发者本地的 onyx.toml
+tests/unit/test_config.py（25）
+```
+
+**格式换成了 TOML，理由写进 DESIGN §13**：`tomllib` 是标准库，为一配置文件引入 PyYAML
+会把依赖面扩大在最不该扩的地方。承诺（配置外置 + 一条优先级规则）没变。
+`[provider].keep_alive` 这一项**刻意没进 schema**：内核里没有任何请求路径消费它
+（只有 calibrate 预热时写死一个 10m），"配置里有但代码不读"正是这一步要防的失败。
+
+**优先级只有一条规则，且实现方式很具体**：flag > 环境变量 > 配置文件 > 内建默认。
+要让"flag 赢"成立，flag 的内建默认必须一律 `None`——否则 `--url http://127.0.0.1:11434`
+这种写法会永远赢过配置文件，配置文件当场变成摆设且不报错。
+收口放在 `_runtime()` / `_engine_url()` / `_policy_from_cli()` 三处，
+而不是 38 条命令各写一遍回落。
+
+**这一步真机试出来的 bug（已修 + 已钉住）**：`--config` 指到一个不存在的文件时，
+`onyx db info` **照常跑并且退出码 0**——因为 data_dir 从 `ONYX_DATA_DIR` 拿到了值，
+`load_settings()` 的短路让 `load_config()` 根本没被执行。坏配置被静默忽略，
+比没有配置危险得多：每个键都能从更高优先级拿到，于是没有任何一条命令会去读那份文件，
+而人以为 `[serve].port` 生效了。
+修法是**在根回调里先验证再动手**（`_CONFIG_TOLERANT = {doctor, config}` 例外——
+它们就是用来诊断这份文件的），回归测试是
+`test_broken_config_stops_ordinary_commands` + `test_doctor_survives_a_broken_config_because_it_is_the_diagnosis`。
+
+**"写了不生效"的机械检出**：`_SCHEMA` 是唯一事实来源，文件里出现 schema 之外的键/节、
+或类型不对的键（含 `port = true` —— bool 是 int 的子类，会被当成 1 号端口），
+都记进 `unknown` / `problems`，由 `onyx doctor` 的"配置文件"一项指名并让退出码非 0；
+`onyx config show` 则把每一项**生效值 + 它来自哪一层**摊开（报告与命令共用 `effective()`，
+不允许两套回落逻辑）。
+
+**自测（全部实际执行）**
+```bash
+uv run pytest                        # 1082 passed, 1 skipped
+uv run ruff check . && uv run lint-imports     # clean / 3 kept
+uv run coverage report               # 88%（config.py 98%）
+uv run pytest -m live                # 20 passed（gateway/serve/eval 的装配路径都改了）
+
+uv run onyx config show              # 无文件时逐项标 [默认]
+ONYX_CONFIG=.tmp/onyx.toml uv run onyx rotate --json        # raw_after 取自文件 = "7d"
+ONYX_CONFIG=... uv run onyx rotate --raw-after 3d --json    # flag 赢过文件 = "3d"
+ONYX_CONFIG=... uv run onyx chat "只回一句话" --provider mock  # 模型来自 [provider].model
+ONYX_CONFIG=... uv run onyx doctor --skip-network           # ✗ 配置文件 · 不认识的键：serve.pprt
+uv run onyx --config .tmp/nope.toml db info                 # 退出码 2 + 一句人话（以前是 0）
+```
+真机跑配置验证时用 `.tmp/cfgdata` 当 `ONYX_DATA_DIR`，没往仓库的 `.data` 里写测试数据。
+
+**验收 DoD**：M8 出口判据的配置一半——一份文件能声明 provider / 锁 / 保留 / sandbox，
+且"配置项写了但没生效"会被 doctor 报出来。
+
+**提交**：`feat(config): onyx.toml 部署配置 —— 一条优先级规则 + 写了不生效可检出（S20）`
+
+---
+
 ## 附录 A — 每步自测速查
 
 | 步 | 命令 | 绿的条件 |
@@ -1501,6 +1563,7 @@ uv run onyx db sizes              # 现在 6.5 MiB · 趋势问不出来（两�
 | S17 | `onyx rotate && onyx rotate --apply` | 默认不删任何东西；两次数字一致；每次运行有留痕 |
 | S18 | `onyx db backup --to D && onyx db verify-backup D` | 9 项检查全绿；人为删一个 blob 后 verify 与 `doctor` 都报出具体 ref |
 | S19 | `onyx doctor && onyx db sizes` | 磁盘与计量档位两项可见；升级前自动留 `backups/pre-migration-v*.sqlite` |
+| S20 | `onyx config show && onyx doctor` | 每一项标出来自 flag/环境/文件/默认哪一层；未知键与坏类型让 doctor 变红 |
 | 门禁 | `make coverage`（`coverage run -m pytest -q`） | 离线套件分支覆盖率 ≥ 80%（基线 88%） |
 
 ## 附录 B — 架构自测（让"模块化"可验证，而非口号）

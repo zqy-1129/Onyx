@@ -41,6 +41,8 @@ uv run onyx db init         # 初始化 .data/onyx.sqlite
 | M6 扩展 | ✅ | 六个扩展点接 entry points（一处实现语义：坏插件隔离 + 失败可见 + 同名覆盖可查）· 两个真外部插件样板（任务 / provider）· 第二 provider：OpenAI 兼容通道（vLLM / LM Studio / Ollama `/v1`）· MCP 执行器（stdio + JSON-RPC，纯 stdlib）· OTLP 导出 sink · provider/sink/插件三套契约测试 · `scripts/check_extension_boundary.py` 把"接实现不改内核"变成构建门禁 |
 | M7 跑得住 | ✅ | **S17** `onyx rotate`：默认 dry-run、只摘五列重 payload（分数指向的 trace 行永不删）、回收无主 blob、每次运行落 `retention_run` 留痕、单次回收超 60% 直接拦住 · **S18** `onyx db backup` / `verify-backup`：WAL 一致快照（不是 cp）、只装被引用的 blob、逐字节重算 sha256、"引用能否在备份里解析"专抓只备库不备证据 · **S19** `doctor` 补磁盘余量与 token 计量档位（明说 `hf_tokenizer`/`gguf_vocab` 本版本未实现）、迁移前自动留 `backups/pre-migration-v*.sqlite`、`onyx db sizes` 报体积曲线（跨度不足一天就说"问不出来"）· 第五道质量门：离线套件分支覆盖率 ≥ 80%（基线 88%）|
 
+| M8 配置与发行 | 🚧 | **S20 ✅** `onyx.toml` 部署配置（provider / GPU 锁 / 保留窗口 / sandbox / serve 绑定）：优先级只有一条规则 **flag > 环境 > 文件 > 默认**，为此每条命令的 flag 内建默认都改成 `None` —— 带着具体默认值的 flag 会永远赢过配置文件，让它当场变成摆设且不报错 · 格式用 TOML 而不是设计稿里的 YAML，因为 `tomllib` 是标准库而"零运行时基础依赖"是立身之本 · `onyx config show` 逐项标出生效值来自哪一层 · `doctor` 抓"写了不生效"：未知键与坏类型（含 `port = true` 这种被当成 1 号端口的手滑）会指名并报红 · 待做：非回环绑定的 token 姿态、LICENSE/CHANGELOG、GitHub Actions |
+
 **M3 执行层的核心保证**（`onyx tools contract`，离线、零真实网络）：
 8 条契约断言在 3 个执行器上全部适用并通过（各列的 n/a 都写明原因）；
 失败被强制分成 6 种互不相同的 kind —— `arg_error`（模型的错）/ `rejected`（策略）/

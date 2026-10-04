@@ -51,6 +51,7 @@ def create_app(
     db_path: Path | str | None = None,
     sample_gpu: bool = True,
     gpu_lock_path: Path | str | None = None,
+    gpu_stale_after_s: float | None = None,
     event_sinks: tuple[str, ...] = (),
     cors_origins: tuple[str, ...] = ("http://localhost:5173", "http://127.0.0.1:5173"),
 ) -> FastAPI:
@@ -76,7 +77,8 @@ def create_app(
         CORSMiddleware, allow_origins=list(cors_origins), allow_methods=["*"], allow_headers=["*"],
     )
 
-    state = AppState.of(resolved, gpu_lock_path=gpu_lock_path)
+    state = AppState.of(resolved, gpu_lock_path=gpu_lock_path,
+                        gpu_stale_after_s=gpu_stale_after_s)
     # gateway 的事件同时进 SSE 广播
     resolved.events.add(state.broker)
     app.state.onyx = state

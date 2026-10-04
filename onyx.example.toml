@@ -1,0 +1,50 @@
+# Onyx 部署配置示例。复制成仓库根的 `onyx.toml`（该文件名已在 .gitignore 里）即生效。
+#
+# 优先级只有一条规则：**显式 flag > 环境变量 > 本文件 > 内建默认**。
+# 所有键都是可选的；写了但内核不认识的键会被 `onyx doctor` 指名——
+# 配置文件最坏的失败不是报错，而是"写了不生效，看上去一切正常"。
+#
+# 想看每一项当前生效的值和它来自哪一层：`onyx config show`。
+
+# 数据目录（库 + blobs + 缓存）。环境变量 `ONYX_DATA_DIR` 优先于这里。
+# data_dir = "D:/Projects/Onyx/.data"
+
+[provider]
+# 引擎种类：ollama | openai-compat | mock | 已安装插件的 kind（`onyx plugins` 看全量）
+kind = "ollama"
+# 引擎地址。换成 vLLM / LM Studio 时改这里，就不必给每条命令都带 --url
+base_url = "http://127.0.0.1:11434"
+# 日常命令（chat / tools fire / eval run / tools cost）的默认模型。
+# probe 与 calibrate 仍要求显式 --model：它们是"针对某个模型做实验"，猜错代价太大。
+# model = "qwen3.5:9b"
+
+[gpu]
+# GPU 是整台机器一块的资源，所以锁默认是机器级路径（不跟着 data_dir 走）。
+# 多卡机器给每个实例一条锁，例如：
+# lock_path = "C:/Users/you/AppData/Local/Temp/onyx-gpu-gpu1.lock"
+# 心跳超过这个秒数没更新就认为持有者已死、锁可回收。
+# 必须明显大于单条样本的最长耗时，否则会误伤正在正常生成的长请求。
+# stale_after_s = 600.0
+
+[retention]
+# `onyx rotate` 的两个窗口。这里写的是常驻策略，命令行临时覆盖用 --raw-after/--trace-after。
+raw_after = "30d"     # 超出即摘掉原始 body / 渲染 prompt / 工具返回值引用（行保留）
+trace_after = "90d"   # trace 行的保留窗口，只有 --purge-traces 才真的删行
+
+[sandbox]
+# 工具默认只允许 read。常驻放开写在这里，`--allow` 是逐次放开。
+# 两个来源都会清掉审批要求：编辑这份文件本身就是那次审批。
+allowed_side_effects = ["read"]
+# python_fn 执行器允许动态导入的前缀。这是"模型输出决定进程加载什么代码"的唯一闸门。
+allowed_impl_prefixes = ["onyx.tools.builtin.", "mcp:"]
+default_timeout_ms = 10000
+
+[serve]
+host = "127.0.0.1"
+# 8787：本机 8000 已被别的服务占用，前端 vite 代理默认也指向这里
+port = 8787
+
+[sinks]
+# 事件导出（`onyx.sinks` 注册表里的名字）。命令行的 --sink 会覆盖这里。
+# 例：events = ["jsonl", "otlp"]，OTLP 的端点等参数走各自的环境变量
+events = []

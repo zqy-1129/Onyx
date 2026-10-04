@@ -29,20 +29,25 @@ class AppState:
     def of(
         cls, runtime: Runtime, broker: SseBroker | None = None,
         *, gpu_lock_path: Path | str | None = None,
+        gpu_stale_after_s: float | None = None,
     ) -> AppState:
+        from onyx.eval.gpu_lock import DEFAULT_GPU_STALE_AFTER_S
+
         return cls(
             runtime=runtime,
             broker=broker or SseBroker(),
             traces=TraceRepo(runtime.db),
             usage=UsageRepo(runtime.db),
             models=ModelRepo(runtime.db),
-            # 默认机器级路径；只有测试与"确实要换一台 GPU"的部署才覆盖它
+            # 默认机器级路径；只有测试与"确实要换一台 GPU"的部署才覆盖它。
+            # 阈值由调用方注入（配置文件 [gpu].stale_after_s）而不是在这里读全局配置：
+            # 装配层决定"用哪把锁、多快算死"，这里只负责照做。
             gpu_lock=GpuLock(
                 gpu_lock_path or default_lock_path(),
                 owner=f"serve:{runtime.provider.id}",
-                # 阈值必须大于单次请求的最长耗时，否则一个还在正常生成的长请求
-                # 会被排队者判成死锁并抢走 GPU。这里对齐 provider 的 read 超时（600s）
-                stale_after_s=600.0,
+                stale_after_s=(
+                    DEFAULT_GPU_STALE_AFTER_S if gpu_stale_after_s is None else gpu_stale_after_s
+                ),
             ),
         )
 
