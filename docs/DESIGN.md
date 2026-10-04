@@ -625,8 +625,11 @@ CONTRACT_VERSION = 1
 - `plugins_example/`（仓库根，独立可安装的两个小包）就是上面这些契约的活体测试：
   内核若不能容纳一个外部实现，`scripts/check_extension_boundary.py` 会直接把这次提交判失败。
 - 所有契约带版本与能力协商；配置外置 `onyx.toml`（providers、GPU 锁、保留策略、sandbox 白名单、serve 绑定）。
-  落地时把设计稿里的 `.yaml` 换成 `.toml`：`tomllib` 是标准库，而"零运行时基础依赖"是本项目的立身之本——
-  为一配置文件引入 PyYAML 会把依赖面扩大在一个最不该扩的地方。承诺（配置外置、优先级一条规则）没变。
+  落地时把设计稿里的 `.yaml` 换成 `.toml`，理由不是"少一个依赖"而是**依赖落在哪一层**：
+  配置模块被 `onyx.settings` 导入，而 `settings` 在 `runtime`/`store` 这条核心管道上——
+  用 YAML 就等于要求"只用库、不用 CLI"的人也装 `runtime` extra（PyYAML 在那儿）。
+  `tomllib` 是标准库，配置层因此零额外依赖，格式也与 `pyproject.toml` 统一。
+  承诺（配置外置、优先级一条规则）没变。
 
 ---
 

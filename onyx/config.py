@@ -1,7 +1,10 @@
 """部署配置：一个 `onyx.toml` 说清"这台机器上 Onyx 怎么跑"。
 
-为什么是 TOML 而不是 DESIGN §13 里写的 `onyx.yaml`：`tomllib` 是标准库，
-而"零运行时基础依赖"是这个项目的立身之本——为一配置文件引入 PyYAML 不值。
+为什么是 TOML 而不是 DESIGN §13 里写的 `onyx.yaml`：本模块被 `onyx.settings` 导入，
+而 `settings` 在 `runtime` / `store` 这条**核心管道**上——用 YAML 就等于让只用库不用 CLI 的
+人也得装 `runtime` extra（PyYAML 在那里，工具定义导入确实需要它）。
+`tomllib` 是标准库，配置层因此零额外依赖；格式也与 `pyproject.toml` 一致。
+承诺（配置外置、优先级一条规则）没变。
 格式换了，承诺没换：散在各条命令 flag 里的部署取舍收到一处。
 
 **优先级只有一条规则**：显式 flag > 环境变量 > 配置文件 > 内建默认。

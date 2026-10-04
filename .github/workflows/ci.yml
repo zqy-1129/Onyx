@@ -1,0 +1,121 @@
+name: CI
+
+# 五道质量门都在这一段：ruff / import-linter / 边界脚本 / 离线测试 + 覆盖率 / 前端三段。
+# 门禁的意义是"挡下 Things 会顺手绕过的那种失败"，所以每一步都必须非 0 退出才算红：
+# `ruff format` 不是门禁（团队只约束 `ruff check`），覆盖率用 `fail_under` 让命令自己失败。
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: 后端五道门（ruff · 架构契约 · 边界 · 离线测试 · 覆盖率）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 边界脚本要 diff 出"这次改了什么"，浅克隆会拿不到 base 那一层
+          fetch-depth: 0
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # dev+runtime+api+bench 就够跑离线套件（已在本机用干净环境验证过：1113 passed / 89%）。
+      # 不装 tokens/analysis：那是标定档位与 duckdb 分析，不属于门禁必需项。
+      - name: 安装依赖
+        run: uv sync --extra dev --extra runtime --extra api --extra bench
+
+      - name: 代码风格（ruff check，不是 format）
+        run: uv run ruff check .
+
+      - name: 架构契约（import-linter：core 仅 stdlib、网络只许 llm/http/otlp、tools 不碰网络）
+        run: uv run lint-imports
+
+      - name: 扩展点边界（"接实现不改内核"，PR 上比对 base）
+        run: |
+          BASE="${{ github.event.pull_request.base.sha }}"
+          if [ -z "$BASE" ] || [ "$BASE" = "" ]; then BASE="HEAD~1"; fi
+          git fetch --no-tags --depth=50 origin "${GITHUB_SHA}" || true
+          uv run python scripts/check_extension_boundary.py --base "$BASE" --head HEAD --verbose
+
+      - name: 离线测试 + 覆盖率门禁（fail_under=80 让这一步自己失败）
+        run: |
+          uv run coverage run -m pytest -q
+          uv run coverage report
+
+      # `-m live`（20 条）与 `-m probe`（4 条）**不在 CI 跑**：它们真打引擎、真占 GPU，
+      # 也真依赖那块 16GB 显存上的模型清单。这是刻意的分工——CI 保证不回归，
+      # 引擎语义靠真机（结论沉淀在 docs/PROBES.md，每条带引擎版本与证据）。
+      - name: 明确标出未在此运行的两档
+        run: |
+          echo "::notice::需要真实引擎的两档不在 CI 跑；本地补跑请用 make test-live 与 make probe"
+
+  frontend:
+    name: 前端（tsc · vitest · build）
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: onyx/web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: onyx/web/package-lock.json
+      - name: 按 lockfile 安装
+        run: npm ci
+      - name: 类型检查
+        run: npx tsc --noEmit
+      - name: 单测（格式化与徽标语义、token 落脚点）
+        run: npx vitest run
+      - name: 构建
+        run: npx vite build
+
+  install:
+    name: 打包与安装冒烟（新机器一条命令能不能装起来）
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 构建 wheel
+        run: uv build
+
+      # 装进隔离目录，不碰 runner 的全局 tool 路径：
+      # 冒烟要验的是"从产物 wheel 出发能不能跑"，不是"这台机器上恰好装过什么"。
+      - name: 从 wheel 安装并冒烟
+        shell: bash
+        run: |
+          export UV_TOOL_DIR="$RUNNER_TEMP/onyx-tools"
+          export UV_TOOL_BIN_DIR="$RUNNER_TEMP/onyx-bin"
+          uv tool install --from "$(ls dist/*.whl)" --with "onyx[runtime,api]" onyx
+          export PATH="$UV_TOOL_BIN_DIR:$PATH"
+          onyx version
+          onyx --help >/dev/null
+          export ONYX_DATA_DIR="$RUNNER_TEMP/data"
+          onyx db init
+          # mock provider：不依赖任何引擎就能验完"装配 → 落库 → 观测 → 体检"这条链
+          onyx chat "冒烟" --model mock/echo --provider mock | head -3
+          onyx doctor --skip-network | tail -12
+          onyx config show | head -6

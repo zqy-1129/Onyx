@@ -52,13 +52,16 @@ sha256 全对得上，行数/schema/引用可解析共 9 项检查全绿）；
 |---|---|
 | ~~`grep onyx.yaml` 只出现在 DESIGN §13~~ | **S20 已交付**（落地为 `onyx.toml`，理由见 DESIGN §13）：provider / GPU 锁 / 保留窗口 / sandbox / serve 绑定收进一份文件，优先级一条规则 flag > 环境 > 文件 > 默认，`onyx config show` 标出每一项来自哪一层 | 剩下的是发行面：鉴权姿态、CI、LICENSE/CHANGELOG 仍然没有 |
 | ~~`grep APIKey\|Authorization onyx/api` → 0~~ | **S21 已交付**：`--host` 非回环且无 token ⇒ 拒绝启动（退出码 2）；`--read-only` 分开"共享看板"与"共享操作台"；SSE 走 `?token=`（`EventSource` 设不了头），代价写进 README 与错误 hint | 剩下的是团队共享那一档的完整形态（多 token、审计谁在操作）——只有真决定共享给同事时才做 |
-| 无 `.github/`、无 `LICENSE`、无 `CHANGELOG.md`、无 `Dockerfile`；`version = "0.1.0"` 从未升过 | 没有 CI 门禁、没有发行物、没有升级说明；"别人怎么装"只能读 README 猜 |
+| ~~无 `.github/`、无 `CHANGELOG.md`、`version = "0.1.0"` 从未升过~~ | **S22 已交付**：`ci.yml` 跑五道门 + 前端 + 安装冒烟；`CHANGELOG.md`（含版本策略）；版本号单点定义并升到 `0.8.0` | 仍未做：LICENSE / Docker / pipx 发行——它们都挂在"是否对外发行"那个未决问题上 |
 
 **出口判据**：~~一份 `onyx.yaml` 能声明 provider、锁路径、保留策略、sandbox 白名单，
 且 `doctor` 会报告"配置项写了但没生效"~~（S20 达成，落地为 `onyx.toml`；
 doctor 现在会指名未知键与坏类型，真机 `serve.pprt` → 退出码 1）；
-`--host` 非回环时**必须**显式给出 token 或 `--allow-insecure-local`，否则拒绝启动；
-CI 跑 ruff + lint-imports + 离线 + live（有 runner 时）+ 边界脚本，README 顶部一条 `uv tool install` 就装得上。
+`--host` 非回环时**必须**显式给出 token 或 `--allow-insecure-local`，否则拒绝启动（S21 达成：
+真机 `--host 0.0.0.0` 无 token ⇒ 端口根本没绑、退出码 2）；
+CI 跑 ruff + lint-imports + 离线 + 边界 + 覆盖率 + 前端 + 安装冒烟（S22 达成；
+`live` 两档明确不在 CI 跑——它要真引擎真 GPU）；一条 `uv tool install` 就装得上（已在本机用
+干净环境验证：`uv build` → 隔离目录 `uv tool install --from dist/*.whl` → `version/db init/chat/doctor` 全通）。
 
 ### G3 操作闭环：从 CLI 工具到界面产品
 证据：`@router.post` 只有两个端点（`/api/playground/chat`、`/api/admin/models/unload`）。
@@ -117,7 +120,7 @@ CI 上覆盖率有基线数字（不追高，只防跌）；契约矩阵增加"�
 | 里程碑 | 内容 | 步 | 出口判据 |
 |---|---|---|---|
 | **M7 跑得住** | G1 全部：`rotate`、`db backup/verify-backup`、`doctor` 补磁盘 + tokenizer 档位、迁移前自动备份、`.data` 体积报告 | **S17–S19 ✅** | 保留策略可 `--dry-run` 且落库审计 ✅ · 备份可验证恢复 ✅ · `doctor` 在人为破坏后报具体项 ✅（真机：删一个 blob ⇒ 具名 + 退出码 1）· 磁盘与档位两项体检 ✅ · `.data` 曲线 ✅ |
-| **M8 配置与发行** | G2：`onyx.toml`（provider/锁/保留/白名单）+ 优先级与"写了不生效"检查；`--host` 非回环强制 token；LICENSE + CHANGELOG + 版本策略；GitHub Actions 全门禁；`uv tool install .` 冒烟 | **S20–S21 ✅**、S22 | 配置项与 flag 冲突时有明确解释 ✅；非回环无 token 起不来 ✅；仍待：新机器一条命令装好并 `doctor` 全绿、CI 能挡住 lint-imports/边界脚本违规 |
+| **M8 配置与发行** | G2：`onyx.toml`（provider/锁/保留/白名单）+ 优先级与"写了不生效"检查；`--host` 非回环强制 token；CHANGELOG + 版本策略 + GitHub Actions；`uv tool install` 冒烟 | **S20–S22 ✅** | 配置项与 flag 冲突时有明确解释 ✅ · 非回环无 token 起不来 ✅ · 新机器一条命令装好并 `doctor` 全绿 ✅（本机干净环境验过）· CI 能挡住 lint-imports/边界脚本违规 ✅（workflow 就位；仓库尚无远端 ⇒ 待首次真跑）· LICENSE/Docker/pipx 挂在"是否对外发行"这个未决问题上 |
 | **M9 操作闭环** | G3：界面发起评测（锁排队 + 实时进度 + 取消）、数据集导入、工具注册/审计页（Tool Bench）、`models pull/rm` | S23–S26 | 不发一句命令就能完成"选模型 → 跑评测 → 看矩阵 → 下钻 trace"；被中断的 run 状态正确；触发型端点全部过机器级锁 |
 | **M10 观测触达** | G4：告警规则 + 两个出口（本地文件 / 通用 webhook）+ 触发历史页；多引擎观测形态定案（要么一进程多 provider，要么文档化"多实例 + 汇总视图"） | S27–S29 | 人为造一条 `CONTEXT_OVERFLOW` 能在 1 分钟内收到通知并能在界面看到"为什么触发" |
 | **M11 评测资产** | G5：`structured_extraction`、`instruction_following`、长上下文中文集、embedding 任务（先解决 U8/U9 未决实测再上视觉） | S30–S33 | 每个新任务三条同源断言全绿；真机跑一次带分母与 CI；矩阵从 2 列长到 5–6 列且雷达图出现 |
@@ -162,7 +165,7 @@ onyx doctor | grep -c "^│[✓✗]"                                          # 
 grep -rn "@router.post" onyx/api/routes/*.py | wc -l                     # 2：界面只有两个写操作
 grep -rn "APIKey\|Authorization" onyx/api --include=*.py | wc -l         # 2：token 闸已落地（S21，onyx/api/auth.py）
 grep -rln "webhook\|notify" --include=*.py onyx/ | wc -l                 # 0：异常只落库
-ls .github 2>/dev/null | wc -l ; ls LICENSE CHANGELOG.md 2>/dev/null | wc -l   # 0 / 0
+ls .github/workflows | wc -l ; ls LICENSE CHANGELOG.md 2>/dev/null | wc -l   # 1 / 1：CI 与 CHANGELOG 已就位；LICENSE 仍未选
 ls onyx/config.py onyx.example.toml 2>/dev/null | wc -l                   # 2：部署配置已落地（S20，TOML 而非 YAML）
 uv run pytest -m e2e --collect-only 2>&1 | grep collected        # "no tests collected" ⇒ e2e 用例 0 个
 grep -c "aria-\|role=\"" -r onyx/web/src --include=*.tsx                 # 3 处

@@ -5,8 +5,8 @@
 `README.md` 的进度表、`docs/IMPLEMENTATION.md` 的分步档案是历史沿革，
 **这里回答的是"现在有什么、能干什么、还欠什么"**。
 
-一句话：**M0–M7 全部达成（含数据生命周期、可验证备份、体检补齐）；
-欠的是 S7 剩下的 `report usage` / `token explain` 两个入口、Tool Bench 网页，
+一句话：**M0–M8 全部达成（观测 / 看板 / 工具 / 评测 / 对比 / 扩展 / 跑得住 / 配置与鉴权姿态）；
+欠的是 S7 剩下的 `report usage` / `token explain` 两个入口、Tool Bench 网页、M10 的告警出口，
 以及一批"带原因推迟"的项。**
 
 ---
@@ -101,7 +101,7 @@ WAL + 批量 sink（队列满丢样本但 `dropped` 计数可见）、
 ## 2. 质量门与规模
 
 ```
-uv run pytest            # 1113 passed, 1 skipped（S17–S21 新增：retention 28 / backup 20 / doctor 9 / config 25 / auth 31）
+uv run pytest            # 1128 passed, 1 skipped（S17–S22 新增：retention 28 / backup 20 / doctor 9 / config 25 / auth 31 / 发行面 15）
 uv run pytest -m live     # 20 passed（真打 qwen3.5:9b，与评测共用机器级 GPU 锁）
 uv run pytest -m probe     # 4 passed（P 系列实验的可重跑版本）
 uv run ruff check .         # All checks passed（`ruff format` 不是门禁）
@@ -110,7 +110,9 @@ uv run coverage run -m pytest -q && uv run coverage report   # 89% ≥ 80%（分
 uv run python scripts/check_extension_boundary.py   # 接入实现未触碰受保护内核文件
 uv run onyx doctor            # 9 项体检：配置 / Python / 可写 / 磁盘 / 迁移 / blob / 档位 / 插件 / 引擎
 uv run onyx config show       # 每一项生效值标出来自 flag/环境/文件/默认哪一层（token 只报"已设置"）
+uv build && uv tool install --from dist/*.whl …  # 干净环境装起来：version / db init / chat(mock) / doctor 全通
 前端：tsc --noEmit / vitest 49 / vite build（204KB js）+ 浏览器 take_snapshot
+CI：.github/workflows/ci.yml 跑上面这些（本机已验证命令本身可跑通；仓库尚无远端 ⇒ 还没真跑过一次）
 ```
 
 真机跑过的证据（可复查，都在 git 里）：

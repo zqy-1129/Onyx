@@ -1491,8 +1491,11 @@ tests/conftest.py                  # _isolated_config：测试永不读开发者
 tests/unit/test_config.py（25）
 ```
 
-**格式换成了 TOML，理由写进 DESIGN §13**：`tomllib` 是标准库，为一配置文件引入 PyYAML
-会把依赖面扩大在最不该扩的地方。承诺（配置外置 + 一条优先级规则）没变。
+**格式换成了 TOML，理由写进 DESIGN §13**：不是"少一个依赖"，而是**依赖落在哪一层**——
+`config.py` 被 `onyx.settings` 导入，而 `settings` 在 `runtime`/`store` 这条核心管道上，
+用 YAML 就等于要求"只用库不用 CLI"的人也装 `runtime` extra（PyYAML 在那儿，工具定义导入确实需要它）。
+`tomllib` 是标准库，配置层因此零额外依赖。（这句理由在 S22 复查时被从"不想加依赖"改成上面这版——
+原说法把 PyYAML 说成了新依赖，而它本来就在 extra 里。）承诺（配置外置 + 一条优先级规则）没变。
 `[provider].keep_alive` 这一项**刻意没进 schema**：内核里没有任何请求路径消费它
 （只有 calibrate 预热时写死一个 10m），"配置里有但代码不读"正是这一步要防的失败。
 
@@ -1597,6 +1600,58 @@ uv run onyx serve --host 0.0.0.0      → 退出码 2、端口没绑、三行说
 
 ---
 
+## S22 — 版本策略 + CHANGELOG + CI（M8 收口）✅
+
+**产出文件**
+```
+CHANGELOG.md                        # Keep a Changelog 分组 + 版本策略 + "已知边界"一节
+onyx/__init__.py                    # 版本号唯一来源：0.8.0
+pyproject.toml                      # dynamic version + [tool.hatch.version]；覆盖率注释按实测更新
+.github/workflows/ci.yml            # python（五道门）/ frontend（tsc·vitest·build）/ install（打包冒烟）
+tests/unit/test_release_surface.py（15）
+README.md                           # M8 行 + "CI 尚未真跑过一次"的实话 + 版本与变更指针
+```
+
+**版本策略写成政策而不是习惯**：MAJOR 停在 0（没决定发行就没有兼容承诺要维护）、
+**MINOR = 里程碑**（`0.8.0` 就是 M8）、PATCH 只在发行后用于修缺陷。
+版本号此前在 `pyproject.toml` 里写死 `0.1.0` 且从未随里程碑更新，而
+`eval_run.app_version` 一直在往库里落这个假值——配对回归的前提"两次跑的是同一份代码"
+因此从来没有真的可核对过。现在单点定义 + hatchling dynamic 读取，并由测试钉住
+"pyproject 里不许再出现静态 version"。
+
+**CI 的三条原则**
+1. 跑的就是那五道门，一步不少：`ruff check` / `lint-imports` / 边界脚本 / 离线测试 + `coverage report`
+   （`fail_under` 让它自己失败）/ 前端三段。测试 `test_ci_runs_every_documented_gate`
+   逐个断言这些命令还在 workflow 里——被"先删了让 CI 绿"删掉时会说出它当初为什么在。
+2. **不谎跑**：`live` / `probe` 需要真引擎与那块 GPU，workflow 里只以 notice 说明"这两档不在这里跑"，
+   并有测试禁止出现 `pytest -m live` 这种看起来像在 CI 里跑的文本。
+   （写第一版时我在 echo 里放了 `uv run pytest -m live`，被这条测试抓出来了——
+   说明"提一句"和"跑一下"在文本层面确实分不开，所以改成指向 `make test-live`。）
+3. 冒烟验的是"从产物出发能不能装起来"：`uv build` → 隔离 `UV_TOOL_DIR/UV_TOOL_BIN_DIR` 装 wheel →
+   `version / db init / chat --provider mock / doctor / config show`。
+
+**本机验证**（CI 的每步命令都在干净环境里真跑过，不是照抄语法）
+```bash
+UV_PROJECT_ENVIRONMENT=.tmp/ci-env uv sync --extra dev --extra runtime --extra api --extra bench
+  → 1128 passed, 1 skipped · ruff clean · lint-imports 3 kept · coverage 89%
+  → 边界脚本 --base HEAD~1 --head HEAD 可用（PR 上换 base sha）
+uv build → dist/onyx-0.8.0-py3-none-any.whl
+UV_TOOL_DIR/UV_TOOL_BIN_DIR 隔离安装 → onyx version(0.8.0) / db init / chat(mock) / doctor 9 项 ✓
+python -c "yaml.safe_load(ci.yml)" → 3 个 job 解析正常
+```
+第一次做隔离安装时只设了 `UV_TOOL_DIR` 没设 `UV_TOOL_BIN_DIR`，结果 shim 落进了 `~/.local/bin`
+（`which onyx` 拿到的根本不是隔离那份）——已 uninstall 复原，并把两个变量都写进 workflow 与验证步骤。
+
+**没做以及为什么**：LICENSE / Docker / pipx 发布——都挂在"是否对外发行"这个未决决策上，
+默认按"不发行"处理（当前即默认保留所有权利）。决定发行时加一个 `LICENSE` 文件 + 一处政策改写即可。
+
+**验收 DoD**：M8 出口判据达成——新机器一条命令装得上并 `doctor` 全绿（本机干净环境已验），
+CI 能挡住 lint-imports / 边界脚本 / 覆盖率下跌；仓库尚无远端 ⇒ workflow 的首次真跑待推送之后。
+
+**提交**：`chore(release): 0.8.0 —— 版本策略、CHANGELOG 与五道门的 CI（S22）`
+
+---
+
 ## 附录 A — 每步自测速查
 
 | 步 | 命令 | 绿的条件 |
@@ -1622,6 +1677,7 @@ uv run onyx serve --host 0.0.0.0      → 退出码 2、端口没绑、三行说
 | S19 | `onyx doctor && onyx db sizes` | 磁盘与计量档位两项可见；升级前自动留 `backups/pre-migration-v*.sqlite` |
 | S20 | `onyx config show && onyx doctor` | 每一项标出来自 flag/环境/文件/默认哪一层；未知键与坏类型让 doctor 变红 |
 | S21 | `ONYX_SERVE_TOKEN=… onyx serve --host 0.0.0.0 --read-only` | 无 token 时非回环绑定拒绝启动；401/403 都带可行动的 hint；浏览器带 token 全量渲染 |
+| S22 | `uv build && uv tool install --from dist/*.whl onyx`（隔离目录） | 干净环境装起来后 version / db init / chat / doctor 全通；CI 步数被测试钉住 |
 | 门禁 | `make coverage`（`coverage run -m pytest -q`） | 离线套件分支覆盖率 ≥ 80%（S17 落地时 88%，S21 后 89%） |
 
 ## 附录 B — 架构自测（让"模块化"可验证，而非口号）
