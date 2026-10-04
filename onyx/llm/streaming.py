@@ -60,7 +60,8 @@ class StreamAssembler:
 
     同时支持两种线格式：
     - Ollama 原生：`message.content` / `message.thinking` / `message.tool_calls[].function.arguments`(dict)
-    - OpenAI 兼容：`choices[].delta.content` / `.reasoning_content` / `.tool_calls[].function.arguments`(str 分片)
+    - OpenAI 兼容：`choices[].delta.content`（流式）或 `choices[].message.content`（非流式）
+      / `.reasoning_content` / `.tool_calls[].function.arguments`(str 分片)
     """
 
     style: str = "native"  # native | openai
@@ -124,7 +125,9 @@ class StreamAssembler:
 
     def _feed_openai(self, chunk: dict[str, Any]) -> None:
         for choice in chunk.get("choices") or []:
-            delta = choice.get("delta") or {}
+            # 流式形状是 `delta`，非流式是 `message`。两种都吃：如果只认 delta，
+            # 非流式响应会解析成"空正文"，而它看起来和"模型真的没输出"一模一样
+            delta = choice.get("delta") or choice.get("message") or {}
             if text := delta.get("content"):
                 self._content.append(str(text))
             thinking = delta.get("reasoning_content") or delta.get("reasoning")

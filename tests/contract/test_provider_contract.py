@@ -99,11 +99,52 @@ def _make_ollama() -> Any:
     )
 
 
+#: 兼容通道的 stub：只实现 LlmProvider，没有控制面
+def _compat_handler(request: httpx.Request) -> httpx.Response:
+    path = request.url.path
+    if path == "/v1/models":
+        return httpx.Response(200, json={"object": "list", "data": [{
+            "id": "compat/test", "object": "model", "created": 1_700_000_000,
+            "owned_by": "stub", "context_length": 4096,
+        }]})
+    if path == "/v1/chat/completions":
+        payload = json.loads(request.read())
+        usage = {"prompt_tokens": 9, "completion_tokens": 4, "total_tokens": 13}
+        if payload.get("stream"):
+            lines = [
+                {"id": "c1", "object": "chat.completion.chunk", "model": "compat/test",
+                 "choices": [{"index": 0, "delta": {"content": "好的"}}]},
+                {"id": "c1", "object": "chat.completion.chunk", "model": "compat/test",
+                 "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}], "usage": usage},
+            ]
+            body = "".join(f"data: {json.dumps(line)}\n\n" for line in lines) + "data: [DONE]\n\n"
+            return httpx.Response(200, content=body.encode(),
+                                  headers={"content-type": "text/event-stream"})
+        return httpx.Response(200, json={
+            "id": "c1", "object": "chat.completion", "model": "compat/test",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "好的"},
+                         "finish_reason": "stop"}],
+            "usage": usage,
+        })
+    return httpx.Response(404, json={"error": {"message": f"stub 没有这个路径: {path}"}})
+
+
+def _make_compat() -> Any:
+    from onyx.llm.providers.openai_compat import CompatClient, OpenAICompatProvider
+
+    return OpenAICompatProvider(
+        id="compat-stub", base_url="http://stub.local/v1", caps=("chat", "tools"),
+        client=CompatClient("http://stub.local/v1",
+                            transport=httpx.MockTransport(_compat_handler)),
+    )
+
+
 #: 被测实现。**外部插件必须在列**——它才是抽象的验收者
 IMPLS: dict[str, Callable[[], Any]] = {
     "mock": MockProvider,
     "echo_plugin": EchoProvider,
     "ollama_stub": _make_ollama,
+    "openai_compat": _make_compat,
 }
 
 
@@ -226,12 +267,14 @@ def test_gateway_records_a_trace_for_any_provider(provider, store):
     record = TraceRepo(db).get(result.trace_id)
     assert record is not None, "trace 必须落库"
     assert record.output_ref, "输出证据引用必须存在"
-    # token 的出处必须写明：引擎报了就是 engine/high，没报就走本地复算并标低置信度。
+    # token 的出处必须写明，且必须来自阶梯上登记过的档位：
+    # 引擎报了就是 engine/compat，没报就走本地复算并标低置信度。
     # 唯一不被允许的是"什么都不说"，因为那在界面上就是 0
     usage = sink_usage(db, result.trace_id)
     if usage is None:
         pytest.fail("generate 之后必须有 usage 记录（哪怕全是估算值）")
-    assert usage.get("source") in {"engine", "tokenizer", "fitted", "heuristic", "template"}
+    assert usage.get("source") in {str(s) for s in TokenSource}, \
+        f"出处 {usage.get('source')!r} 不在 TokenSource 阶梯里 = 这个数字无法解释"
 
 
 def sink_usage(db, trace_id: str) -> dict[str, Any] | None:

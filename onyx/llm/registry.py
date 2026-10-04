@@ -29,9 +29,16 @@ def _builtin_mock(**kwargs: Any) -> LlmProvider:
     return MockProvider(**kwargs)
 
 
+def _builtin_openai_compat(**kwargs: Any) -> LlmProvider:
+    from onyx.llm.providers.openai_compat import OpenAICompatProvider
+
+    return OpenAICompatProvider(**kwargs)
+
+
 BUILTIN: dict[str, Callable[..., LlmProvider]] = {
     "ollama": _builtin_ollama,
     "mock": _builtin_mock,
+    "openai-compat": _builtin_openai_compat,
 }
 
 
