@@ -20,7 +20,7 @@ Onyx 的目标形态不是 SaaS，也不是通用 LLM 应用框架，而是：
 |---|---|---|
 | **跑得住** | 数据不会把磁盘吃掉，坏了能恢复，出问题能定位 | ⚠️ 保留策略（S17）与可验证备份（S18）已交付；仍缺磁盘与 tokenizer 体检 |
 | **用得起来** | 日常动作不必背 CLI 参数，长任务能看见进度、能取消 | ⚠️ 观测/评测的**写操作全在 CLI**，界面只能读 + Playground |
-| **给别人看** | 部署形态、权限边界、版本与升级是明确的，不靠口头知识 | ⚠️ 配置系统已交付（S20 `onyx.toml`）；仍缺鉴权姿态、CI/发行物/CHANGELOG |
+| **给别人看** | 部署形态、权限边界、版本与升级是明确的，不靠口头知识 | ⚠️ 配置（S20）与非回环 token 姿态（S21）已交付；仍缺 CI/发行物/CHANGELOG |
 
 **核心判断**：功能面其实已经很宽（34 条 CLI、19 个 API 端点、9 个页面、4 种执行器、
 6 个扩展点、24 条实测结论），**缺的不是功能，是"运行多年"的外壳**。
@@ -51,7 +51,7 @@ sha256 全对得上，行数/schema/引用可解析共 9 项检查全绿）；
 | 证据 | 现状 |
 |---|---|
 | ~~`grep onyx.yaml` 只出现在 DESIGN §13~~ | **S20 已交付**（落地为 `onyx.toml`，理由见 DESIGN §13）：provider / GPU 锁 / 保留窗口 / sandbox / serve 绑定收进一份文件，优先级一条规则 flag > 环境 > 文件 > 默认，`onyx config show` 标出每一项来自哪一层 | 剩下的是发行面：鉴权姿态、CI、LICENSE/CHANGELOG 仍然没有 |
-| `grep APIKey\|Authorization onyx/api` → 0 | 无鉴权。默认绑 127.0.0.1 是"隐形安全边界"，一旦 `--host 0.0.0.0` 就变成任何局域网的人能 unload 你的模型、打你的 GPU |
+| ~~`grep APIKey\|Authorization onyx/api` → 0~~ | **S21 已交付**：`--host` 非回环且无 token ⇒ 拒绝启动（退出码 2）；`--read-only` 分开"共享看板"与"共享操作台"；SSE 走 `?token=`（`EventSource` 设不了头），代价写进 README 与错误 hint | 剩下的是团队共享那一档的完整形态（多 token、审计谁在操作）——只有真决定共享给同事时才做 |
 | 无 `.github/`、无 `LICENSE`、无 `CHANGELOG.md`、无 `Dockerfile`；`version = "0.1.0"` 从未升过 | 没有 CI 门禁、没有发行物、没有升级说明；"别人怎么装"只能读 README 猜 |
 
 **出口判据**：~~一份 `onyx.yaml` 能声明 provider、锁路径、保留策略、sandbox 白名单，
@@ -117,7 +117,7 @@ CI 上覆盖率有基线数字（不追高，只防跌）；契约矩阵增加"�
 | 里程碑 | 内容 | 步 | 出口判据 |
 |---|---|---|---|
 | **M7 跑得住** | G1 全部：`rotate`、`db backup/verify-backup`、`doctor` 补磁盘 + tokenizer 档位、迁移前自动备份、`.data` 体积报告 | **S17–S19 ✅** | 保留策略可 `--dry-run` 且落库审计 ✅ · 备份可验证恢复 ✅ · `doctor` 在人为破坏后报具体项 ✅（真机：删一个 blob ⇒ 具名 + 退出码 1）· 磁盘与档位两项体检 ✅ · `.data` 曲线 ✅ |
-| **M8 配置与发行** | G2：`onyx.toml`（provider/锁/保留/白名单）+ 优先级与"写了不生效"检查；`--host` 非回环强制 token；LICENSE + CHANGELOG + 版本策略；GitHub Actions 全门禁；`uv tool install .` 冒烟 | **S20 ✅**、S21–S22 | 配置项与 flag 冲突时有明确解释 **已达成**（`onyx config show` 标层级 + doctor 抓未知键）；新机器一条命令装好并 `doctor` 全绿；CI 能挡住 lint-imports/边界脚本违规 |
+| **M8 配置与发行** | G2：`onyx.toml`（provider/锁/保留/白名单）+ 优先级与"写了不生效"检查；`--host` 非回环强制 token；LICENSE + CHANGELOG + 版本策略；GitHub Actions 全门禁；`uv tool install .` 冒烟 | **S20–S21 ✅**、S22 | 配置项与 flag 冲突时有明确解释 ✅；非回环无 token 起不来 ✅；仍待：新机器一条命令装好并 `doctor` 全绿、CI 能挡住 lint-imports/边界脚本违规 |
 | **M9 操作闭环** | G3：界面发起评测（锁排队 + 实时进度 + 取消）、数据集导入、工具注册/审计页（Tool Bench）、`models pull/rm` | S23–S26 | 不发一句命令就能完成"选模型 → 跑评测 → 看矩阵 → 下钻 trace"；被中断的 run 状态正确；触发型端点全部过机器级锁 |
 | **M10 观测触达** | G4：告警规则 + 两个出口（本地文件 / 通用 webhook）+ 触发历史页；多引擎观测形态定案（要么一进程多 provider，要么文档化"多实例 + 汇总视图"） | S27–S29 | 人为造一条 `CONTEXT_OVERFLOW` 能在 1 分钟内收到通知并能在界面看到"为什么触发" |
 | **M11 评测资产** | G5：`structured_extraction`、`instruction_following`、长上下文中文集、embedding 任务（先解决 U8/U9 未决实测再上视觉） | S30–S33 | 每个新任务三条同源断言全绿；真机跑一次带分母与 CI；矩阵从 2 列长到 5–6 列且雷达图出现 |
@@ -160,7 +160,7 @@ grep -rn "prune\|retention\|vacuum" --include=*.py onyx/ | wc -l        # 32：�
 grep -rln "create_backup\|verify_backup" --include=*.py onyx/ | wc -l    # 3：备份与验证（S18）
 onyx doctor | grep -c "^│[✓✗]"                                          # 9：体检项（S19 磁盘/档位、S20 配置）
 grep -rn "@router.post" onyx/api/routes/*.py | wc -l                     # 2：界面只有两个写操作
-grep -rn "APIKey\|Authorization" onyx/api --include=*.py | wc -l         # 0：无鉴权（S21 要改的就是这个）
+grep -rn "APIKey\|Authorization" onyx/api --include=*.py | wc -l         # 2：token 闸已落地（S21，onyx/api/auth.py）
 grep -rln "webhook\|notify" --include=*.py onyx/ | wc -l                 # 0：异常只落库
 ls .github 2>/dev/null | wc -l ; ls LICENSE CHANGELOG.md 2>/dev/null | wc -l   # 0 / 0
 ls onyx/config.py onyx.example.toml 2>/dev/null | wc -l                   # 2：部署配置已落地（S20，TOML 而非 YAML）

@@ -60,9 +60,9 @@ branch = true
 
 [tool.coverage.report]
 # 门禁是 80%，但**必须用离线套件量**：CI 机器上不一定有 Ollama。
-# 基线（2026-10-04，离线 1018 项 / 分支覆盖）= 88%，最低的是 probe/checks 17%
+# 基线（2026-10-04，离线 1113 项 / 分支覆盖）= 89%，最低的是 probe/checks 17%
 # （那些代码只在 `-m live` / `-m probe` 里跑，离线量不到）。
-# 留 8 个点的余量：低到刚好贴线的门禁会在下一次正常改动时被绕过。
+# 留 9 个点的余量：低到刚好贴线的门禁会在下一次正常改动时被绕过。
 fail_under = 80
 show_missing = true
 skip_covered = false

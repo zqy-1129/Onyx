@@ -226,6 +226,7 @@ def test_chat_stops_when_no_model_is_known(tmp_path, monkeypatch):
 
 def test_serve_reads_host_port_lock_and_stale(tmp_path, monkeypatch):
     captured: dict[str, object] = {}
+    served: dict[str, object] = {}
 
     def fake_create_app(**kwargs):
         captured.update(kwargs)
@@ -236,9 +237,10 @@ def test_serve_reads_host_port_lock_and_stale(tmp_path, monkeypatch):
     import onyx.api.app as app_module
 
     monkeypatch.setattr(app_module, "create_app", fake_create_app)
-    monkeypatch.setattr(uvicorn, "run", lambda *a, **k: None)
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kw: served.update(kw))
+    # 0.0.0.0 现在必须带 token（S21 的姿态）：这里正是要验证"配置文件里的 host 真的传到了 uvicorn"
     _write(tmp_path, monkeypatch, (
-        '[serve]\nhost = "0.0.0.0"\nport = 9123\n'
+        '[serve]\nhost = "0.0.0.0"\nport = 9123\ntoken = "cfg-token"\n'
         '[gpu]\nlock_path = "D:/tmp/onyx-gpu-2.lock"\nstale_after_s = 333.0\n'
     ))
 
@@ -247,6 +249,8 @@ def test_serve_reads_host_port_lock_and_stale(tmp_path, monkeypatch):
     assert result.exit_code == 0, result.output
     assert captured["gpu_lock_path"] == "D:/tmp/onyx-gpu-2.lock"
     assert captured["gpu_stale_after_s"] == 333.0
+    assert captured["token"] == "cfg-token"
+    assert served["host"] == "0.0.0.0" and served["port"] == 9123
 
     with_explicit = runner.invoke(app, ["serve", "--gpu-lock", "D:/tmp/flag.lock"])
     assert with_explicit.exit_code == 0, with_explicit.output

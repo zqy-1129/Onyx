@@ -1449,11 +1449,32 @@ def serve(
     sink: list[str] = typer.Option(
         [], "--sink", help="额外的事件导出 sink（onyx.sinks 注册表），可重复；如 jsonl"
     ),
+    token: str = typer.Option(
+        None, "--token",
+        help="访问 token（优先用环境变量 ONYX_SERVE_TOKEN，别把密钥写进会备份的文件）",
+    ),
+    read_only: bool = typer.Option(
+        None, "--read-only/--no-read-only",
+        help="只读：GET 放行、写操作 403。共享看板时挡住别人往你 GPU 上打请求",
+    ),
+    allow_insecure_local: bool = typer.Option(
+        False, "--allow-insecure-local",
+        help="明知是非回环绑定也不设 token（只建议临时排障；这个 flag 故意不进配置文件）",
+    ),
 ) -> None:
-    """启动 REST + SSE 服务（看板后端）。"""
+    """启动 REST + SSE 服务（看板后端）。
+
+    非回环绑定（`0.0.0.0` 或某个局域网地址）没有 token 时**拒绝启动**：
+    默认绑 127.0.0.1 从来不是鉴权，只是碰巧没人连得上；一旦放开，
+    同网段任何人都能读走你的 prompt 与原始 body、往你的 GPU 上打请求、unload 你的模型。
+    """
+    import os as _os
+
     import uvicorn
 
     from onyx.api.app import create_app
+    from onyx.api.auth import is_loopback
+    from onyx.config import ENV_TOKEN
     from onyx.eval.gpu_lock import DEFAULT_GPU_STALE_AFTER_S
 
     cfg = _config()
@@ -1462,6 +1483,27 @@ def serve(
     kind = pick(provider, cfg.provider.kind, DEFAULT_PROVIDER_KIND)
     sinks = tuple(sink) if sink else tuple(cfg.sinks or ())
     lock = pick(gpu_lock_path, cfg.gpu.lock_path)
+    secret = pick(token, _os.environ.get(ENV_TOKEN) or None, cfg.serve.token)
+    readonly = pick(read_only, cfg.serve.read_only, False)
+
+    if not is_loopback(host) and not secret and not allow_insecure_local:
+        typer.echo(
+            f"拒绝启动：--host {host} 是非回环绑定，而我没有 token。",
+            err=True,
+        )
+        typer.echo(
+            "  同网段的人将能读走你所有的 prompt 与原始 body、往你的 GPU 上打请求、"
+            "unload 你正在用的模型。",
+            err=True,
+        )
+        typer.echo(
+            f"  二选一：设 {ENV_TOKEN}=... （或 --token / 配置文件 [serve].token），"
+            "共享时再加 --read-only；\n"
+            "          确实要在信任网络里裸跑，就显式加 --allow-insecure-local。",
+            err=True,
+        )
+        raise typer.Exit(2)
+
     provider_id = "ollama-local" if kind == DEFAULT_PROVIDER_KIND else f"{kind}-local"
     app_obj = create_app(base_url=_engine_url(url), provider_kind=kind, provider_id=provider_id,
                          db_path=str(db) if db else None,
@@ -1469,8 +1511,13 @@ def serve(
                          sample_gpu=kind == DEFAULT_PROVIDER_KIND,
                          gpu_lock_path=lock,
                          gpu_stale_after_s=pick(cfg.gpu.stale_after_s, DEFAULT_GPU_STALE_AFTER_S),
-                         event_sinks=sinks)
-    typer.echo(f"Onyx API: http://{host}:{port}/api/docs")
+                         event_sinks=sinks,
+                         token=secret, read_only=bool(readonly))
+    typer.echo(
+        f"Onyx API: http://{host}:{port}/api/docs"
+        + (f"  · token 已启用{' · 只读' if readonly else ''}" if secret else "")
+        + ("" if secret or is_loopback(host) else "  · 警告：非回环绑定且无 token")
+    )
     uvicorn.run(app_obj, host=host, port=port, log_level="info")
 
 

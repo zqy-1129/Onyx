@@ -1540,6 +1540,63 @@ uv run onyx --config .tmp/nope.toml db info                 # 退出码 2 + 一�
 
 ---
 
+## S21 — 非回环绑定的 token 姿态（M8 第二步）✅
+
+**产出文件**
+```
+onyx/api/auth.py                     # is_loopback / install_auth（token + 可选只读）
+onyx/api/app.py                      # create_app(token=…, read_only=…)
+onyx/cli.py                          # serve：--token / --read-only / --allow-insecure-local + 启动姿态
+onyx/config.py + onyx.example.toml   # [serve].token / [serve].read_only（token 值不落终端）
+onyx/web/src/api/token.ts            # URL ?token= → sessionStorage；fetch 走 header、SSE 走 query
+onyx/web/src/api/{client,sse}.ts     # 带上 Authorization；401 给可行动提示；顺手修掉"默认 8000"的旧文案
+tests/unit/test_api_auth.py（31）+ web/src/__tests__/token.test.ts（5）
+```
+
+**姿态本身**：`--host` 是非回环地址而没有 token ⇒ **拒绝启动**（退出码 2），并给出两条出路
+（设 token / 显式 `--allow-insecure-local`）。默认绑 127.0.0.1 从来不是鉴权，只是碰巧没人连得上；
+一旦放开，同网段任何人能读走全部 prompt 与原始 body、往 GPU 上打请求、unload 正在用的模型。
+`--allow-insecure-local` **故意不可写进配置文件**：那是一次决定，不是一劳永逸。
+
+**几个具体取舍（都是会做错的地方）**
+- **回环判定用 `ipaddress`，不用 `startswith("127.")`**：`127.0.0.1.evil.com` 也满足前缀，
+  而它是攻击者控制的域名。判不出 IP 的名字一律当非回环（宁可多要一次 token）。
+- **token 比较用 `hmac.compare_digest`**：`==` 按字节短路返回，反复请求能逐字节猜出 token。
+- **闸覆盖所有 `/api`，含 `/api/docs` 与 `/api/openapi.json`**：它们暴露能力面；
+  但不拦 SPA 静态资源——拦了只会白屏，保护不了任何数据。
+- **`install_auth(token="")` 直接抛错**：空 token 装出来的是一道永远过不去的闸，
+  比没有闸更擅长伪装（看起来"启用了鉴权"）。
+- **SSE 允许 `?token=`**：`EventSource` 设不了请求头，没有第二条路。代价写进 README 与
+  错误体的 `hint` 里 —— 它会进浏览器历史、Referer 与中间层日志。
+- **只读模式替代不了鉴权**，它只把"共享看板"和"共享操作台"分开：GET/HEAD 放行，写操作 403 并说清怎么放开。
+- 错误体形状与 `api/routes` 一致（`{error:{code,message,detail}}`），字段统一叫 `hint`：
+  前端只认一个约定，两个名字就会有一个不显示。
+- `config show` 对 token 只报"已设置（N 字符，值不打印）"——报告是会被贴进终端和截图的。
+
+**自测（全部实际执行）**
+```bash
+uv run pytest                       # 1113 passed, 1 skipped（auth 31 + token.ts 5）
+uv run ruff check . && uv run lint-imports    # clean / 3 kept
+cd onyx/web && npx tsc --noEmit && npx vitest run && npx vite build   # 49 tests / 204KB js
+ONYX_SERVE_TOKEN=… uv run onyx serve --port 8787
+  curl /api/fleet                     → 401 + {"code":"UNAUTHORIZED","detail":{"hint":"带 Authorization…"}}
+  curl -H "Authorization: Bearer …"   → 200 ；?token=… → 200 ；Bearer 错误 / 少了 Bearer 前缀 → 401
+  curl /api/docs                      → 401（能力面也在闸内）
+  --read-only + POST                  → 403 READ_ONLY，hint 说怎么放开
+uv run onyx serve --host 0.0.0.0      → 退出码 2、端口没绑、三行说清出路
+浏览器（vite:5173 代理到带 token 的后端）：
+  无 token            → 页面显示"这个 Onyx 看板需要 token 才能读数据 · UNAUTHORIZED"
+  /?token=…          → Fleet 全量渲染（引擎 v0.35.1 · schema v6 · 3 个已安装模型），console 零错误
+  再去掉 URL 的 token → 仍然正常（sessionStorage 接住了），证明"每页都要贴 token"是不必要的折磨
+```
+
+**验收 DoD**：M8 的鉴权姿态达成——"不小心把看板开放给全网"从运行时才发现变成启动时就起不来；
+共享场景有只读档；且未鉴权路径的失败是**具名可行动**的，不是一屏空白。
+
+**提交**：`feat(api): 非回环绑定强制 token —— 起不来比敞着强（S21）`
+
+---
+
 ## 附录 A — 每步自测速查
 
 | 步 | 命令 | 绿的条件 |
@@ -1564,7 +1621,8 @@ uv run onyx --config .tmp/nope.toml db info                 # 退出码 2 + 一�
 | S18 | `onyx db backup --to D && onyx db verify-backup D` | 9 项检查全绿；人为删一个 blob 后 verify 与 `doctor` 都报出具体 ref |
 | S19 | `onyx doctor && onyx db sizes` | 磁盘与计量档位两项可见；升级前自动留 `backups/pre-migration-v*.sqlite` |
 | S20 | `onyx config show && onyx doctor` | 每一项标出来自 flag/环境/文件/默认哪一层；未知键与坏类型让 doctor 变红 |
-| 门禁 | `make coverage`（`coverage run -m pytest -q`） | 离线套件分支覆盖率 ≥ 80%（基线 88%） |
+| S21 | `ONYX_SERVE_TOKEN=… onyx serve --host 0.0.0.0 --read-only` | 无 token 时非回环绑定拒绝启动；401/403 都带可行动的 hint；浏览器带 token 全量渲染 |
+| 门禁 | `make coverage`（`coverage run -m pytest -q`） | 离线套件分支覆盖率 ≥ 80%（S17 落地时 88%，S21 后 89%） |
 
 ## 附录 B — 架构自测（让"模块化"可验证，而非口号）
 

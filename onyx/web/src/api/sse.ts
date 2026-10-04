@@ -2,6 +2,8 @@
  *  断线自动重连；事件按 trace/client_key 关联，避免多模型并排时串台。 */
 import { useEffect, useRef, useState } from 'react'
 
+import { withToken } from './token'
+
 export interface TraceEventDto {
   v: number
   type: string
@@ -33,7 +35,8 @@ export function useSse(filter?: (event: TraceEventDto) => boolean): SseState {
 
     const connect = () => {
       if (stopped) return
-      source = new EventSource('/api/stream')
+      // token 只能走 query：EventSource 没有设请求头的办法
+      source = new EventSource(withToken('/api/stream'))
       source.onopen = () => setState((s) => ({ ...s, connected: true, error: null }))
       source.onerror = () => {
         setState((s) => ({ ...s, connected: false, error: 'SSE 连接中断，重连中' }))

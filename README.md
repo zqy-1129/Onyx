@@ -39,9 +39,9 @@ uv run onyx db init         # 初始化 .data/onyx.sqlite
 | M4 评测 | ✅ | 评测内核（task/grade/runner + 指标层 + bootstrap CI）· 6 个评分器 + 类型感知参数比对 · 236 条中文意图集 + 97 条工具调用集 · `intent_classification` 与 `tool_selection` 各一次真机运行 · BFCL 导入器 · GPU 独占锁（跨进程 + 心跳 + ETA），eval/Playground/live 测试互相排队 |
 | M5 对比 | ✅ | 模型 × 任务矩阵 + 配对回归 diff（净改善/净劣化 + 配对 bootstrap CI + 劣化清单）· Eval / 矩阵 / 回归三页已在真实浏览器实测 · md/csv/自包含 html 报告导出 · 每次运行带数据集来历 |
 | M6 扩展 | ✅ | 六个扩展点接 entry points（一处实现语义：坏插件隔离 + 失败可见 + 同名覆盖可查）· 两个真外部插件样板（任务 / provider）· 第二 provider：OpenAI 兼容通道（vLLM / LM Studio / Ollama `/v1`）· MCP 执行器（stdio + JSON-RPC，纯 stdlib）· OTLP 导出 sink · provider/sink/插件三套契约测试 · `scripts/check_extension_boundary.py` 把"接实现不改内核"变成构建门禁 |
-| M7 跑得住 | ✅ | **S17** `onyx rotate`：默认 dry-run、只摘五列重 payload（分数指向的 trace 行永不删）、回收无主 blob、每次运行落 `retention_run` 留痕、单次回收超 60% 直接拦住 · **S18** `onyx db backup` / `verify-backup`：WAL 一致快照（不是 cp）、只装被引用的 blob、逐字节重算 sha256、"引用能否在备份里解析"专抓只备库不备证据 · **S19** `doctor` 补磁盘余量与 token 计量档位（明说 `hf_tokenizer`/`gguf_vocab` 本版本未实现）、迁移前自动留 `backups/pre-migration-v*.sqlite`、`onyx db sizes` 报体积曲线（跨度不足一天就说"问不出来"）· 第五道质量门：离线套件分支覆盖率 ≥ 80%（基线 88%）|
+| M7 跑得住 | ✅ | **S17** `onyx rotate`：默认 dry-run、只摘五列重 payload（分数指向的 trace 行永不删）、回收无主 blob、每次运行落 `retention_run` 留痕、单次回收超 60% 直接拦住 · **S18** `onyx db backup` / `verify-backup`：WAL 一致快照（不是 cp）、只装被引用的 blob、逐字节重算 sha256、"引用能否在备份里解析"专抓只备库不备证据 · **S19** `doctor` 补磁盘余量与 token 计量档位（明说 `hf_tokenizer`/`gguf_vocab` 本版本未实现）、迁移前自动留 `backups/pre-migration-v*.sqlite`、`onyx db sizes` 报体积曲线（跨度不足一天就说"问不出来"）· 第五道质量门：离线套件分支覆盖率 ≥ 80%（落地时基线 88%，S21 后 89%）|
 
-| M8 配置与发行 | 🚧 | **S20 ✅** `onyx.toml` 部署配置（provider / GPU 锁 / 保留窗口 / sandbox / serve 绑定）：优先级只有一条规则 **flag > 环境 > 文件 > 默认**，为此每条命令的 flag 内建默认都改成 `None` —— 带着具体默认值的 flag 会永远赢过配置文件，让它当场变成摆设且不报错 · 格式用 TOML 而不是设计稿里的 YAML，因为 `tomllib` 是标准库而"零运行时基础依赖"是立身之本 · `onyx config show` 逐项标出生效值来自哪一层 · `doctor` 抓"写了不生效"：未知键与坏类型（含 `port = true` 这种被当成 1 号端口的手滑）会指名并报红 · 待做：非回环绑定的 token 姿态、LICENSE/CHANGELOG、GitHub Actions |
+| M8 配置与发行 | 🚧 | **S20 ✅** `onyx.toml` 部署配置（provider / GPU 锁 / 保留窗口 / sandbox / serve 绑定）：优先级只有一条规则 **flag > 环境 > 文件 > 默认**，为此每条命令的 flag 内建默认都改成 `None` —— 带着具体默认值的 flag 会永远赢过配置文件，让它当场变成摆设且不报错 · 格式用 TOML 而不是设计稿里的 YAML，因为 `tomllib` 是标准库而"零运行时基础依赖"是立身之本 · `onyx config show` 逐项标出生效值来自哪一层（token 只报"已设置"，值不落终端） · `doctor` 抓"写了不生效"：未知键与坏类型（含 `port = true` 这种被当成 1 号端口的手滑）会指名并报红 · **S21 ✅** 非回环绑定的姿态：`--host 0.0.0.0` 没有 token 就**拒绝启动**（退出码 2），共享时 `--read-only` 只让看不让操作 · 待做：LICENSE/CHANGELOG、GitHub Actions |
 
 **M3 执行层的核心保证**（`onyx tools contract`，离线、零真实网络）：
 8 条契约断言在 3 个执行器上全部适用并通过（各列的 n/a 都写明原因）；
@@ -110,7 +110,7 @@ tool 消息**——少一条，之后每次请求的上下文都永久错位，�
 它进台账，`onyx plugins` / `onyx eval tasks` 会打印出来并以退出码 1 结束，
 `onyx doctor` 也多了一项体检。只隔离不报告，等于把"插件没生效"伪装成"插件正常工作"。
 
-**第五道质量门是覆盖率**（`make coverage`）：离线套件分支覆盖 **≥ 80%**，基线实测 88%。
+**第五道质量门是覆盖率**（`make coverage`）：离线套件分支覆盖 **≥ 80%**，基线实测 89%（1113 项）。
 门禁挂在门禁上而不是文档里——`fail_under` 让 `coverage report` 直接以非 0 退出。
 用分支覆盖而不是语句覆盖，是因为这个项目的正确性大量住在 `if x is None` 的分岔上
 （"未知"与"没有"必须走两条路），只数语句会让"两岔只走过一岔"的文件显得很像样。
@@ -123,7 +123,24 @@ source=engine，confidence=high）、分段归因（`msg:0=8 + template_ctl=11 =
 评测怎么跑才不出错觉：[`docs/eval-recipes.md`](docs/eval-recipes.md)。
 **现在到底有什么、还欠什么**：[`docs/STATUS.md`](docs/STATUS.md)（数字当场核对，含核对命令）。
 
-下一步（S9 收尾）：Playground 页（多模型并排、thinking 分栏、工具面板、SSE 实时增量）与 Token Ledger 页。
+下一步见 [`docs/ROADMAP.md`](docs/ROADMAP.md)（M8 剩下的发行面 + M9 界面发起评测，含三个需要决策的问题）。
+
+## 共享给同事看（非回环绑定）
+
+`onyx serve` 默认绑 `127.0.0.1` —— 那**不是**鉴权，只是碰巧没人连得上。
+要局域网共享就必须带 token，否则**拒绝启动**（退出码 2），因为看板里有你全部的 prompt 与原始 body，
+而且它能往你的 GPU 上打请求、unload 你正在用的模型：
+
+```bash
+ONYX_SERVE_TOKEN=… uv run onyx serve --host 0.0.0.0 --read-only
+#   浏览器打开 http://<本机IP>:8787/?token=…      （token 只报"已设置"，不会被打进 config show 的输出）
+```
+
+- `--read-only`：GET 放行、写操作 403 并说明怎么放开 —— 共享"看一眼"与共享"操作台"是两件事。
+- 优先用环境变量而不是配置文件写 token：文件会跟着备份、截图和 `git status` 漂走。
+- `--allow-insecure-local` 可以裸跑，但**故意不可写进配置文件**：每次都要显式说一遍。
+- SSE 只能走 `?token=`（`EventSource` 设不了请求头），所以这个 token 会出现在 URL、
+  浏览器历史与任何中间层日志里 —— 能走 header 就走 header。
 
 ## 前端
 
@@ -139,7 +156,7 @@ npm run build      # tsc + vite build
 ```
 技术选型：Vite + React + TS + **手写 CSS 设计 token**，不引 Tailwind / 组件库 / 图表库。
 高密度看板的价值在像素级控制（28px 行高、tabular-nums、1px 分隔线），
-而图表形态固定，手写 SVG 比引 400KB 图表库更可控。产物 172KB JS / 12KB CSS。
+而图表形态固定，手写 SVG 比引 400KB 图表库更可控。产物 204KB JS / 13KB CSS（gzip 66KB / 3.5KB）。
 
 ## 目录
 

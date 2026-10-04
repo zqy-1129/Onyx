@@ -43,6 +43,14 @@ default_timeout_ms = 10000
 host = "127.0.0.1"
 # 8787：本机 8000 已被别的服务占用，前端 vite 代理默认也指向这里
 port = 8787
+# 非回环绑定（host 不是 127.0.0.1/::1/localhost）没有 token 时 serve 会拒绝启动。
+# 更推荐用环境变量：token 写进文件就会跟着备份、截图和 git status 漂走。
+#   ONYX_SERVE_TOKEN=… onyx serve --host 0.0.0.0
+# token = "…"
+# 只读 = 让同事看得见底数但不许操作（Playground / unload / 导入会 403 并说明怎么放开）
+# read_only = true
+# 注意：`allow_insecure_local` 这种"我知道我在干什么"的开关故意不放进配置文件 ——
+# 它必须是每次启动时的一次决定，而不是一次写死永久生效。
 
 [sinks]
 # 事件导出（`onyx.sinks` 注册表里的名字）。命令行的 --sink 会覆盖这里。

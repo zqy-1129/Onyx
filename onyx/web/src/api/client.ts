@@ -2,6 +2,8 @@
  *  错误统一成 ApiError{code,message,detail}——后端保证不返回堆栈，前端也不该把
  *  原始 Response 到处传。 */
 
+import { authHeaders } from './token'
+
 export class ApiError extends Error {
   code: string
   status: number
@@ -20,13 +22,14 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let resp: Response
   try {
     resp = await fetch(path, {
-      headers: { 'content-type': 'application/json' },
       ...init,
+      // 每个请求都要带 Authorization（非回环部署时）；content-type 由本文件统一给
+      headers: authHeaders({ 'content-type': 'application/json' }),
     })
   } catch (err) {
     // 网络层失败（后端没起）：给出可行动的提示，而不是 "Failed to fetch"
     throw new ApiError(0, 'NETWORK', `无法连接 Onyx API：${(err as Error).message}`, {
-      hint: '确认已运行 onyx serve（默认 http://127.0.0.1:8000）',
+      hint: '确认已运行 onyx serve（默认 http://127.0.0.1:8787）',
     })
   }
   const text = await resp.text()
@@ -37,7 +40,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       resp.status,
       error?.code ?? 'HTTP_' + resp.status,
       error?.message ?? resp.statusText,
-      (error?.detail as Record<string, unknown>) ?? {},
+      (error?.detail as Record<string, unknown>) ??
+        (resp.status === 401 ? { hint: '这个看板要 token：在地址后加 ?token=…（只读共享时最省事）' } : {}),
     )
   }
   return body as T

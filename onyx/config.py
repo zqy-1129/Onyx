@@ -25,6 +25,8 @@ from typing import Any
 CONFIG_NAME = "onyx.toml"
 ENV_CONFIG_PATH = "ONYX_CONFIG"
 ENV_DATA_DIR = "ONYX_DATA_DIR"
+#: token 优先走环境变量而不是配置文件：写进文件的 token 会跟着备份、截图和 git status 漂走。
+ENV_TOKEN = "ONYX_SERVE_TOKEN"
 
 
 class ConfigError(ValueError):
@@ -65,6 +67,11 @@ class SandboxConfig:
 class ServeConfig:
     host: str | None = None
     port: int | None = None
+    #: 局域网共享看板的闸门。优先用环境变量 `ONYX_SERVE_TOKEN`：
+    #: 把 token 写进文件意味着它会跟着备份、截图和 git 状态一起漂走。
+    token: str | None = None
+    #: 只读 = 挡住"别人往你的 GPU 上打请求 / unload 你的模型"，挡不住读。
+    read_only: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -100,7 +107,7 @@ _SCHEMA: dict[str | None, dict[str, tuple[type, ...]]] = {
         "allowed_impl_prefixes": (list,),
         "default_timeout_ms": (int,),
     },
-    "serve": {"host": (str,), "port": (int,)},
+    "serve": {"host": (str,), "port": (int,), "token": (str,), "read_only": (bool,)},
     "sinks": {"events": (list,)},
 }
 
@@ -169,6 +176,11 @@ def _text(value: Any) -> str | None:
 
 def _integer(value: Any) -> int | None:
     return None if value is None else int(value)
+
+
+def _flag(value: Any) -> bool | None:
+    """bool 与"没写"是三件事：`read_only = false` 是显式关掉，不写是没决定。"""
+    return None if value is None else bool(value)
 
 
 def _seconds(value: Any) -> float | None:
@@ -248,6 +260,8 @@ def load_config(path: Path | str | None = None) -> Config:
         serve=ServeConfig(
             host=_text(read("serve", "host")),
             port=_integer(read("serve", "port")),
+            token=_text(read("serve", "token")),
+            read_only=_flag(read("serve", "read_only")),
         ),
         sinks=_str_list(read("sinks", "events")),
         sources=(chosen,),
@@ -318,5 +332,20 @@ def effective(cfg: Config) -> list[Setting]:
     add("sandbox.default_timeout_ms", cfg.sandbox.default_timeout_ms, None, DEFAULT_TIMEOUT_MS)
     add("serve.host", cfg.serve.host, None, DEFAULT_HOST)
     add("serve.port", cfg.serve.port, None, DEFAULT_PORT)
+    add("serve.read_only", cfg.serve.read_only, None, False)
+    # token 只报"有没有设"，值一律不落终端：它会进 shell 历史、CI 日志和截图。
+    token_source = next(
+        (source for source, value in (
+            ("file", cfg.serve.token),
+            ("env", os.environ.get(ENV_TOKEN) or None),
+        ) if value),
+        "default",
+    )
+    rows.append(Setting(
+        "serve.token",
+        f"已设置（{len(pick(os.environ.get(ENV_TOKEN) or None, cfg.serve.token) or '')} 字符，值不打印）"
+        if token_source != "default" else "未设（仅回环绑定时允许）",
+        token_source,
+    ))
     add("sinks.events", cfg.sinks, None, ())
     return rows

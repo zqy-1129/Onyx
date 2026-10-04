@@ -52,6 +52,8 @@ def create_app(
     sample_gpu: bool = True,
     gpu_lock_path: Path | str | None = None,
     gpu_stale_after_s: float | None = None,
+    token: str | None = None,
+    read_only: bool = False,
     event_sinks: tuple[str, ...] = (),
     cors_origins: tuple[str, ...] = ("http://localhost:5173", "http://127.0.0.1:5173"),
 ) -> FastAPI:
@@ -76,6 +78,11 @@ def create_app(
     app.add_middleware(
         CORSMiddleware, allow_origins=list(cors_origins), allow_methods=["*"], allow_headers=["*"],
     )
+    if token:
+        # 闸装在 CORS 之后：预检请求不带 Authorization，先拦就会把 CORS 自己挡死
+        from onyx.api.auth import install_auth
+
+        install_auth(app, token=token, read_only=read_only)
 
     state = AppState.of(resolved, gpu_lock_path=gpu_lock_path,
                         gpu_stale_after_s=gpu_stale_after_s)
