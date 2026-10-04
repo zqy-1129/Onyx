@@ -81,8 +81,13 @@ def build_task(task_id: str, *, model: str, dataset: Dataset | None = None, **kw
     return task
 
 
-def load_dataset(dataset_id: str | None, *, task_id: str) -> Dataset:
-    """按 id 载入数据集。`None` 时取该任务的默认数据集。"""
+def load_dataset(dataset_id: str | None, *, task_id: str, db: Any = None) -> Dataset:
+    """按 id 载入数据集。`None` 时取该任务的默认数据集。
+
+    三种写法按固定顺序解析，**CLI 与界面必须走这一个函数**：
+    内置别名 → `file:<路径>` → 库里已登记的 id。少一层就会出现"命令行能跑、
+    界面说未知数据集"这种两边口径分裂。
+    """
     if dataset_id is None:
         spec = specs().get(task_id)
         if spec is None:
@@ -99,9 +104,16 @@ def load_dataset(dataset_id: str | None, *, task_id: str) -> Dataset:
         from onyx.eval.datasets.loader import load_jsonl
 
         return load_jsonl(dataset_id[len("file:"):])
+    if db is not None:
+        # 导入过的数据集在库里。这一步之前不存在：`eval import --id x` 之后
+        # `--dataset x` 会报未知 id，而它的样本明明就在同一张 DB 里。
+        from onyx.eval.datasets.loader import load_registered
+
+        return load_registered(db, dataset_id)
     raise KeyError(
         f"未知数据集 {dataset_id!r}；内置可选: {sorted(set(_BUILTIN_DATASETS))}，"
         "或用 file:<路径> 直接读 JSONL，或先用 onyx eval import 导入"
+        "（导入过的 id 需要连着数据库一起解析，CLI 会自己做）"
     )
 
 

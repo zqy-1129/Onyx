@@ -23,6 +23,7 @@ from pydantic import BaseModel
 from onyx.api.deps import AppState, get_state
 from onyx.core.clock import utc_now_iso
 from onyx.eval.compare import CompareError, compare_runs
+from onyx.eval.datasets.loader import DatasetError, parse_jsonl, register_dataset
 from onyx.eval.service import JobView, SubmitRequest
 from onyx.eval.tasks import build_task, builtin_dataset_names, specs
 from onyx.report.eval_report import build_matrix
@@ -32,6 +33,10 @@ router = APIRouter(prefix="/api", tags=["evals"])
 
 #: 内存快照里"还没结束"的两个状态；其余都是终态
 LIVE_STATES = ("queued", "running")
+
+#: 一次导入的 JSONL 上限。超了直接拒——请求线程要把它解析成对象，
+#  几十 MB 的上传等于"任何人用一个 POST 就能把看板钉住"
+MAX_UPLOAD_BYTES = 4_000_000
 
 
 class DatasetView(BaseModel):
@@ -129,6 +134,32 @@ class CancelView(BaseModel):
     message: str
 
 
+class DatasetImportRequest(BaseModel):
+    """JSONL 文本而不是文件路径：看板可能在另一台机器上，路径没有意义，
+    而且"路径来自请求体"本身就是任意文件读的入口（S21 的共享姿态）。"""
+
+    jsonl: str
+    id: str | None = None
+    name: str = "uploaded"
+    upstream: str = ""
+    revision: str = ""
+    license: str = ""
+    notes: str = ""
+    #: 覆盖已有 id 必须显式确认：历史 grade 指着这个 id，悄悄换内容会让"能不能比"变成玄学
+    allow_replace: bool = False
+
+
+class ImportView(BaseModel):
+    id: str
+    n_cases: int
+    upstream: str
+    revision: str
+    license: str
+    splits: dict[str, int] = {}
+    replaced: bool = False
+    warnings: list[str] = []
+
+
 class RunView(BaseModel):
     id: str
     task_id: str
@@ -180,7 +211,9 @@ def _dataset_view(record: Any) -> DatasetView:
         id=record.id, n_cases=record.n_cases, upstream=record.upstream,
         revision=record.revision, license=record.license, loader=record.loader,
         splits=record.splits, imported_at=record.imported_at, notes=record.notes,
-        selectable=record.id in set(builtin_dataset_names()),
+        # 与提交服务的校验保持一致：内置写法，或已导入且真有样本的 id。
+        # 登记过但一条样本都没有的行选上去只会在 worker 里变成一条 error
+        selectable=record.id in set(builtin_dataset_names()) or bool(record.n_cases),
     )
 
 
@@ -484,4 +517,59 @@ def cancel_run(run_id: str, state: AppState = Depends(get_state)) -> CancelView:
         status_code=409,
         detail=f"这条 run 由 {holder.owner if holder else '另一个进程'} 在跑，不是本服务发起的，"
                "取消要回到那个进程（Ctrl-C）",
+    )
+
+
+@router.post("/datasets", response_model=ImportView, status_code=201)
+def import_dataset(
+    body: DatasetImportRequest, state: AppState = Depends(get_state)
+) -> ImportView:
+    """导入 JSONL 数据集，并把来历（upstream/revision/license）一起落库。
+
+    与 `onyx eval import` 共用同一份解析（`parse_jsonl`）与同一个落库函数
+    （`register_dataset`）：两个入口对"第 37 行坏了"必须给出行号并给出同一个结果，
+    对"覆盖了旧 revision"必须说同一句警告。
+
+    两条刻意的限制：
+    - **收文本不收路径**：请求体里的路径就是任意文件读，而这个看板是可以共享的（S21）。
+    - **覆盖已有 id 要显式确认**：历史 grade 指向这个 id，悄悄换内容会让
+      "这两次分数能不能比"从"能"变成"不知道"，而那正是评测最贵的一种失效。
+    """
+    payload = body.jsonl or ""
+    if len(payload.encode("utf-8")) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"导入内容 {len(payload)} 字节，上限 {MAX_UPLOAD_BYTES} 字节；"
+                   "请分批判次导入（一次导入一大坨也没法核对第几行坏了）",
+        )
+    if not payload.strip():
+        raise HTTPException(status_code=422, detail="jsonl 是空的：没有任何样本可导入")
+    name = (body.name or "uploaded").strip()[:80] or "uploaded"
+    # 空串按"没填"处理：默认 id 由 name 决定，而 revision 是内容 hash
+    dataset_id = (body.id or "").strip()[:80] or None
+
+    repo = EvalRepo(state.runtime.db)
+    if dataset_id is not None and repo.get_dataset(dataset_id) is not None and not body.allow_replace:
+        raise HTTPException(
+            status_code=409,
+            detail=f"数据集 {dataset_id!r} 已经登记过；覆盖会改变历史分数指向的考卷。"
+                   "确认要覆盖就带 allow_replace=true，或换一个 id",
+        )
+
+    try:
+        dataset = parse_jsonl(
+            payload, name=name, dataset_id=dataset_id,
+            upstream=body.upstream.strip(), revision=body.revision.strip(),
+            license=body.license.strip(), notes=body.notes.strip(),
+        )
+    except DatasetError as exc:
+        # 行号是这里唯一有用的信息："第 37 行不是合法 JSON"能直接改，"格式错误"不能
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+
+    replaced = repo.get_dataset(dataset.id) is not None
+    warnings = register_dataset(state.runtime.db, dataset, repo=repo)
+    return ImportView(
+        id=dataset.id, n_cases=len(dataset), upstream=dataset.upstream,
+        revision=dataset.revision, license=dataset.license,
+        splits=dataset.splits(), replaced=replaced, warnings=warnings,
     )

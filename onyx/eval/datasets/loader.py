@@ -103,44 +103,66 @@ def load_jsonl(
     license: str = "",
     notes: str = "",
 ) -> Dataset:
-    """读 JSONL。每行一个样本，必须含 `input`；`expect` 可空（latency_bench 这类任务）。"""
+    """读 JSONL 文件。每行一个样本，必须含 `input`；`expect` 可空（latency_bench 这类任务）。"""
     target = Path(path)
     if not target.exists():
         raise DatasetError(f"数据集文件不存在: {target}", path=str(target))
+    return parse_jsonl(
+        target.read_text(encoding="utf-8"), name=target.stem,
+        dataset_id=dataset_id, upstream=upstream or f"file:{target.name}",
+        # 文件的 revision 用字节 hash：同一份文件两次导入必须得到同一个值，
+        # 否则"换了数据版本"这件事在两次分数之间发现不了
+        revision=revision or _file_revision(target), license=license, notes=notes,
+    )
 
+
+def parse_jsonl(
+    text: str,
+    *,
+    name: str,
+    dataset_id: str | None = None,
+    upstream: str = "",
+    revision: str = "",
+    license: str = "",
+    notes: str = "",
+) -> Dataset:
+    """把 JSONL **文本**解析成 Dataset（`load_jsonl` 与 HTTP 上传共用这一份解析）。
+
+    分成两层是必须的：两个入口对"来历默认值"的算法不同（文件按字节 hash、
+    上传按内容 hash），但**行的合法性判据必须完全一致**——否则同一份数据
+    从 CLI 导入能跑、从界面导入报错（或反过来），而没人会想到是解析器有两份。
+    """
     cases: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
-    for line_number, raw in enumerate(
-        target.read_text(encoding="utf-8").splitlines(), start=1
-    ):
+    for line_number, raw in enumerate(text.splitlines(), start=1):
         if not raw.strip():
             continue
         try:
             case = json.loads(raw)
         except json.JSONDecodeError as exc:
             raise DatasetError(
-                f"第 {line_number} 行不是合法 JSON: {exc}", line=line_number, path=str(target)
+                f"第 {line_number} 行不是合法 JSON: {exc}", line=line_number, path=name
             ) from exc
         if not isinstance(case, dict):
             raise DatasetError(
                 f"第 {line_number} 行不是对象: {type(case).__name__}",
-                line=line_number, path=str(target),
+                line=line_number, path=name,
             )
         if not isinstance(case.get("input"), dict) or not case["input"]:
             raise DatasetError(
-                f"第 {line_number} 行缺少非空的 input 对象", line=line_number, path=str(target)
+                f"第 {line_number} 行缺少非空的 input 对象", line=line_number, path=name
             )
         case.setdefault("expect", {})
         case.setdefault("kind", "single")
         case.setdefault("tags", [])
         case.setdefault("meta", {})
         case_id = str(case.get("id") or content_id(
-            target.stem, case["input"], json.dumps(case["expect"], ensure_ascii=False, sort_keys=True)
+            name, case["input"], json.dumps(case["expect"], ensure_ascii=False, sort_keys=True)
         ))
         if case_id in seen_ids:
             raise DatasetError(
                 f"第 {line_number} 行的 id {case_id!r} 重复；重复 id 会让 grade 互相覆盖",
-                line=line_number, path=str(target),
+                line=line_number, path=name,
             )
         seen_ids.add(case_id)
         case["id"] = case_id
@@ -148,14 +170,82 @@ def load_jsonl(
         cases.append(case)
 
     if not cases:
-        raise DatasetError(f"{target} 里没有任何样本", path=str(target))
+        raise DatasetError(f"{name or '上传内容'} 里没有任何样本", path=name)
 
     return Dataset(
-        id=dataset_id or f"{target.stem}-v1",
+        id=dataset_id or f"{name}-v1",
         cases=tuple(cases),
-        upstream=upstream or f"file:{target.name}",
-        revision=revision or _file_revision(target),
+        upstream=upstream or (f"uploaded:{name}" if name else "uploaded"),
+        # 没给 revision 就用内容 hash：同一段文本两次导入必须是同一个 revision，
+        # 而"没填"绝不能变成空串（空 revision 等于放弃可比性判据）
+        revision=revision or f"sha256:{hashlib.sha256(text.encode('utf-8')).hexdigest()[:16]}",
         license=license, loader="jsonl", notes=notes,
+    )
+
+
+def register_dataset(db: Any, dataset: Dataset, *, repo: Any = None) -> list[str]:
+    """把 Dataset 落库，并返回"这次导入会影响可比性"的警告。
+
+    重复导入同一个 id 是覆盖（upsert），这本身没问题；有问题的是**覆盖了但没人知道**：
+    历史 grade 仍然指向这个 id，而它现在指向另一份数据，于是"这两次分数可比吗"
+    从"是"悄悄变成"不知道"。所以旧 revision / 旧条数与新值不一致时必须警告，
+    CLI 打印它、界面显示它。
+    """
+    from onyx.store.repos import EvalRepo
+
+    repo = repo or EvalRepo(db)
+    warnings: list[str] = []
+    existing = repo.get_dataset(dataset.id)
+    record, cases = dataset.to_records()
+    if existing is not None:
+        if existing.revision and record.revision and existing.revision != record.revision:
+            warnings.append(
+                f"数据集 {dataset.id} 原先登记的 revision 是 {existing.revision!r}，"
+                f"现在是 {record.revision!r}：指向它的历史分数与之后的分数不可比"
+            )
+        if existing.n_cases is not None and existing.n_cases != record.n_cases:
+            warnings.append(
+                f"条数从 {existing.n_cases} 变成 {record.n_cases}：同一个 id 换了规模，"
+                "历史 run 的分母就对不上现在这份考卷了"
+            )
+    repo.upsert_dataset(record)
+    repo.upsert_cases(cases)
+    return warnings
+
+
+def load_registered(db: Any, dataset_id: str) -> Dataset:
+    """把**已在库里登记过**的数据集读回来（导入之后跑评测的第二步）。
+
+    这一步以前不存在：`onyx eval import --id x` 之后 `--dataset x` 会报未知数据集，
+    而库里明明有它的样本。读回来时必须带上来历字段，否则分数历史与考卷就断链了。
+    """
+    from onyx.store.repos import EvalRepo
+
+    record = EvalRepo(db).get_dataset(dataset_id)
+    if record is None:
+        registered = sorted(item.id for item in EvalRepo(db).list_datasets())
+        raise DatasetError(
+            f"未知数据集 {dataset_id!r}；库里已登记的: {registered or '（一个都没有，先 onyx eval import）'}",
+            path=dataset_id,
+        )
+    cases = tuple(
+        {
+            "id": case.id, "ord": case.ord, "kind": case.kind, "input": case.input,
+            "expect": case.expect, "tools": list(case.tools), "fixture": case.fixture,
+            "meta": case.meta, "tags": list(case.tags),
+        }
+        for case in EvalRepo(db).list_cases(dataset_id)
+    )
+    if not cases:
+        # dataset 行在而样本不在：导入被中断或库被清过。返回空集会变成"0 条样本的评测"，
+        # 那在界面上看起来完全正常（status=done、n_total=0），必须当场拒绝
+        raise DatasetError(
+            f"数据集 {dataset_id} 登记过但一条样本都没有；请重新导入", path=dataset_id
+        )
+    return Dataset(
+        id=record.id, cases=cases, upstream=record.upstream, revision=record.revision,
+        license=record.license, loader=f"{record.loader or 'registered'} (registered)",
+        notes=record.notes,
     )
 
 

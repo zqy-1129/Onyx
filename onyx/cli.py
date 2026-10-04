@@ -2429,7 +2429,7 @@ def eval_import(
     外部数据源只支持"从本地文件导入"，不替你下载：下载会在评测路径上引入网络依赖，
     于是"离线复现一次评测"就做不到了，而这正是本地评测相对云 API 的主要优势。
     """
-    from onyx.eval.datasets.loader import DatasetError, load_builtin, load_jsonl
+    from onyx.eval.datasets.loader import DatasetError, load_builtin, load_jsonl, register_dataset
     from onyx.eval.datasets.sources import describe, import_bfcl, supported
     from onyx.store.repos import EvalRepo
 
@@ -2470,15 +2470,17 @@ def eval_import(
     database = Database(_db_path(settings, db))
     try:
         repo = EvalRepo(database)
-        record, cases = dataset.to_records()
-        repo.upsert_dataset(record)
-        repo.upsert_cases(cases)
+        # 落库走与 API 同一个函数：两个入口对"覆盖了旧 revision"必须给出同一句警告，
+        # 否则"这两次分数是不是同一份考卷"这个问题只有一个入口能回答
+        warnings = register_dataset(database, dataset, repo=repo)
         typer.echo(describe(dataset))
         # notes 里装着"跳过了多少条"这类信息；不打印的话样本变少这件事就没人知道
         if dataset.notes:
             typer.echo(f"  {dataset.notes}")
         for split, count in sorted(dataset.splits().items()):
             typer.echo(f"  子集 {split:<12} {count} 条")
+        for warning in warnings:
+            typer.secho(f"  ⚠ {warning}", fg="yellow")
     finally:
         database.close()
 
@@ -2539,15 +2541,23 @@ def eval_run(
     console = Console()
     model = _resolved_model(model, "onyx eval run")
     cfg = _config()
+    runtime = _eval_runtime(url, db, provider)
     try:
-        loaded = load_dataset(dataset, task_id=task)
+        # 带着 db 解析：已导入的数据集只有连着库才认得出来，否则 `eval import --id x`
+        # 之后 `--dataset x` 会报"未知数据集"，而样本就在同一张库里
+        loaded = load_dataset(dataset, task_id=task, db=runtime.db)
         overrides = {"max_tokens": max_tokens} if max_tokens else {}
         instance = build_task(task, model=model, dataset=loaded, **overrides)
     except KeyError as exc:
         typer.echo(str(exc).strip("'"), err=True)
+        runtime.close()
         raise typer.Exit(2) from None
-
-    runtime = _eval_runtime(url, db, provider)
+    except ValueError as exc:
+        # `DatasetError`（库里没有这个数据集、第 37 行坏了、样本为空）是 ValueError 的子类。
+        # 不接住它就是一屏 traceback + 退出码 1，读起来像 Onyx 自己坏了
+        typer.echo(f"数据集错误: {exc}", err=True)
+        runtime.close()
+        raise typer.Exit(2) from None
     try:
         repo = EvalRepo(runtime.db)
         progress = None

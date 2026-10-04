@@ -49,7 +49,10 @@ MAX_K = 8
 MAX_LIMIT = 20_000
 
 #: 从界面发起评测时数据集训允许的写法（理由见 `_validate_dataset`）
-NO_FILE_DATASET_HINT = "从界面发起评测只能选内置数据集，不接受 file:<路径>"
+NO_FILE_DATASET_HINT = (
+    "界面不能读服务器磁盘上的文件（file:<路径> 只给 CLI 用）；"
+    "请先导入数据集：用页面上的「数据集」面板，或 onyx eval import"
+)
 
 LIVE_STATES = ("queued", "running")
 
@@ -218,25 +221,32 @@ class EvalService:
         self._validate_model(request.model)
 
     def _validate_dataset(self, dataset_id: str | None) -> None:
-        """只接受 `load_dataset` 真能载入的写法。
+        """只接受 `load_dataset(..., db=)` 真能载入的写法。
 
         两道闸各自的理由：
         - **不接受 `file:<路径>`**：那是 CLI 在本机的便利。把它开放给 HTTP 就等于
           "请求体里写什么路径就读什么文件"，而这个看板是可以带 token 共享出去的（S21）。
-        - **不接受只在库里登记的 id**：目前还没有"从库里读回数据集"的载入器，
-          放过它只会在 worker 里变成一条 error——校验必须和 worker 的能力一致。
-          界面能选自定义数据集，是"数据集导入"那一步补齐了读回能力之后的事。
+        - **接受内置写法与库里已登记的 id**：解析顺序与 CLI 完全一致（内置 → file: → 库里），
+          校验必须与 worker 的能力一致，否则会出现"提交成功、跑的时候死在 worker 里"。
         """
         if dataset_id is None:
             return
         if dataset_id.startswith("file:"):
             raise EvalError(NO_FILE_DATASET_HINT, detail={"dataset": dataset_id})
-        known = set(builtin_dataset_names())
-        if dataset_id not in known:
-            raise EvalError(
-                f"未知数据集 {dataset_id!r}；界面现在只能选内置数据集",
-                detail={"available": sorted(known)},
-            )
+        if dataset_id in set(builtin_dataset_names()):
+            return
+        record = self.repo.get_dataset(dataset_id)
+        if record is not None and record.n_cases:
+            return
+        # 只有 dataset 行、没有样本的登记不算可选：跑起来会是 `status=done, n_total=0`
+        # 这种"看起来完全正常"的东西，而它其实是导入被中断的残骸
+        known = set(builtin_dataset_names()) | {
+            item.id for item in self.repo.list_datasets() if item.n_cases
+        }
+        raise EvalError(
+            f"未知数据集 {dataset_id!r}；界面可选: 内置数据集或已导入且有样本的数据集",
+            detail={"available": sorted(known)},
+        )
 
     def _validate_model(self, model: str) -> None:
         """库里已经同步过模型清单时才做严格校验。
@@ -333,7 +343,7 @@ class EvalService:
         job.state, job.started_at = "running", utc_now_iso()
         request = job.request
         try:
-            dataset = load_dataset(request.dataset, task_id=request.task)
+            dataset = load_dataset(request.dataset, task_id=request.task, db=self.db)
             overrides: dict[str, Any] = {}
             if request.max_tokens:
                 overrides["max_tokens"] = request.max_tokens
