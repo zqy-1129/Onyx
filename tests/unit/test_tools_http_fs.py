@@ -422,11 +422,12 @@ def test_constants_must_be_an_object():
 
 
 # ── 分发 ──────────────────────────────────────────────────────────
-def test_http_is_registered_and_only_mcp_remains_pending():
-    assert EXECUTOR_KINDS == ("fixture", "http", "python_fn")
+def test_http_is_registered_and_only_builtin_tools_remain_pending():
+    assert EXECUTOR_KINDS == ("fixture", "http", "mcp", "python_fn")
     assert isinstance(executor_for(_http_def()), HttpExecutor)
     assert isinstance(executor_for(_http_def(), kind="fixture").spec(), ToolDef)
-    for pending in ("mcp", "ollama_builtin"):
+    # mcp 在 S16d 落地；还剩引擎内建工具，它需要先有 P21 的实测结论才知道怎么调
+    for pending in ("ollama_builtin",):
         definition = ToolDef(name="x", description="y" * 30, kind=ToolKind(pending))
         with pytest.raises(ToolUnknown, match="S16"):
             executor_for(definition)

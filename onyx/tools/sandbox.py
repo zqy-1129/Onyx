@@ -20,7 +20,12 @@ from onyx.tools.spec import SideEffect, ToolDef
 
 #: 允许的 impl_ref 前缀。`python_fn` 执行器会按 `pkg.mod:fn` 动态导入，
 #: 没有白名单就等于让模型输出决定进程加载什么代码。
-DEFAULT_ALLOWED_IMPL_PREFIXES: tuple[str, ...] = ("onyx.tools.builtin.",)
+#:
+#: `"mcp:"` 与模块路径命名空间天然互斥（没有任何 Python 模块叫 `mcp:...`），加进来
+#: 不会放松 python_fn 那道闸；它约束的是"允许跟配置里的哪个 server 说话"——
+#: MCP 真正的闸门是那份人工审核的配置文件，`mcp:<server>:<tool>` 里的 server
+#: 必须存在于配置中，否则 `McpPool` 直接报错。
+DEFAULT_ALLOWED_IMPL_PREFIXES: tuple[str, ...] = ("onyx.tools.builtin.", "mcp:")
 
 DEFAULT_TIMEOUT_MS = 10_000
 

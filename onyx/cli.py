@@ -965,6 +965,106 @@ def tools_import(
         database.close()
 
 
+@tools_app.command("mcp-ls")
+def tools_mcp_ls(
+    config: Path = typer.Option(
+        None, "--config", exists=True, dir_okay=False,
+        help="MCP 配置文件；默认 $ONYX_MCP_CONFIG 或 <data_dir>/mcp.json",
+    ),
+    server: str = typer.Option(None, "--server", help="只看这一个 server；默认列出全部"),
+) -> None:
+    """发现 MCP server 提供的工具（只读，不写库）。"""
+    from rich.console import Console
+    from rich.table import Table
+
+    from onyx.tools.mcp import tooldefs_from_mcp
+
+    pool = _mcp_pool(config)
+    try:
+        names = [server] if server else sorted(pool.servers)
+        table = Table(title="MCP 工具", pad_edge=False)
+        for column in ("注册名", "server", "原工具名", "副作用", "为什么这么定"):
+            table.add_column(column)
+        total = 0
+        for name in names:
+            for definition in tooldefs_from_mcp(pool, name):
+                table.add_row(
+                    definition.name, name, definition.extra.get("mcp_tool", ""),
+                    str(definition.side_effect),
+                    definition.extra.get("side_effect_reason", ""),
+                )
+                total += 1
+        Console().print(table)
+        typer.echo(f"共 {total} 个工具。导入：onyx tools mcp-import"
+                   f"{' --server ' + server if server else ''}")
+    finally:
+        pool.close()
+
+
+@tools_app.command("mcp-import")
+def tools_mcp_import(
+    config: Path = typer.Option(None, "--config", exists=True, dir_okay=False,
+                                help="MCP 配置文件"),
+    server: str = typer.Option(None, "--server", help="只导入这一个 server 的工具"),
+    db: Path = typer.Option(None, "--db"),
+) -> None:
+    """把 MCP server 的工具注册进工具表（`kind=mcp`）。
+
+    副作用按最小权限落库：server 没标注 `readOnlyHint` 的一律记成 `write`，
+    于是默认策略会直接拒绝执行，直到你显式 `--allow write` 或让 server 标注。
+    "未标注就当成只读"是把审计责任推给运气。
+    """
+    from onyx.tools.mcp import tooldefs_from_mcp
+    from onyx.tools.spec import SideEffect
+
+    pool = _mcp_pool(config)
+    try:
+        names = [server] if server else sorted(pool.servers)
+        definitions = []
+        for name in names:
+            try:
+                definitions.extend(tooldefs_from_mcp(pool, name))
+            except Exception as exc:  # noqa: BLE001 - 一个 server 坏了不许拖垮整批导入
+                typer.echo(f"  ✗ server {name}: {exc}", err=True)
+        if not definitions:
+            typer.echo("没有发现任何工具（见上面的错误）", err=True)
+            raise typer.Exit(1)
+    finally:
+        pool.close()
+
+    registry, database = _tool_registry(db, None)
+    try:
+        records = registry.register_many(definitions)
+        writes = [r.name for r, d in zip(records, definitions, strict=True)
+                  if d.side_effect is not SideEffect.READ]
+        for record in records:
+            typer.echo(f"  {record.name:<28} v{record.version} {record.kind} "
+                       f"{record.side_effect} tokens={record.tokens if record.tokens is not None else '—'}")
+        typer.echo(f"已导入 {len(records)} 个工具")
+        if writes:
+            typer.echo(f"⚠ 其中 {len(writes)} 个按有副作用登记（{', '.join(writes[:3])}"
+                       f"{'…' if len(writes) > 3 else ''}）："
+                       "默认策略会拒绝执行，跑之前需要 --allow write 或让 server 标注 readOnlyHint",
+                       err=True)
+    finally:
+        database.close()
+
+
+def _mcp_pool(config: Path | None):
+    """拿 MCP 连接池；配置缺失/写错时报可读错误而不是堆栈。"""
+    from onyx.core.errors import ToolUnknown
+    from onyx.tools.executors.mcp import config_path, default_pool
+
+    try:
+        pool = default_pool(path=config) if config else default_pool()
+    except (ToolUnknown, ValueError, OSError) as exc:
+        typer.echo(str(exc), err=True)
+        typer.echo(f"（查找路径：{config or config_path()}）", err=True)
+        raise typer.Exit(2) from None
+    typer.echo(f"MCP 配置：{config or config_path()} · server: {', '.join(sorted(pool.servers))}")
+    return pool
+
+
 @tools_app.command("ls")
 def tools_ls(db: Path = typer.Option(None, "--db")) -> None:
     """列出已注册工具。"""
@@ -1076,6 +1176,18 @@ def _http_contract_target():
     return contract_target()
 
 
+def _mcp_contract_target():
+    """mcp 列的离线契约样本（假连接：不起子进程、不碰任何真实 server）。
+
+    惰性导入的理由与 http 一样：导入失败要显示"未知"，不能让整条矩阵崩掉。
+    """
+    try:
+        from onyx.tools.executors.mcp import contract_target
+    except ImportError:  # pragma: no cover - 取决于安装
+        return None
+    return contract_target()
+
+
 def _resolve_tool_def(tool: str, db: Path | None):
     """查定义：**注册表优先，内置兜底**。返回 (定义, 出处, 需要关闭的 Database 或 None)。
 
@@ -1145,7 +1257,17 @@ def tools_contract(
         else:
             http_sample, http_factory, http_args, http_synth = http
             targets.append(("http", http_sample, http_factory, http_args, None, {}, http_synth))
-        pending = {"mcp": "S16", "ollama_builtin": "S16"}
+        mcp = _mcp_contract_target()
+        if mcp is None:
+            unavailable["mcp"] = "MCP 执行器导入失败——未知，不是通过"
+        else:
+            mcp_sample, mcp_factory, mcp_args, mcp_synth = mcp
+            targets.append(("mcp", mcp_sample, mcp_factory, mcp_args, None, {}, mcp_synth))
+        # "还剩哪些种类没实现"必须从注册表推导，不能在这里写死：
+        # 写死的版本会在实现完成之后继续宣称"未实现"，而这句话看起来总是合理的
+        from onyx.tools.executors import PENDING_KINDS
+
+        pending = {k: v for k, v in PENDING_KINDS.items() if k not in unavailable}
 
         matrix: dict[str, dict[str, object]] = {}
         samples: dict[str, str] = {}
@@ -1197,7 +1319,9 @@ def tools_contract(
 
         typer.echo("样本出处（每一列测的定义可能不同，必须写清楚）：")
         for name, sample_name in samples.items():
-            note = "（注册表/内置）" if name in {"python_fn", "mock"} else "（离线 MockTransport）"
+            note = {"mock": "（注册表/内置）", "python_fn": "（注册表/内置）",
+                    "http": "（离线 MockTransport）",
+                    "mcp": "（离线假连接，不起子进程）"}.get(name, "（自带样本）")
             typer.echo(f"  {name:<12} {sample_name} {note}")
 
         failed = 0

@@ -24,6 +24,7 @@ from .python_fn import PythonFnExecutor
 
 __all__ = [
     "EXECUTOR_KINDS",
+    "PENDING_KINDS",
     "MockReplayExecutor",
     "PythonFnExecutor",
     "executor_for",
@@ -38,14 +39,22 @@ _BUILDERS: dict[str, Any] = {
     str(ToolKind.FIXTURE): MockReplayExecutor,
 }
 
-#: 需要惰性导入的构造器（`模块:属性`）
-_LAZY: dict[str, str] = {str(ToolKind.HTTP): "onyx.tools.executors.http:HttpExecutor"}
+#: 需要惰性导入的构造器（`模块:属性`）。
+#: http 要 httpx；mcp 虽然只用 stdlib，但它的客户端会 spawn 子进程，
+#: 让 `import onyx.tools` 顺手带上这套东西没有道理。
+_LAZY: dict[str, str] = {
+    str(ToolKind.HTTP): "onyx.tools.executors.http:HttpExecutor",
+    str(ToolKind.MCP): "onyx.tools.executors.mcp:McpExecutor",
+}
 
 #: 尚未实现的种类与它们计划落地的里程碑（不许静默降级成 python_fn）
 _PENDING: dict[str, str] = {
-    str(ToolKind.MCP): "S16（MCP 执行器）",
-    str(ToolKind.OLLAMA_BUILTIN): "S16（引擎内建工具，需先跑 P21 探针）",
+    str(ToolKind.OLLAMA_BUILTIN): "S16+（引擎内建工具，需先跑 P21 探针：模板里工具到底怎么渲染）",
 }
+
+#: 对外暴露：CLI 的契约矩阵从这里读"还剩谁没实现"，写死在 CLI 里就会在实现完成后
+#: 继续宣称"未实现"——那句报错看起来永远合理，没人会去核对
+PENDING_KINDS: dict[str, str] = dict(_PENDING)
 
 #: 内建种类（不含插件）——契约测试与审计用它，值是稳定的
 EXECUTOR_KINDS: tuple[str, ...] = tuple(sorted({*_BUILDERS, *_LAZY}))
@@ -87,7 +96,10 @@ def executor_for(
     if wanted in _LAZY:
         module_name, _, attr = _LAZY[wanted].partition(":")
         lazy_builder: Any = getattr(importlib.import_module(module_name), attr)
-        return lazy_builder(definition, transport=transport)
+        # 只有拿到注入对象时才传 `transport`：mcp 执行器没有 httpx transport 这个概念，
+        # 强行给它加一个"接收但忽略"的参数，就等于让"我注入了替身"这件事变成幻觉
+        kwargs = {"transport": transport} if transport is not None else {}
+        return lazy_builder(definition, **kwargs)
     builder = _BUILDERS.get(wanted)
     if builder is None:
         pending = _PENDING.get(wanted)

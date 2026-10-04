@@ -147,13 +147,32 @@ def test_contract_json_output_is_machine_readable():
     payload = json.loads(result.output)
     assert payload["tool"] == "echo"
     assert payload["source"] == "builtin"
-    assert set(payload["executors"]) == {"python_fn", "mock", "http"}
+    assert set(payload["executors"]) == {"python_fn", "mock", "http", "mcp"}
     assert len(payload["assertions"]) == 8
     assert payload["summary"]["python_fn"] == {"passed": 7, "failed": 0, "not_applicable": 1}
     # http 列有自己的离线样本，8 条断言全部适用
     assert payload["samples"]["http"] == "contract_http"
     assert payload["summary"]["http"] == {"passed": 8, "failed": 0, "not_applicable": 0}
-    assert payload["pending"] == {"mcp": "S16", "ollama_builtin": "S16"}
+    # mcp 列同样自带离线样本（假连接，不起子进程）：契约矩阵不许依赖外部 server，
+    # 否则这条命令变成"装了东西才跑得动"，就没人经常跑了
+    assert payload["samples"]["mcp"] == "contract_mcp"
+    assert payload["summary"]["mcp"] == {"passed": 8, "failed": 0, "not_applicable": 0}
+
+
+def test_pending_kinds_are_derived_not_hardcoded():
+    """"还剩哪些执行器没实现"必须从注册表推导。
+
+    写在 CLI 里的版本会在实现完成后继续宣称"未实现"，而那句话看起来永远合理——
+    S16d 落地 mcp 之后，矩阵里那一行就该自动消失。
+    """
+    from onyx.tools.executors import EXECUTOR_KINDS, PENDING_KINDS
+
+    assert "mcp" in EXECUTOR_KINDS and "mcp" not in PENDING_KINDS
+    assert set(PENDING_KINDS) == {"ollama_builtin"}
+    assert all(v for v in PENDING_KINDS.values()), "每个未实现的种类都要写明计划与前置探针"
+    result = _run("tools", "contract")
+    assert "mcp] 未实现" not in result.output
+    assert "[ollama_builtin] 未实现" in result.output
 
 
 # ── run ───────────────────────────────────────────────────────────

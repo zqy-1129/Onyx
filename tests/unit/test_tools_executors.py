@@ -397,10 +397,18 @@ def test_diff_args_separates_missing_from_unexpected():
 
 # ── 分发与内置定义 ────────────────────────────────────────────────
 def test_executor_for_dispatches_and_refuses_unimplemented_kinds():
+    from onyx.tools.executors.mcp import McpExecutor
+
     assert isinstance(executor_for(ECHO), PythonFnExecutor)
     assert isinstance(executor_for(ECHO, kind="fixture"), MockReplayExecutor)
-    assert EXECUTOR_KINDS == ("fixture", "http", "python_fn")
-    for kind in ("mcp", "ollama_builtin"):
+    # S16d：mcp 已实现（惰性注册，不用时不 import）
+    assert EXECUTOR_KINDS == ("fixture", "http", "mcp", "python_fn")
+    assert isinstance(
+        executor_for(ToolDef(name="x", description="y" * 30, kind=ToolKind.MCP,
+                             impl_ref="mcp:demo:echo")),
+        McpExecutor,
+    )
+    for kind in ("ollama_builtin",):
         definition = ToolDef(name="x", description="y" * 30, kind=ToolKind(kind))
         with pytest.raises(ToolUnknown) as exc:
             executor_for(definition)

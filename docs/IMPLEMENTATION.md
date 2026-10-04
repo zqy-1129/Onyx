@@ -1254,6 +1254,67 @@ sink 因此不编造 `onyx.usage.source`，只导出事件流里真出现过的 
 
 ---
 
+### S16d 已交付（MCP 执行器：发现 → tool_def → contract → fire-verify）
+
+**实际产出**
+```
+onyx/tools/mcp.py                 # stdio JSON-RPC 2.0 客户端（纯 stdlib）+ 配置 + 发现 + 结果映射
+onyx/tools/executors/mcp.py       # ToolKind.MCP 的执行器（走同一条 guarded_call）+ 离线契约样本
+onyx/tools/executors/__init__.py  # mcp 从 _PENDING 移到 _LAZY；新增 PENDING_KINDS 导出
+onyx/tools/sandbox.py             # 默认 impl_ref 白名单加 "mcp:"（理由写在代码里）
+onyx/cli.py                       # tools mcp-ls / mcp-import；contract 的 mcp 列；pending 改为推导
+tests/fixtures/mcp_demo_server.py # 最小但真实的 stdio MCP server（故意带三种坏毛病）
+tests/unit/test_tools_mcp.py      # 协议边界 42 项（假传输）
+tests/unit/test_tools_mcp_stdio.py # 真子进程/真管道 7 项
+```
+**为什么手写客户端而不装 `mcp` SDK**：`onyx.tools` 的可移植性锚点是"除 executors.http 外不依赖
+三方网络库"，而 stdio 传输本质就是"往子进程 stdin 写一行 JSON、从 stdout 读一行 JSON"。
+用 stdlib 换来两件事：`import-linter` 的网络契约继续成立（MCP 不经 httpx，3 条契约零改动全绿），
+以及测试能离线穷举协议边界。**但因此必须自己承担帧的正确性**——见下面真机挖出的两条。
+
+**闸门放在哪里（安全设计，三条）**
+1. server 的**命令只来自配置文件**（`$ONYX_MCP_CONFIG` 或 `<data_dir>/mcp.json`），
+   参数永远只能进 `tools/call` 的 `arguments`；`impl_ref` 还额外过 `check_impl_ref`。
+   与"不提供通用 fetch 工具"是同一条理由：模型能决定跑什么命令 = RCE。
+2. **副作用取保守默认**：`annotations.readOnlyHint` 是服务器自报的提示，
+   没标注一律 `write` ⇒ 默认策略直接拒绝执行。`mcp-import` 会把这批工具单独警告出来。
+3. **工具输出里的非文本块不内联**：image 只记 `mime` 与字节数。
+   把 base64 塞进上下文等于让一次工具调用吃掉几千 token，而上下文开销正是被测对象。
+   另外**默认不导出参数值**（见 S16c 的同一条理由）。
+
+**真机才暴露出来的两个 bug（都有断言）**
+- **子进程 stdout 不是 UTF-8**：中文 Windows 上 Python 子进程按控制台代码页（GBK）输出，
+  `text=True` 的 `readline()` 抛 UnicodeDecodeError，**读线程当场死掉**，
+  父进程此后只能等到超时——现象是"卡住"而不是"编码错了"。
+  改成二进制管道 + `decode_line()`（坏字节替换、解不出 JSON 当非协议行跳过），
+  并给读线程加兜底：它一死整个会话就挂死，比报错危险得多。
+- **stderr 排空线程在 close() 后抛"I/O operation on closed file"**：留下
+  "未处理的线程异常"告警。一次正常的关闭不该长得像故障，否则人就学会忽略这类告警了。
+- 顺带一条测试装置自身的坑：假传输的**回答 id 与请求 id 必须对齐**，
+  错开时"握手响应"会被当成 `tools/call` 的回答，测试就绿在一次根本没发生的调用上。
+
+**契约矩阵现在有四列**（`python_fn / mock / http / mcp`，mcp 用离线假连接，8 条断言全过）。
+`pending` 一列改为从 `PENDING_KINDS` 推导并加断言：写死在 CLI 里的版本会在实现完成后
+继续宣称"未实现"，而那句话看起来永远合理。
+
+**自测（全部实际执行）**
+```bash
+uv run pytest            # 990 passed, 1 skipped（mcp 单元 42 + 真子进程 7 + 契约矩阵断言）
+uv run pytest -m live     # 见下（与 fire-verify 一起跑）
+uv run ruff check . && uv run lint-imports   # clean / 3 kept，零新增例外
+uv run python scripts/check_extension_boundary.py --staged   # ✓ 未触碰受保护内核文件
+
+onyx tools mcp-ls / mcp-import        # 真子进程发现 5 个工具；1 个按 write 登记并被警告出来
+onyx tools contract                   # mcp 列 通过 8 · 失败 0 · 不适用 0
+onyx tools fire --tools demo__weather --mock fixture   # 零真实调用：模型选对工具、参数缺 text ⇒ BAD_ARGS
+onyx tools fire --tools demo__weather --mock live --expect-args '{"city":"北京"}'
+                                      # 判定 PASS · 真实执行：模型 → loop → stdio server → 回填 → final
+```
+`--mock live` 那一条是 M6 想要的形状：**换一种执行器不需要改循环、不需要改评测、
+不需要改看板**，contract 矩阵与 fire 六种判定照样把它测得下来。
+
+---
+
 ## 附录 A — 每步自测速查
 
 | 步 | 命令 | 绿的条件 |
