@@ -241,6 +241,62 @@ export interface DatasetView {
   splits: Record<string, number>
   imported_at: string
   notes: string
+  /** 界面能不能直接选它跑评测。库里登记的导入数据集还没有"读回"载入器，选了也跑不起来 */
+  selectable: boolean
+}
+
+/** 评测任务清单：来自后端注册表，不在前端硬编码，否则装了插件的任务界面看不到 */
+export interface TaskView {
+  id: string
+  name: string
+  requires: string[]
+  metrics: string[]
+  labels: string[]
+  default_dataset: string
+  dataset_revision: string
+  n_cases: number | null
+  splits: Record<string, number>
+  max_tokens: number | null
+  temperature: number | null
+  error: string
+}
+
+export interface SubmitView {
+  run_id: string
+  state: string
+  position: number
+  task: string
+  model: string
+}
+
+/** 进度：source 说清出处。CLI 发起的运行没有内存快照，也就没有取消开关 */
+export interface ProgressView {
+  run_id: string
+  source: 'service' | 'db' | string
+  state: string
+  task: string
+  model: string
+  done: number
+  total: number
+  case_id: string
+  verdict: string
+  position: number
+  holder: string
+  eta_s: number | null
+  waited_s: number
+  error: string
+  reason: string
+  queued_at: string
+  started_at: string
+  finished_at: string | null
+  cancellable: boolean
+  n_error: number
+  dataset_id: string | null
+}
+
+export interface QueueView {
+  max_pending: number
+  jobs: ProgressView[]
 }
 
 export interface RunView {

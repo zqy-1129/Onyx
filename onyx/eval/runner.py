@@ -268,6 +268,11 @@ class EvalRunner:
             # 墙钟是"累计值"：续跑时之前那一段已经花掉的时间不能假装没花
             cost["wall_ms"] = round(float(cost.get("wall_ms") or 0.0) + elapsed_ms(), 1)
             if self.gpu_lock is not None:
+                # 心跳写不出去意味着"排队者看到的 ETA 在变旧、锁可能被判过期"。
+                # 不为它中断评测，但必须留在 cost 里，否则这段数字无法解释
+                cost["gpu_heartbeat_errors"] = self.gpu_lock.heartbeat_errors
+                if self.gpu_lock.last_heartbeat_error:
+                    cost["gpu_heartbeat_error"] = self.gpu_lock.last_heartbeat_error
                 self.gpu_lock.release()
 
         # 续跑时要把**之前那些** grade 一起纳入聚合，否则分数只反映新跑的部分

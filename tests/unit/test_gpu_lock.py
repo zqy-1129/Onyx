@@ -347,3 +347,105 @@ def test_takeover_leaves_no_stray_files_behind(lock_path):
     assert leftovers == [], f"遗留了搬走过期锁的临时文件: {leftovers}"
     fresh.release()
     assert list(lock_path.parent.iterdir()) == []
+
+
+# ── 心跳写不进去（Windows 真实形态）───────────────────────────────
+def test_transient_replace_denial_does_not_lose_a_heartbeat(lock_path, monkeypatch):
+    """看板每秒 `peek()` 一次锁文件，Windows 上这会让 os.replace 短暂 ACCESS_DENIED。
+
+    一次就放弃等于"有人在看进度"就能把一轮评测判死——而看进度正是它唯一的用途。
+    """
+    holder = _lock(lock_path, "holder")
+    holder.acquire()
+    real_replace = os.replace
+    state = {"n": 0}
+
+    def flaky(src, dst):
+        state["n"] += 1
+        if state["n"] == 1:
+            raise PermissionError(5, "另一个程序正在使用此文件，进程无法访问")
+        return real_replace(src, dst)
+
+    try:
+        monkeypatch.setattr(os, "replace", flaky)
+        holder.heartbeat(3, 10)
+    finally:
+        monkeypatch.undo()
+
+    assert state["n"] >= 2, "第一次被拒后必须重试"
+    assert holder.heartbeat_errors == 0
+    info = read_lock(lock_path)
+    assert info is not None and info.done == 3, "重试成功后心跳要真的写进去"
+    holder.release()
+
+
+def test_persistent_replace_denial_only_costs_a_heartbeat(lock_path, monkeypatch):
+    """一直写不进去时：评测继续跑，但失败必须被数出来，而且不留垃圾文件。"""
+    holder = _lock(lock_path, "holder")
+    holder.acquire()
+    before = holder.peek().heartbeat_at
+
+    def deny(src, dst):
+        raise PermissionError(5, "拒绝访问")
+
+    monkeypatch.setattr(os, "replace", deny)
+    holder.heartbeat(7, 10)          # 不许抛：拿不到文件句柄就把整轮 GPU 时间判死，代价不对等
+    monkeypatch.undo()
+
+    assert holder.heartbeat_errors == 1
+    assert "PermissionError" in holder.last_heartbeat_error
+    assert holder.peek().heartbeat_at == before, "写不出去就不该假装刷新过"
+    assert [p.name for p in lock_path.parent.iterdir() if p.name.endswith(".tmp")] == []
+
+    # 锁本身还在手上：心跳失败不等于丢锁，release 照样要能删掉它
+    holder.release()
+    assert read_lock(lock_path) is None
+
+
+def test_heartbeat_failures_reach_the_run_record(lock_path, monkeypatch):
+    """心跳长期写不出去意味着锁可能被别人判过期接管——那段数字要能被解释，
+    所以失败次数必须进 run 记录，而不是只活在内存里直到进程结束。"""
+    from onyx.core.content import FileBlobStore
+    from onyx.eval.datasets.loader import Dataset
+    from onyx.eval.runner import EvalRunner, RunConfig
+    from onyx.eval.tasks.intent_classification import IntentClassification
+    from onyx.llm.gateway import Gateway
+    from onyx.llm.providers.mock import MockProvider, MockScript
+    from onyx.obs.engine import ObserverEngine
+    from onyx.store.db import Database
+    from onyx.store.repos import EvalRepo
+    from onyx.store.sinks import SqliteRecordSink
+
+    monkeypatch.setattr("onyx.eval.gpu_lock.WRITE_RETRIES", 1)  # 别真的退避 30ms×N 次
+    db = Database(lock_path.parent / "run.sqlite")
+    sink = SqliteRecordSink(db, batch_size=4, idle_wait=0.005)
+    provider = MockProvider(scripts={"m": MockScript(text="转账", in_tokens=10, out_tokens=2)},
+                            models=("m",))
+    gateway = Gateway(provider, observer=ObserverEngine(record_sink=sink),
+                      blobs=FileBlobStore(lock_path.parent / "blobs"))
+    cases = tuple(
+        {"id": f"c{i}", "ord": i, "input": {"instruction": "转账"}, "expect": {"label": "转账"},
+         "tags": [], "kind": "single"} for i in range(4)
+    )
+    data = Dataset(id="tiny-lock", cases=cases, upstream="test", revision="r1")
+    lock = _lock(lock_path, "runner")
+    real_replace = os.replace
+
+    def deny(src, dst):
+        if str(src).endswith(".tmp"):
+            raise PermissionError(5, "拒绝访问")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", deny)
+    try:
+        report = EvalRunner(gateway, EvalRepo(db), IntentClassification(data, model="m"),
+                            dataset=data, gpu_lock=lock).run(RunConfig(model="m"))
+    finally:
+        monkeypatch.undo()
+        sink.close()
+        db.close()
+
+    assert report.status == "done", "心跳失败不该把一轮跑完的评测判成失败"
+    assert report.cost["gpu_heartbeat_errors"] >= 1
+    assert "PermissionError" in report.cost["gpu_heartbeat_error"]
+    assert lock.held is False, "跑完还是要放锁"

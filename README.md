@@ -43,6 +43,8 @@ uv run onyx db init         # 初始化 .data/onyx.sqlite
 
 | M8 配置与发行 | ✅ | **S20** `onyx.toml` 部署配置（provider / GPU 锁 / 保留窗口 / sandbox / serve 绑定）：优先级只有一条规则 **flag > 环境 > 文件 > 默认**，为此每条命令的 flag 内建默认都改成 `None` —— 带着具体默认值的 flag 会永远赢过配置文件，让它当场变成摆设且不报错 · 格式用 TOML 而不是设计稿里的 YAML，因为 `config.py` 在 `settings → runtime/store` 这条核心管道上，用 YAML 就等于要求"只用库不用 CLI"的人也装 `runtime` extra；`tomllib` 是标准库（详见 DESIGN §13） · `onyx config show` 逐项标出生效值来自哪一层（token 只报"已设置"，值不落终端） · `doctor` 抓"写了不生效"：未知键与坏类型（含 `port = true` 这种被当成 1 号端口的手滑）会指名并报红 · **S21** 非回环绑定的姿态：`--host 0.0.0.0` 没有 token 就**拒绝启动**（退出码 2），共享时 `--read-only` 只让看不让操作 · **S22** 版本策略（`0.8.0`＝M8；版本号单点定义在 `onyx/__init__.py`）+ `CHANGELOG.md` + `.github/workflows/ci.yml` 跑五道门与安装冒烟 |
 
+| M9 操作闭环 | 🟡 | **S23** 评测可以在界面发起了：`POST /api/runs` 只入队并立刻返回 run_id（跑评测的是服务里的一个 worker 线程，不是请求线程），进程内单飞排队 + 与 Playground 共用**同一把**机器级 GPU 锁；界面上看得到逐条进度、排队位置、"谁在占 GPU + ETA"，三条路都能取消（排队中 / 等锁中 / 跑一半）；跑完自动选中那条 run 并下钻 grade。被中断的运行不再留 `running` 僵尸：服务启动时把上次进程发起、且锁已空闲的行标成 `error` 并写明原因，**但不碰别的进程（CLI）正在跑的行**。欠 S24 数据集导入、S25 Tool Bench 页、S26 `models pull/rm` 与续跑入口 |
+
 > CI 与安装冒烟都在本机验证过命令本身（干净环境里 `uv sync --extra dev,runtime,api,bench` → 1128 passed / 覆盖率 89%；
 > `uv build` + `uv tool install` 隔离装起来后 `onyx version / db init / chat --provider mock / doctor` 全通），
 > 但**这个仓库还没有远端**，所以 workflow 尚未真正跑过一次。推上 GitHub 才算"CI 已绿"。
@@ -128,7 +130,7 @@ source=engine，confidence=high）、分段归因（`msg:0=8 + template_ctl=11 =
 评测怎么跑才不出错觉：[`docs/eval-recipes.md`](docs/eval-recipes.md)。
 **现在到底有什么、还欠什么**：[`docs/STATUS.md`](docs/STATUS.md)（数字当场核对，含核对命令）。
 
-下一步见 [`docs/ROADMAP.md`](docs/ROADMAP.md)（M8 剩下的发行面 + M9 界面发起评测，含三个需要决策的问题）。
+下一步见 [`docs/ROADMAP.md`](docs/ROADMAP.md)（M9 剩下的 S24–S26 + M10 告警出口，含三个需要决策的问题）。
 
 ## 共享给同事看（非回环绑定）
 

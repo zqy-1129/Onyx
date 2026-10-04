@@ -64,17 +64,29 @@ CI 跑 ruff + lint-imports + 离线 + 边界 + 覆盖率 + 前端 + 安装冒烟
 干净环境验证：`uv build` → 隔离目录 `uv tool install --from dist/*.whl` → `version/db init/chat/doctor` 全通）。
 
 ### G3 操作闭环：从 CLI 工具到界面产品
-证据：`@router.post` 只有两个端点（`/api/playground/chat`、`/api/admin/models/unload`）。
+证据（S23 之前）：`@router.post` 只有两个端点（`/api/playground/chat`、`/api/admin/models/unload`）。
 即：**评测、数据集导入、工具注册、契约矩阵、矩阵报告导出，全都要离开浏览器用命令行做**。
 另有两处能力"实现了但没出口"：`AdminProvider.pull/delete` 与 runner 的 `cancelled` 状态——
 `onyx models` 只有 `sync`/`ls`（拉模型/删模型没有命令），跑了一半的评测**只能 Ctrl-C**，
 库里留下 `running` 僵尸记录（矩阵会排除它，但没人知道那次跑的进度）。
 
-**出口判据**：界面上能发起评测（选任务/模型/k/limit）并看到实时进度与取消；
-能导入数据集（上传 JSONL 或选内置生成器）并看到来历/revision/条数；
-`onyx models pull/rm` 与界面同源；被中断的 run 显示为 `cancelled` 且可续跑（`--resume` 已有）。
+**S23 已交付"发起评测"这一半**：写操作从 2 个变成 4 个
+（`POST /api/runs`、`POST /api/runs/{id}/cancel` 加上原有两个），评测进程内单飞排队 +
+机器级 GPU 锁同源，界面能看到逐条进度、排队位置、"谁在占 GPU + ETA"，三条路都能取消
+（排队中 / 等锁中 / 跑一半）。僵尸回收也落了：服务启动时把上次进程留下的 `running` 行
+标成 `error` 并写明原因，但**只动 `trigger=api` 且锁空闲的那些**。
+真机验证：mock 引擎上点一次按钮跑完 944 条并自动下钻 grade；占住锁后取消 ⇒ 状态 cancelled
+且库里没有那条 run。
+
+**出口判据**（逐条核对）：
+- ✅ 界面上能发起评测（选任务/模型/k/limit/seed/子集/卸掉其它模型）并看到实时进度与取消
+- ⬜ 能导入数据集（上传 JSONL 或选内置生成器）并看到来历/revision/条数 —— S24
+- ⬜ Tool Bench 页：注册表 / 审计 / 开销 / 契约矩阵 / fire 结果 —— S25
+- ⬜ `onyx models pull/rm` 与界面同源 —— S26
+- ⬜ 被中断的 run 显示为 `cancelled`/`error` 且**在界面上可续跑**（`--resume` 已有，入口没有）—— S26
 这块最大的风险是"写操作把 GPU 抢了"：所有触发型端点必须走同一把机器级锁，
-并在页面上显示"谁在占"（`/api/gpu` 已有数据）。
+并在页面上显示"谁在占"（`/api/gpu` 已有数据）。S23 按这条做了：`AppState` 把同一把锁的
+路径与 stale 阈值注入提交服务，测试 `test_submitted_runs_share_the_apps_gpu_lock` 钉住"锁路径不许分叉"。
 
 ### G4 观测的产品化闭环（只有记录，没有触达）
 证据：`grep webhook\|notify` → 0。23 种异常码全部只落库；`obs/visitors` 的设计目标是"新异常规则、成本模型、**告警**"，
@@ -121,7 +133,7 @@ CI 上覆盖率有基线数字（不追高，只防跌）；契约矩阵增加"�
 |---|---|---|---|
 | **M7 跑得住** | G1 全部：`rotate`、`db backup/verify-backup`、`doctor` 补磁盘 + tokenizer 档位、迁移前自动备份、`.data` 体积报告 | **S17–S19 ✅** | 保留策略可 `--dry-run` 且落库审计 ✅ · 备份可验证恢复 ✅ · `doctor` 在人为破坏后报具体项 ✅（真机：删一个 blob ⇒ 具名 + 退出码 1）· 磁盘与档位两项体检 ✅ · `.data` 曲线 ✅ |
 | **M8 配置与发行** | G2：`onyx.toml`（provider/锁/保留/白名单）+ 优先级与"写了不生效"检查；`--host` 非回环强制 token；CHANGELOG + 版本策略 + GitHub Actions；`uv tool install` 冒烟 | **S20–S22 ✅** | 配置项与 flag 冲突时有明确解释 ✅ · 非回环无 token 起不来 ✅ · 新机器一条命令装好并 `doctor` 全绿 ✅（本机干净环境验过）· CI 能挡住 lint-imports/边界脚本违规 ✅（workflow 就位；仓库尚无远端 ⇒ 待首次真跑）· LICENSE/Docker/pipx 挂在"是否对外发行"这个未决问题上 |
-| **M9 操作闭环** | G3：界面发起评测（锁排队 + 实时进度 + 取消）、数据集导入、工具注册/审计页（Tool Bench）、`models pull/rm` | S23–S26 | 不发一句命令就能完成"选模型 → 跑评测 → 看矩阵 → 下钻 trace"；被中断的 run 状态正确；触发型端点全部过机器级锁 |
+| **M9 操作闭环** | G3：界面发起评测（锁排队 + 实时进度 + 取消）✅、数据集导入、工具注册/审计页（Tool Bench）、`models pull/rm` | S23 ✅ / S24–S26 | 不发一句命令就能完成"选模型 → 跑评测 → 看矩阵 → 下钻 trace"（S23 已达成这一段）；被中断的 run 状态正确（✅ 含重启后的僵尸回收）且可续跑；触发型端点全部过机器级锁（✅） |
 | **M10 观测触达** | G4：告警规则 + 两个出口（本地文件 / 通用 webhook）+ 触发历史页；多引擎观测形态定案（要么一进程多 provider，要么文档化"多实例 + 汇总视图"） | S27–S29 | 人为造一条 `CONTEXT_OVERFLOW` 能在 1 分钟内收到通知并能在界面看到"为什么触发" |
 | **M11 评测资产** | G5：`structured_extraction`、`instruction_following`、长上下文中文集、embedding 任务（先解决 U8/U9 未决实测再上视觉） | S30–S33 | 每个新任务三条同源断言全绿；真机跑一次带分母与 CI；矩阵从 2 列长到 5–6 列且雷达图出现 |
 | **M12 防倒退** | G6：6 页 e2e、覆盖率基线、契约矩阵真 stdio 变体、性能基线、i18n 抽取（仅在确定要分发时做） | S34–S36 | CI 上 e2e 跑通且能抓到一次人为注入的 SSE 断链；`onyx perf` 有可比基线 |

@@ -1652,6 +1652,94 @@ CI 能挡住 lint-imports / 边界脚本 / 覆盖率下跌；仓库尚无远端 
 
 ---
 
+## S23 — 界面发起评测：单飞队列 + 取消 + 进度（M9 第一步）✅
+
+**产出文件**
+```
+onyx/eval/service.py                  # 进程内单飞队列、取消事件、进度快照、僵尸回收
+onyx/eval/runner.py                   # RunConfig.run_id（预分配）+ trigger（出处）+ 心跳失败计入 cost
+onyx/eval/gpu_lock.py                 # 心跳写锁重试；写不出去只计数，不判死整轮
+onyx/eval/tasks/__init__.py           # builtin_dataset_names()：校验与 load_dataset 认同一套写法
+onyx/core/errors.py                   # EvalQueueFull（EVAL_QUEUE_FULL）
+onyx/api/deps.py                      # AppState 带上 eval_service，锁路径与 stale 阈值同源
+onyx/api/app.py                       # 启动时 reclaim 僵尸、关停时先停 worker 再关库、错误表 +2
+onyx/api/routes/evals.py              # POST /api/runs · …/progress · …/cancel · GET /api/queue · /api/tasks
+onyx/web/src/pages/EvalLaunch.tsx     # 发起评测面板（表单 → 提交 → 轮询进度 → 取消）
+onyx/web/src/pages/EvalRuns.tsx       # 面板挂进运行页，跑完自动选中那一行
+onyx/web/src/api/client.ts            # startRun / runProgress / cancelRun / evalQueue / evalTasks
+onyx/web/src/api/types.ts             # TaskView / SubmitView / ProgressView / QueueView / selectable
+onyx/web/src/components/primitives.tsx# queued 的符号与色调（真实状态不许落到 "?"）
+onyx/web/src/styles/app.css           # .meter / .meter-fill 进度条
+tests/unit/test_eval_service.py（25）
+tests/unit/test_api_eval_submit.py（16）
+tests/unit/test_gpu_lock.py（+3 → 25）
+tests/unit/test_eval_runner.py（+3 → 29）
+onyx/web/src/__tests__/evalLaunch.test.ts（11）
+```
+
+**为什么不在请求线程里跑评测**：一次 236 条的评测占住 GPU 几十分钟，HTTP 会超时，
+调用方以为失败了而 GPU 还在跑。所以 POST 只入队（202 + run_id），worker 线程串行执行。
+为此 runner 加了两件事：`run_id`（提交时必须就能把 id 交出去）与 `trigger`（这次运行是谁发起的）。
+`resume_run_id` 的语义一点没动——它带"跳过已评 case"，挪用来传新 id 会让一次新运行
+莫名继承别人的进度。
+
+**四条服务侧纪律**
+1. 只有一条评测路径：service 不重新实现循环，用的就是 `onyx eval run` 那套
+   `load_dataset` / `build_task` / `EvalRunner`。
+2. 单飞：GPU 锁管跨进程，进程内再排一层队（`max_pending=8`，满了报 429 而不是默默排队）。
+3. **run 记录从"真的开始跑"那一刻才存在**：runner 是拿到锁之后才 insert，
+   所以排队中/等锁中被取消的任务在库里没有任何痕迹——界面为此单独有一个"没跑过"的状态，
+   而不是一个 0 分格子。
+4. 状态词表不新增（running/done/cancelled/skipped/error）：worker 崩了记 error，
+   重启留下的僵尸也记 error。发明 `interrupted` 会让每个读这张表的下游重学一遍。
+
+**取消必须在三种位置都是活的**：排队中（worker 取出时发现标记）、跑一半（runner 在 case 之间检查）、
+**等 GPU 锁时**——第三种最容易漏：worker 阻塞在 `acquire()` 里，而 runner 的检查在 case 之间，
+不在锁的 `on_wait` 回调里抛出去，取消按钮在"排队中"那一屏就是死的。
+
+**僵尸回收的判据必须成对使用**：`config.trigger == "api"` **且** GPU 锁没人持有。
+只看第一条会去改别的进程正在跑的运行；只看第二条会把 CLI 正在跑的运行标成失败。
+`finished_at` 留空——只知道它已经不在了，不知道它什么时候没的，填当前时间就是编造。
+
+**真机上撞出来的一个 Windows 缺陷**（不是新代码写错，是新代码让它天天发生）：
+锁的心跳用 `os.replace(tmp, lock)`，而看板开始每秒读锁文件显示"谁在占 GPU"之后，
+Windows 会因目标被别的句柄打开而返回 `ACCESS_DENIED`——实测 944 条样本的那轮评测
+被一次心跳失败整个判死（`PermissionError` 冒到 service 变成 status=error，0/8 那行就是它）。
+修法是 replace 重试 + 心跳失败只计数（`cost.gpu_heartbeat_errors`）不中断：
+心跳是给排队者算 ETA 的优化，不是正确性前提；但必须留痕，因为心跳长期写不出去
+意味着锁可能已被别人判过期接管，那段数字要能被质疑。
+
+**进度必须说清出处**：`source=service` 才有逐条进度与取消开关；
+CLI 发起的运行只有库里每 10 条落一次的检查点，`cancellable=false` 并给出 409。
+`holder` 只在**真的在等锁**时报——持有者就是自己时报"GPU 正被 api-eval:… 占用"，
+界面会读成"有人在跟我抢 GPU"。总数未知时显示「—」而不是 0/0。
+
+**数据集这一栏的校验故意比 CLI 窄**：不接受 `file:<路径>`（请求体里写什么路径就读什么文件，
+而这个看板是可以带 token 共享的），也不接受只在库里登记的导入数据集——还没有"从库里读回"
+的载入器，放过它只会在 worker 里变成一条 error。**校验必须和 worker 的能力一致**。
+
+**本机验证**（不是只有单测）
+```bash
+onyx serve --provider mock --port 8787 --db .tmp/s23.sqlite --gpu-lock .tmp/s23-gpu.lock
+curl POST /api/runs {limit:5} → 202 + run_id；/progress → done 5/5；/queue → 任务在册；/api/gpu → busy:false
+浏览器（vite:5173 /#/eval）：
+  面板列出 2 个任务 / 1 个模型 / 数据集下拉含"任务默认（intent_zh-v1，236 条）" / 子集带条数
+  填 limit=236 k=4 → ▶ running → ✓ done 944/944，自动选中该 run 并下钻 grade（修复心跳后跑的）
+  另开进程占住机器锁 → 界面出现"等 GPU：当前由 cli-eval:holder 占用，预计还需 180s（已等 7s）"
+  点取消 → ⊘ cancelled，/api/runs?limit=20 仍是 3 条：那条取消的运行没进库
+  再点取消 → "取消是幂等的：什么都没改"
+```
+离线套件 1175 passed / 1 skipped，`coverage` 分支覆盖 89%（新代码：service 95%、evals 路由 97%、
+deps 100%），`ruff check .` 与 `lint-imports`（3 条契约）全绿，前端 tsc / vitest 60 / vite build 全绿。
+
+**没做以及为什么**：评测进度不进 SSE 而是 1s 轮询——进度本来就要落库检查点，
+多一条事件流就多一处会撒谎的地方；长任务的"重启后续跑"留给 S26（被中断的 run 现在显示 error，
+`onyx eval run --resume <id>` 已能接上，但界面还没有那个按钮）。
+
+**提交**：`feat(eval): 界面发起评测 —— 单飞队列、取消、进度与一处 Windows 心跳缺陷（S23）`
+
+---
+
 ## 附录 A — 每步自测速查
 
 | 步 | 命令 | 绿的条件 |
@@ -1678,7 +1766,8 @@ CI 能挡住 lint-imports / 边界脚本 / 覆盖率下跌；仓库尚无远端 
 | S20 | `onyx config show && onyx doctor` | 每一项标出来自 flag/环境/文件/默认哪一层；未知键与坏类型让 doctor 变红 |
 | S21 | `ONYX_SERVE_TOKEN=… onyx serve --host 0.0.0.0 --read-only` | 无 token 时非回环绑定拒绝启动；401/403 都带可行动的 hint；浏览器带 token 全量渲染 |
 | S22 | `uv build && uv tool install --from dist/*.whl onyx`（隔离目录） | 干净环境装起来后 version / db init / chat / doctor 全通；CI 步数被测试钉住 |
-| 门禁 | `make coverage`（`coverage run -m pytest -q`） | 离线套件分支覆盖率 ≥ 80%（S17 落地时 88%，S21 后 89%） |
+| S23 | 浏览器点「开始评测」＋另起进程占住 GPU 锁 | 提交立刻返回 run_id；进度逐条推进；等锁时看得见持有者与 ETA；取消后库里没有那条 run |
+| 门禁 | `make coverage`（`coverage run -m pytest -q`） | 离线套件分支覆盖率 ≥ 80%（S17 落地时 88%，S21 后 89%，S23 后仍 89%） |
 
 ## 附录 B — 架构自测（让"模块化"可验证，而非口号）
 

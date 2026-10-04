@@ -56,6 +56,10 @@ DEFAULT_POLL_S = 0.5
 #: 接管死锁时搬走旧锁文件的重试次数。Windows 的 rename 会被"文件正被别的句柄打开"
 #: 短暂拒绝（杀软/索引器），一次就放弃等于没人能接管死锁。
 CLAIM_RETRIES = 3
+#: 写锁（含心跳）的重试次数。看板每秒读一次锁文件来显示进度，而 Windows 的 `os.replace`
+#: 在目标被别的句柄打开（没带 FILE_SHARE_DELETE）时会直接返回 ACCESS_DENIED。
+#: 一次就放弃等于"有人在看进度"就能把一整轮评测判死。
+WRITE_RETRIES = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +123,10 @@ class GpuLock:
         self.on_wait = on_wait
         self.host = host or _hostname()
         self._held = False
+        #: 心跳写入失败的次数与最后一次原因。写不进锁文件不该让评测死掉，
+        #: 但"静默忽略"更不该——见 heartbeat
+        self.heartbeat_errors = 0
+        self.last_heartbeat_error = ""
 
     # ── 状态 ──────────────────────────────────────────────────────
     @property
@@ -160,14 +168,24 @@ class GpuLock:
             waited += self.poll_s
 
     def heartbeat(self, done: int, total: int, **extra: Any) -> None:
-        """刷新心跳与进度。**排队者的 ETA 完全依赖这个调用**，所以每条样本后都要打。"""
+        """刷新心跳与进度。**排队者的 ETA 完全依赖这个调用**，所以每条样本后都要打。
+
+        写不进去（重试之后仍然失败）时**只计数，不中断评测**：心跳是给排队者算 ETA
+        与判死用的优化，不是正确性前提，为一时拿不到文件句柄把整轮 GPU 时间判死，
+        代价完全不对等。但计数必须留在 run 记录里——心跳长时间写不出去，
+        锁会被别人判过期并接管，那时数字就真的被污染了。
+        """
         if not self._held:
             return
-        self._write(LockInfo(
-            owner=self.owner, pid=os.getpid(), started_at=self._started_at,
-            heartbeat_at=utc_now_iso(), done=done, total=total,
-            host=self.host, extra=extra,
-        ))
+        try:
+            self._write(LockInfo(
+                owner=self.owner, pid=os.getpid(), started_at=self._started_at,
+                heartbeat_at=utc_now_iso(), done=done, total=total,
+                host=self.host, extra=extra,
+            ))
+        except OSError as exc:
+            self.heartbeat_errors += 1
+            self.last_heartbeat_error = f"{type(exc).__name__}: {exc}"[:200]
 
     def release(self) -> None:
         if not self._held:
@@ -259,11 +277,25 @@ class GpuLock:
                 moved.unlink()
 
     def _write(self, info: LockInfo) -> None:
-        """原子写：先写临时文件再 `os.replace`，排队者永远读不到半截 JSON。"""
+        """原子写：先写临时文件再 `os.replace`，排队者永远读不到半截 JSON。
+
+        replace 要重试：看板每秒读一次这个文件来显示"谁在占 GPU"，而 Windows 上
+        目标被别的句柄打开时 `os.replace` 会直接 ACCESS_DENIED。不重试的话，
+        "有人在看进度"这件事本身就能把一轮评测判死。
+        """
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(self.path.suffix + f".{os.getpid()}.tmp")
         tmp.write_text(json.dumps(asdict(info), ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, self.path)
+        for attempt in range(WRITE_RETRIES):
+            try:
+                os.replace(tmp, self.path)
+                return
+            except OSError:
+                if attempt == WRITE_RETRIES - 1:
+                    with contextlib.suppress(OSError):
+                        tmp.unlink()  # 写不动就干净退出，不把 .tmp 烂在目录里
+                    raise
+                time.sleep(0.005 * (attempt + 1))
 
     def _is_stale(self, info: LockInfo) -> bool:
         age = _seconds_between(info.heartbeat_at, utc_now_iso())

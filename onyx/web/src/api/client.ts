@@ -75,7 +75,11 @@ import type {
   HealthView,
   MatrixView,
   ModelView,
+  ProgressView,
+  QueueView,
   RunView,
+  SubmitView,
+  TaskView,
   TraceDetail,
   TracePage,
   UsageSummaryView,
@@ -123,6 +127,28 @@ export const api = {
   /** GPU 锁状态是**只读**的：看板轮询它不能把锁抢了 */
   gpu: () => request<GpuStatusView>('/api/gpu'),
   evalDatasets: () => request<DatasetView[]>('/api/datasets'),
+  /** 任务清单现读后端注册表：前端不硬编码任务名，否则插件任务在界面上是隐形的 */
+  evalTasks: () => request<TaskView[]>('/api/tasks'),
+  /** 发起评测：只入队，立刻返回 run_id。跑评测的是服务里的 worker 线程，不是这个请求 */
+  startRun: (body: {
+    task: string
+    model: string
+    k?: number
+    limit?: number | null
+    split?: string
+    seed?: number | null
+    dataset?: string | null
+    max_tokens?: number | null
+    unload_others?: boolean
+    notes?: string
+  }) => request<SubmitView>('/api/runs', { method: 'POST', body: JSON.stringify(body) }),
+  runProgress: (runId: string) => request<ProgressView>(`/api/runs/${encodeURIComponent(runId)}/progress`),
+  cancelRun: (runId: string) =>
+    request<{ run_id: string; state: string; cancelled: boolean; message: string }>(
+      `/api/runs/${encodeURIComponent(runId)}/cancel`,
+      { method: 'POST' },
+    ),
+  evalQueue: () => request<QueueView>('/api/queue'),
   evalRuns: (params: { task?: string | null; model?: string | null; limit?: number } = {}) =>
     request<RunView[]>(`/api/runs${qs(params)}`),
   evalGrades: (runId: string, params: { verdict?: string | null; limit?: number } = {}) =>

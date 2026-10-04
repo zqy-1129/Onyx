@@ -135,12 +135,12 @@ export function SeverityBadge({ severity, children }: { severity: string; childr
  *  而 "?" 在本项目里专指"未实测"，所以任何真实状态都不许落到 "?"。 */
 export const STATUS_BADGE_MAP: Record<string, string> = {
   ok: 'ok', done: 'ok', error: 'error', timeout: 'warn', cancelled: 'neutral',
-  running: 'info', skipped: 'unknown',
+  running: 'info', skipped: 'unknown', queued: 'neutral',
 }
 
 export const STATUS_SYMBOL: Record<string, string> = {
   ok: '✓', done: '✓', error: '✕', timeout: '⏱', cancelled: '⊘',
-  running: '▶', skipped: '⊝',
+  running: '▶', skipped: '⊝', queued: '⏳',
 }
 
 export function statusSymbol(status: string): string {

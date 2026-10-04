@@ -90,6 +90,29 @@ def test_tasks_are_listed_from_the_registry(app):
     assert "macro_f1" in intent["metrics"], "跑之前就该知道会产出哪些指标"
 
 
+def test_a_broken_task_degrades_to_one_row_not_an_empty_list(app, monkeypatch):
+    """一个坏插件任务把 /api/tasks 打成 500，界面看起来就是"一个任务都没有"。
+
+    这比少一列糟糕得多：真相（这个任务坏了）会被读成"没有任何评测可跑"。
+    """
+    client, _, _ = app
+    from onyx.api.routes import evals as evals_module
+
+    real_build = evals_module.build_task
+
+    def broken(task_id, **kw):
+        if task_id == TASK:
+            raise KeyError(f"未知任务 {task_id!r}")
+        return real_build(task_id, **kw)
+
+    monkeypatch.setattr(evals_module, "build_task", broken)
+    rows = client.get("/api/tasks").json()
+    assert len(rows) >= 2, "内建有两个任务，坏一个之后至少还要列得出另一个"
+    mine = next(row for row in rows if row["id"] == TASK)
+    assert "KeyError" in mine["error"], "坏任务要带着坏在哪里出现，而不是被静默丢掉"
+    assert all(other["error"] == "" for other in rows if other["id"] != TASK)
+
+
 def test_datasets_say_which_ones_the_ui_can_run(app):
     client, _, _ = app
     rows = client.get("/api/datasets").json()
@@ -207,6 +230,9 @@ def test_cancel_while_it_waits_for_the_gpu_lock(app, tmp_path):
         resp = client.post(f"/api/runs/{run_id}/cancel")
         assert resp.status_code == 200 and resp.json()["cancelled"] is True
         _wait_state(client, run_id, "cancelled")
+        again = client.post(f"/api/runs/{run_id}/cancel")
+        assert again.status_code == 200
+        assert "幂等" in again.json()["message"], "重复取消要说不改任何东西，而不是演一遍成功"
     finally:
         holder.release()
     assert EvalRepo(runtime.db).get_run(run_id) is None, "一条样本都没跑，库里不该有这条 run"

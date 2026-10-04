@@ -444,8 +444,16 @@ class ToolExecutor(Protocol):
   然后照样同时往显存里塞模型。
 - 接管靠 `os.rename`（要求源存在）+ 内容复验，不靠"覆盖后回读确认"：
   顺序执行的接管者用后者会**都认为自己赢了**。两个持有者比没有锁更危险，因为它看起来是安全的。
+- 心跳写的是 `os.replace(tmp, lock)`，而 Windows 上目标被别的句柄打开时会返回 `ACCESS_DENIED`——
+  **看板每秒读一次锁文件就会制造这种句柄**。所以 replace 带重试，重试仍失败时只计数
+  （进 `cost.gpu_heartbeat_errors`）不打断评测：心跳是给排队者算 ETA 的优化，不是正确性前提，
+  为拿不到句柄把整轮 GPU 时间判死代价不对等。但计数必须可见——心跳长期写不出去意味着
+  锁可能已被别人判过期接管，那时数字要被质疑。
 - 参与方：`eval run`（`--no-queue` 立刻失败、`--lock-timeout` 限时排队、`--gpu-lock` 覆盖路径）、
-  `onyx serve` 的 Playground（忙时 HTTP 429 带持有者与 ETA）、`/api/gpu`（只读状态）、
+  `onyx serve` 的 Playground（忙时 HTTP 429 带持有者与 ETA）、
+  **serve 的评测提交队列**（S23：`eval/service.py` 进程内单飞 + 与 serve 用**同一条**锁路径与
+  stale 阈值，所以"界面发起的评测"与 CLI 发起的照样互斥；锁路径一分叉，这条保证就只剩一半）、
+  `/api/gpu`（只读状态）、
   以及 `pytest -m live`（`tests/integration/conftest.py` 在整个 session 前拿同一把锁）。
   最后一条是补的缺陷：live 套件原先不参与锁，与评测并发时**基准数字全部失真但不报错**。
 
@@ -527,7 +535,7 @@ CONTRACT_VERSION = 1
 | **Playground** | 多模型并排、thinking 分栏、工具面板、每轮 usage 条、**渲染后 prompt 查看**、一键转 case | 并排必须串行过 GPU 锁 |
 | **Traces** | 列表 + 详情：时间轴、消息、tool 循环树、per-part token 归因、缓存推断、原始 body | 任意派生值可回溯原始证据 |
 | **Tool Bench** | 注册表健康、**工具库 token 开销排行**、契约测试结果、fire-and-verify 结果、MCP 工具发现 | 模型侧与工具侧结果分区展示 |
-| **Eval** | task/benchmark 配置、model×task 矩阵、雷达图、per-case 钻取、回归 diff（两 run 并排 + 劣化清单） | 每个分数能跳到 trace |
+| **Eval** | **发起评测 + 实时进度与取消**（S23）、运行列表、model×task 矩阵、雷达图、per-case 钻取、回归 diff（两 run 并排 + 劣化清单） | 每个分数能跳到 trace；排队要说清"谁在占 GPU、还要多久"，而不是一个转圈的图标 |
 | **Token Ledger** | input/output/thinking 时序、采信来源占比、drift 异常、prefill vs decode、缓存命中推断 | 明确区分 cold/warm |
 | **Ops** | pull/delete/unload、keep_alive 策略、并发队列、DB 备份导出、数据集导入 | 危险操作二次确认 |
 

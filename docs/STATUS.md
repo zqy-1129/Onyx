@@ -1,11 +1,11 @@
-# 项目现状（Onyx · v0.1.0）
+# 项目现状（Onyx · v0.8.0）
 
-核对时间 **2026-10-04**，HEAD = M6 收口 + M7 第一步（S17 数据生命周期）之后。
+核对时间 **2026-10-04**，HEAD = M8 收口（S20–S22 配置/鉴权/发行面）+ M9 第一步（S23 界面发起评测）之后。
 本文所有数字都是当场跑出来的（命令附在每节末尾），不是从旧文档抄的；
 `README.md` 的进度表、`docs/IMPLEMENTATION.md` 的分步档案是历史沿革，
 **这里回答的是"现在有什么、能干什么、还欠什么"**。
 
-一句话：**M0–M8 全部达成（观测 / 看板 / 工具 / 评测 / 对比 / 扩展 / 跑得住 / 配置与鉴权姿态）；
+一句话：**M0–M8 全部达成，M9 已迈出第一步（评测可以在界面发起、可以取消）；
 欠的是 S7 剩下的 `report usage` / `token explain` 两个入口、Tool Bench 网页、M10 的告警出口，
 以及一批"带原因推迟"的项。**
 
@@ -61,6 +61,8 @@ WAL + 批量 sink（队列满丢样本但 `dropped` 计数可见）、
 - 模型 × 任务矩阵（每格取**最新一次 done**，薄覆盖率强制显示分母）
 - 报告导出：md / csv / 自包含 html（含手写 SVG 雷达图，任务数 ≥3 才画）
 - 调度：GPU **机器级**独占锁 + 心跳 + ETA + `--unload-others`、断点续跑（成本与 n_done 不被后续片段清零）
+- **提交服务 `eval/service.py`（S23）**：进程内单飞队列（`max_pending=8`，满了报 429 而不是默默排队）、
+  取消（排队中 / 等锁中 / 跑一半三条路都真能停）、逐条进度快照、启动时回收上次进程留下的 `running` 僵尸行
 - 能力不满足 ⇒ 整任务 skip 且**留下带原因的记录**（禁止隐式降级）
 - 数据集导入：`--source bfcl`、JSONL、`file:<路径>`；来历（upstream/revision/license）参与可比性判定
 
@@ -70,7 +72,8 @@ WAL + 批量 sink（队列满丢样本但 `dropped` 计数可见）、
 - **部署配置 `onyx.toml`**（S20）：provider / GPU 锁 / 保留窗口 / sandbox / serve 绑定收在一处。
   优先级只有一条规则 **flag > 环境 > 文件 > 默认**；`onyx config show` 逐项标出它来自哪一层，
   `onyx doctor` 把"写了不生效"的未知键与坏类型报成红项（模板见 `onyx.example.toml`）
-- **API 19 个端点**（18 REST + `GET /api/stream` SSE）
+- **API 24 个操作 / 23 条路径**（23 REST + `GET /api/stream` SSE）。写操作 4 个：
+  Playground chat、admin unload、**发起评测**、**取消评测**（后两个 S21 的 `--read-only` 一样挡 403）
 - **非回环绑定强制 token**（S21）：`serve --host 0.0.0.0` 没有 token 就拒绝启动；
   `--read-only` 让共享看板不变成共享操作台；错误体统一 `{error:{code,message,detail.hint}}`
 - **Web 9 页**：Fleet / Models / Traces / TraceDetail / Token Ledger / Playground / 评测 / 矩阵 / 回归
@@ -101,17 +104,18 @@ WAL + 批量 sink（队列满丢样本但 `dropped` 计数可见）、
 ## 2. 质量门与规模
 
 ```
-uv run pytest            # 1128 passed, 1 skipped（S17–S22 新增：retention 28 / backup 20 / doctor 9 / config 25 / auth 31 / 发行面 15）
+uv run pytest            # 1175 passed, 1 skipped（S17–S23 新增：retention 28 / backup 20 / doctor 9 / config 25 / auth 31 / 发行面 15 / 提交服务 25 / 发起评测 API 16）
 uv run pytest -m live     # 20 passed（真打 qwen3.5:9b，与评测共用机器级 GPU 锁）
 uv run pytest -m probe     # 4 passed（P 系列实验的可重跑版本）
 uv run ruff check .         # All checks passed（`ruff format` 不是门禁）
 uv run lint-imports          # 3 contracts kept（两条网络例外显式登记）
-uv run coverage run -m pytest -q && uv run coverage report   # 89% ≥ 80%（分支覆盖，离线套件）
+uv run coverage run -m pytest -q && uv run coverage report   # 89% ≥ 80%（分支覆盖，离线套件；S23 新代码 service 95% / evals 路由 97% / deps 100%）
 uv run python scripts/check_extension_boundary.py   # 接入实现未触碰受保护内核文件
 uv run onyx doctor            # 9 项体检：配置 / Python / 可写 / 磁盘 / 迁移 / blob / 档位 / 插件 / 引擎
 uv run onyx config show       # 每一项生效值标出来自 flag/环境/文件/默认哪一层（token 只报"已设置"）
 uv build && uv tool install --from dist/*.whl …  # 干净环境装起来：version / db init / chat(mock) / doctor 全通
-前端：tsc --noEmit / vitest 49 / vite build（204KB js）+ 浏览器 take_snapshot
+前端：tsc --noEmit / vitest 60 / vite build（211KB js）+ 浏览器 take_snapshot
+API：openapi 23 paths / 24 operations（含 `GET /api/stream` SSE）
 CI：.github/workflows/ci.yml 跑上面这些（本机已验证命令本身可跑通；仓库尚无远端 ⇒ 还没真跑过一次）
 ```
 
@@ -122,6 +126,11 @@ CI：.github/workflows/ci.yml 跑上面这些（本机已验证命令本身可�
 `--provider openai-compat` 打本机 `/v1` 得 `usage=compat/low in=16 out=400`（与 `finish=length` 自洽）；
 `--provider echo`（外部插件）落库 `heuristic/low` 且无引擎计数的项显示「—」；
 MCP 工具经 `tools fire --mock live` 判定 **PASS**（模型 → 循环 → stdio server → 回填 → final）。
+S23 在浏览器里真跑过：`--provider mock` 的 serve 上点「开始评测」跑完 **944 条**（236×4）并自动下钻 grade；
+另起进程占住机器级 GPU 锁时界面显示"等 GPU：当前由 cli-eval:holder 占用，预计还需 180s（已等 7s）"，
+点取消后状态停在 `cancelled` 且 `/api/runs` 里**没有**那条 run（一条样本都没跑就不该有记录）。
+这一步顺带暴露了一处 Windows 真实缺陷：看板每秒读锁文件之后，心跳的 `os.replace` 会拿到
+`ACCESS_DENIED`，原先会把整轮评测判死——现在重试 + 失败计数进 `cost.gpu_heartbeat_errors`。
 
 ---
 
@@ -168,8 +177,11 @@ MCP 工具经 `tools fire --mock live` 判定 **PASS**（模型 → 循环 → s
 
 
 1. ~~M7 跑得住~~（S17 保留策略 / S18 可验证备份 / S19 体检补齐 + 迁移前自动快照 + 体积曲线，全部达成）。
-   **下一步是 M8 配置与发行**——它决定别人能不能不读源码把这套东西装起来跑。
+   ~~M8 配置与发行~~（S20 `onyx.toml` / S21 token 姿态 / S22 版本 + CHANGELOG + CI）。
+   **M9 操作闭环进行中**：S23 界面发起评测已交付；欠 S24 数据集导入进界面、
+   S25 Tool Bench 页、S26 `models pull|rm` 与被中断运行的续跑入口。
 2. **`-m e2e` 用例**：把已经手工验证过的六页路径固化成回归（SSE 联通、矩阵分母显示、劣化清单下钻）。
+   S23 之后这条更值钱：发起评测的浏览器路径现在是核心流程，只靠手工点。
 3. **Tool Bench 页**：后端齐了（`tools ls/audit/cost/contract/fire` 的数据都在库里），缺的是把它摆上看板。
 4. **`token explain` + `doctor` 两项检查 + `report usage`**：都属于"每天都在用但入口缺失"。
 5. C 组三条一致性（`RECONCILED` 不发、`base_url` 默认值、兼容通道探针覆盖）适合凑成一次"口径一致性"清理。

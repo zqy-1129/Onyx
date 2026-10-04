@@ -3,7 +3,7 @@
  * 这一页的存在理由只有一条：**每个分数都能点进一条真实 trace**。
  * 因此 grade 表里的 trace 列必须可点，而不是把 id 印出来让人自己抄。
  */
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { api } from '../api/client'
 import type { CIView, GradeView, GpuStatusView, RunView } from '../api/types'
 import { DataTable, type Column } from '../components/DataTable'
@@ -11,6 +11,7 @@ import { EmptyState, ErrorState, Panel, Skeleton, StatusBadge } from '../compone
 import { fmtClock, fmtInt, fmtScore, fmtCi, shortId, UNKNOWN } from '../format'
 import { useApi } from '../hooks/useApi'
 import { navigate } from '../router'
+import { EvalLaunchPanel } from './EvalLaunch'
 import { THIN_COVERAGE } from './EvalMatrix'
 
 /** 主分数：按与后端 HEADLINE_METRICS 相同的优先级挑第一个出现过的键。
@@ -125,6 +126,10 @@ export function EvalRunsPage({ selectedRunId }: { selectedRunId?: string }) {
   }, [selectedRunId])
   const active = picked ?? selectedRunId ?? runs.data?.[0]?.id ?? null
 
+  // 稳定的回调：轮询进度那个 effect 把它列在依赖里，
+  // 每次渲染新建一个箭头函数会让轮询从头开始，进度条反而变成每帧重启
+  const pickRun = useCallback((id: string) => setPicked(id), [])
+
   const list = runs.data ?? []
 
   return (
@@ -138,6 +143,7 @@ export function EvalRunsPage({ selectedRunId }: { selectedRunId?: string }) {
           </span>
         </div>
       ) : null}
+      <EvalLaunchPanel onRefresh={runs.refresh} onFinished={pickRun} />
       <Panel
         title="运行"
         note="每行是一次 eval run；点行看它的 grade"
@@ -149,7 +155,7 @@ export function EvalRunsPage({ selectedRunId }: { selectedRunId?: string }) {
         {runs.data && runs.data.length === 0 ? (
           <EmptyState
             title="还没有评测运行"
-            hint="onyx eval run --task intent_classification --model qwen3.5:9b --seed 42"
+            hint="用上方「发起评测」填任务与模型点开始，或 onyx eval run --task intent_classification --model qwen3.5:9b --seed 42"
           />
         ) : null}
         {runs.data && runs.data.length > 0 ? (

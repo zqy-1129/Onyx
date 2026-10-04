@@ -288,3 +288,12 @@ textarea.input { font-family: var(--font-ui); resize: vertical; line-height: 1.5
 }
 .warnbox ul { margin: 4px 0 0; padding-left: 18px; }
 .note { color: var(--text-muted); font-size: var(--fs-xs); margin: var(--space-2) 0 0; }
+
+/* ── 发起评测（S23）───────────────────────────────────────────── */
+/* 进度条：宽度由 done/total 决定。total 未知时留空而不是画 0%——
+   "一条都没跑完"与"还不知道总共多少条"是两件事（UI_DESIGN R2） */
+.meter {
+  height: 6px; margin-top: var(--space-2); border-radius: 3px; overflow: hidden;
+  background: var(--bg-inset); border: 1px solid var(--border);
+}
+.meter-fill { height: 100%; background: var(--info); transition: width var(--dur-fast) linear; }
