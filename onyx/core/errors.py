@@ -133,6 +133,16 @@ class BudgetExceeded(EvalError):
     code = "BUDGET_EXCEEDED"
 
 
+class EvalQueueFull(EvalError):
+    """单飞队列已满，拒绝新的提交。
+
+    必须显式拒绝而不是默默排在最后：一次评测是几十分钟 GPU 时间，
+    排第 30 位等于永远不会有结果，而界面上只写着"排队中"。
+    """
+
+    code = "EVAL_QUEUE_FULL"
+
+
 class GpuLockBusy(OnyxError):
     """本地 GPU 是独占资源：eval / bench / playground 互斥（DESIGN §8.5）。"""
 

@@ -515,3 +515,38 @@ def test_unload_others_records_what_it_evicted(env, monkeypatch):
     report = runner2.run(RunConfig(model=MODEL, unload_others=True))
     assert unloaded == ["other-model"], "该卸的没卸"
     assert report.cost["unloaded_models"] == ["other-model"]
+
+
+# ── 提交即拿到 id（S23：界面发起评测）──────────────────────────────
+def test_explicit_run_id_is_used_for_the_run(env):
+    """服务侧要在样本跑起来之前就返回 id，否则界面无法展示"已提交"的这条运行。"""
+    _, sink, _, _ = env
+    runner, _ = _runner(env, _scripts("转账"))
+    report = runner.run(RunConfig(model=MODEL, run_id="pre-allocated-1", trigger="api"))
+    assert report.run_id == "pre-allocated-1"
+    row = EvalRepo(env[0]).get_run("pre-allocated-1")
+    assert row is not None and row.status == "done"
+    sink.flush(5.0)
+    # 每条 grade 的 trace 都挂在预先分配的那个 run 上，而不是另一个新 id
+    traces = {TraceRepo(env[0]).get(g.trace_id).eval_run_id
+              for g in EvalRepo(env[0]).list_grades("pre-allocated-1")}
+    assert traces == {"pre-allocated-1"}
+
+
+def test_resume_run_id_beats_an_explicit_run_id(env):
+    """两个都给时必须是续跑语义赢：把新 id 写进 resume 路径会产生一个空壳 run。"""
+    runner, _ = _runner(env, _scripts("转账"))
+    first = runner.run(RunConfig(model=MODEL, limit=2))
+    again = runner.run(RunConfig(model=MODEL, resume_run_id=first.run_id, run_id="ignored"))
+    assert again.run_id == first.run_id
+    assert EvalRepo(env[0]).get_run("ignored") is None, "不该凭空造出一条从没跑过的 run"
+
+
+def test_trigger_is_persisted_as_provenance(env):
+    """running 行是不是僵尸，取决于它是谁发起的；出处必须在库里，不能只在内存里。"""
+    runner, _ = _runner(env, _scripts("转账"))
+    report = runner.run(RunConfig(model=MODEL, trigger="api"))
+    assert EvalRepo(env[0]).get_run(report.run_id).config["trigger"] == "api"
+
+    other = runner.run(RunConfig(model=MODEL))
+    assert EvalRepo(env[0]).get_run(other.run_id).config["trigger"] == "cli"

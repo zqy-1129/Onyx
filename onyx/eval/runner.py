@@ -45,6 +45,13 @@ class RunConfig:
     split: str = "default"
     #: 续跑：跳过该 run 里已经评过的 case
     resume_run_id: str | None = None
+    #: 预先分配的 run_id。服务侧需要"提交即拿到 id"，而 runner 内部生成的 id
+    #: 调用方永远拿不到。与 `resume_run_id` 是两件事：那个带"跳过已评 case"的语义，
+    #: 挪用它会让一次新运行莫名其妙地继承别人的进度。两者都给时 `resume_run_id` 赢。
+    run_id: str | None = None
+    #: 谁发起的这次运行（cli / api）。进程重启后要判断"哪条 running 是僵尸"，
+    #: 靠的就是这个出处：不知道是谁发起的，就无法把它和"另一个进程正在跑"分开。
+    trigger: str = "cli"
     max_wall_ms: float | None = None
     purpose: TracePurpose = TracePurpose.EVAL
     notes: str = ""
@@ -133,7 +140,7 @@ class EvalRunner:
 
         self._ensure_persisted()
         skip = check_capabilities(self.task, self.capabilities)
-        run_id = config.resume_run_id or new_trace_id()
+        run_id = config.resume_run_id or config.run_id or new_trace_id()
         previous = self.repo.get_run(run_id) if config.resume_run_id else None
         resuming = previous is not None
 
@@ -215,6 +222,7 @@ class EvalRunner:
                     config={"k": config.k, "limit": config.limit, "split": config.split,
                             "resumed_from": config.resume_run_id,
                             "already_graded": len(already),
+                            "trigger": config.trigger,
                             "unload_others": config.unload_others},
                     n_cases=total, notes=config.notes,
                     dataset_id=self._dataset_id, dataset_revision=self._dataset_revision,

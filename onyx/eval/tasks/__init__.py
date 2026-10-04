@@ -51,6 +51,15 @@ def task_ids() -> tuple[str, ...]:
     return tuple(sorted(specs()))
 
 
+def builtin_dataset_names() -> tuple[str, ...]:
+    """内置数据集**可接受的写法**（含 `-v1` 别名）。
+
+    给服务侧校验用：校验必须和 `load_dataset` 认同一样的写法，
+    否则会出现"CLI 能跑、界面说未知数据集"这种两边口径分裂。
+    """
+    return tuple(sorted(_BUILTIN_DATASETS))
+
+
 def build_task(task_id: str, *, model: str, dataset: Dataset | None = None, **kw: Any) -> EvalTask:
     """构造任务实例。
 
@@ -96,4 +105,5 @@ def load_dataset(dataset_id: str | None, *, task_id: str) -> Dataset:
     )
 
 
-__all__ = ["BUILTIN_TASKS", "build_task", "load_dataset", "specs", "task_ids"]
+__all__ = ["BUILTIN_TASKS", "build_task", "builtin_dataset_names", "load_dataset",
+           "specs", "task_ids"]
