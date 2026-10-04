@@ -156,6 +156,6 @@ grep -rn "APIKey\|Authorization" onyx/api --include=*.py | wc -l         # 0：�
 grep -rln "webhook\|notify" --include=*.py onyx/ | wc -l                 # 0：异常只落库
 ls .github 2>/dev/null | wc -l ; ls LICENSE CHANGELOG.md 2>/dev/null | wc -l   # 0 / 0
 grep -n "onyx.yaml" docs/DESIGN.md | head -1                            # 承诺过，代码里没有
-uv run pytest -m e2e --collect-only 2>&1 | grep -E "[0-9]+/1015 tests" # 0 个 e2e 用例
+uv run pytest -m e2e --collect-only 2>&1 | grep collected        # "no tests collected" ⇒ e2e 用例 0 个
 grep -c "aria-\|role=\"" -r onyx/web/src --include=*.tsx                 # 3 处
 ```
