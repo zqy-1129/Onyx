@@ -355,7 +355,9 @@ def cost_report(
         "json_bytes": sum(item["bytes"] for item in per_tool),
         "template_overhead_tokens": template_overhead,
         "effective_tokens": total + template_overhead,
+        # 没传开销时是 None 而不是 0.0：`0%` 会被读成"模板不花钱"，
+        # 而真相是"这次没量过模板开销"——P17 的教训恰恰是模板才是大头
         "template_share": round(template_overhead / (total + template_overhead), 4)
-        if (total + template_overhead) else None,
+        if template_overhead and (total + template_overhead) else None,
         "count_source": getattr(count_fn, "source_name", "unknown"),
     }

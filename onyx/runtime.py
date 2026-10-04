@@ -144,6 +144,30 @@ def build_runtime(
     )
 
 
+def build_tool_registry(
+    db: Database, *, provider_id: str, model: str | None = None
+) -> Any:
+    """构造工具注册表。CLI 与看板共用这一个装配点。
+
+    给了 `model` 就用**该模型标定过的计数档位**，与 gateway 归因走同一个 `text_counter`——
+    工具库开销必须与 trace 里的 `part=tool_defs` 同源，两处各算一套迟早报出两个数字。
+    """
+    from onyx.llm.measurement.fidelity import FITTED_MIN_SAMPLES, text_counter
+    from onyx.store.repos import ToolRepo
+    from onyx.tools.registry import ToolRegistry
+
+    count_fn = None
+    if model:
+        ctx = counter_ctx_factory(db, provider_id)(model)
+        count_fn = text_counter(ctx)
+        count_fn.source_name = (  # type: ignore[attr-defined]
+            "gguf_vocab" if ctx.tokenizer is not None
+            else "fitted" if ctx.fitted_ratio and ctx.fitted_n >= FITTED_MIN_SAMPLES
+            else "heuristic"
+        )
+    return ToolRegistry(ToolRepo(db), count_fn=count_fn)
+
+
 def register_provider(runtime: Runtime) -> None:
     """把 provider 与它的模型清单落库（`onyx models sync` 的核心）。"""
     info = runtime.provider.info()

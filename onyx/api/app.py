@@ -105,12 +105,13 @@ def create_app(
     app.state.onyx = state
     app.state.owns_runtime = owns_runtime
 
-    from onyx.api.routes import evals, fleet, playground, traces
+    from onyx.api.routes import evals, fleet, playground, tools, traces
 
     app.include_router(fleet.router)
     app.include_router(traces.router)
     app.include_router(playground.router)
     app.include_router(evals.router)
+    app.include_router(tools.router)
 
     @app.exception_handler(OnyxError)
     async def _onyx_error(_: Request, exc: OnyxError) -> JSONResponse:

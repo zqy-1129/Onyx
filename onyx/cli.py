@@ -1527,13 +1527,9 @@ app.add_typer(tools_app, name="tools")
 
 
 def _tool_registry(db: Path | None, model: str | None):
-    """构造注册表。给了 --model 就用**该模型标定过的计数档位**，
-    与 gateway 归因走同一个 `text_counter`——开销数字必须与 trace 里的
-    `part=tool_defs` 同源，不许两处各算一套。"""
-    from onyx.llm.measurement.fidelity import text_counter
-    from onyx.runtime import counter_ctx_factory
-    from onyx.store.repos import ToolRepo
-    from onyx.tools.registry import ToolRegistry
+    """构造注册表。装配本身在 `runtime.build_tool_registry`——CLI 与看板共用一个装配点，
+    否则"开销数字对不上 trace"这种分歧会永远查不完（DESIGN 原则 1 的延伸）。"""
+    from onyx.runtime import build_tool_registry
 
     settings = _settings()
     cfg = _config()
@@ -1543,16 +1539,7 @@ def _tool_registry(db: Path | None, model: str | None):
     provider_id = "ollama-local" if kind == DEFAULT_PROVIDER_KIND else f"{kind}-local"
     model = pick(model, cfg.provider.model)
     database = Database(_db_path(settings, db))
-    count_fn = None
-    if model:
-        ctx = counter_ctx_factory(database, provider_id)(model)
-        count_fn = text_counter(ctx)
-        count_fn.source_name = (  # type: ignore[attr-defined]
-            "gguf_vocab" if ctx.tokenizer is not None
-            else "fitted" if ctx.fitted_ratio and ctx.fitted_n >= FITTED_MIN_SAMPLES
-            else "heuristic"
-        )
-    return ToolRegistry(ToolRepo(database), count_fn=count_fn), database
+    return build_tool_registry(database, provider_id=provider_id, model=model), database
 
 
 @tools_app.command("import")
