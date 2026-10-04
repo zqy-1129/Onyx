@@ -20,6 +20,8 @@ from onyx import __version__
 from onyx.api.deps import AppState
 from onyx.core.errors import (
     CapabilityMissing,
+    EvalError,
+    EvalQueueFull,
     OnyxError,
     ProviderRejected,
     ProviderUnreachable,
@@ -30,11 +32,15 @@ from onyx.runtime import Runtime, build_runtime
 log = logging.getLogger("onyx.api")
 
 #: OnyxError → HTTP 状态码。集中在一处，避免每个路由各写一套。
+#: 这里是**精确类型**查表（见 `_onyx_error`），新增错误族成员要一起登记，
+#: 否则它会静默落到 500，前端看到的是"服务出错"而不是"任务名写错了"。
 _ERROR_STATUS: dict[type[OnyxError], int] = {
     ProviderUnreachable: 503,
     RequestTimeout: 504,
     ProviderRejected: 502,
     CapabilityMissing: 422,
+    EvalError: 422,
+    EvalQueueFull: 429,
 }
 
 
@@ -65,7 +71,15 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> Any:
+        # 上次进程退出/崩溃留下的 running 行：不标出来，看板会一直显示"这条还在跑"，
+        # 而实际上已经没有任何线程在为它工作
+        orphans = state.eval_service.reclaim_orphans()
+        if orphans:
+            log.warning("服务启动时发现 %d 条没跑完的评测，已标为 error：%s",
+                        len(orphans), ", ".join(orphans[:5]))
         yield
+        # 先停 worker 再关库：反过来会让正在写 grade 的线程对着一个已关闭的连接报错
+        state.eval_service.shutdown()
         if owns_runtime:
             resolved.close()
 

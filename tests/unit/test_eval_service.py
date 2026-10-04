@@ -133,6 +133,8 @@ def test_progress_snapshot_advances_case_by_case(env):
         assert snap is not None, "刚提交的任务在快照里消失了"
         if snap.state not in LIVE:
             break
+        # 没在等锁就不许报持有者：把"自己的评测正在跑"显示成"有人在抢 GPU"是谎报竞争
+        assert snap.holder == "", f"没人占 GPU 却报出持有者：{snap.holder}"
         if not seen or snap.done != seen[-1]:
             seen.append(snap.done)
         time.sleep(0.005)

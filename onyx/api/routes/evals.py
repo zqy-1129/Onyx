@@ -1,14 +1,16 @@
-"""评测 API：数据集、运行、分数下钻、矩阵/配对对比与 GPU 锁状态。
+"""评测 API：数据集、运行、分数下钻、矩阵/配对对比、GPU 锁状态，以及发起评测。
 
-只做只读查询 —— 发起评测是 CLI / 后台任务的事。
-在 API 里跑一次 236 条的评测会把请求线程占住几分钟，
-而 HTTP 超时会让调用方以为失败了，实际 GPU 还在跑。
+发起评测走的是服务进程内的那条单飞队列（`onyx.eval.service`），不在请求线程里跑：
+一次 236 条的评测会把请求线程占住几分钟，而 HTTP 超时会让调用方以为失败了，
+实际 GPU 还在跑。POST 只入队并立刻返回 run_id，进度靠 `…/progress` 读。
 
-两个刻意的形状：
+三个刻意的形状：
 - `grade` 里带 `trace_id` 而不是只带分数。"每个分数都能点进一条真实 trace"
   是整个系统的立足点（DESIGN §15），API 不暴露它，前端就做不出下钻。
 - 矩阵与对比在这里返回**派生后的结论 + 警告**，而不是让前端自己算差值：
   配对 CI 只在 Python 侧算一次，界面、CLI 与导出报告才不会互相打脸。
+- 进度必须说明**出处**（`source`）：界面发起的运行有逐条进度和取消开关，
+  CLI 发起的运行只有库里的检查点。把后者显示成"可以取消"是撒谎。
 """
 
 from __future__ import annotations
@@ -19,11 +21,17 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from onyx.api.deps import AppState, get_state
+from onyx.core.clock import utc_now_iso
 from onyx.eval.compare import CompareError, compare_runs
+from onyx.eval.service import JobView, SubmitRequest
+from onyx.eval.tasks import build_task, builtin_dataset_names, specs
 from onyx.report.eval_report import build_matrix
 from onyx.store.repos import EvalRepo
 
 router = APIRouter(prefix="/api", tags=["evals"])
+
+#: 内存快照里"还没结束"的两个状态；其余都是终态
+LIVE_STATES = ("queued", "running")
 
 
 class DatasetView(BaseModel):
@@ -36,6 +44,89 @@ class DatasetView(BaseModel):
     splits: dict[str, int] = {}
     imported_at: str = ""
     notes: str = ""
+    #: 界面能不能直接选它跑评测。库里登记的导入数据集目前还没有"读回"载入器，
+    #: 选它只会在 worker 里变成一条 error，所以这里就标成不可选
+    selectable: bool = False
+
+
+class TaskView(BaseModel):
+    id: str
+    name: str
+    requires: list[str] = []
+    metrics: list[str] = []
+    labels: list[str] = []
+    default_dataset: str = ""
+    dataset_revision: str = ""
+    n_cases: int | None = None
+    splits: dict[str, int] = {}
+    max_tokens: int | None = None
+    temperature: float | None = None
+    #: 任务构造失败的原因。列不出来的任务比列得少更坏：那看起来像"没有任务"
+    error: str = ""
+
+
+class RunRequest(BaseModel):
+    """与 `onyx eval run` 的 flag 一一对应；范围校验在 service 里做，不在这里重复一套。"""
+
+    task: str
+    model: str
+    k: int = 1
+    limit: int | None = None
+    split: str = "default"
+    seed: int | None = None
+    dataset: str | None = None
+    max_tokens: int | None = None
+    max_wall_ms: float | None = None
+    #: 拿不到 GPU 锁时最多等多久。0 = 不排队直接失败（对应 CLI 的 --no-queue）
+    lock_timeout: float | None = None
+    unload_others: bool = False
+    notes: str = ""
+
+
+class SubmitView(BaseModel):
+    run_id: str
+    state: str
+    position: int
+    task: str
+    model: str
+
+
+class ProgressView(BaseModel):
+    run_id: str
+    #: service = 本进程发起的运行；db = 只有库里的记录（CLI 发起，或已被裁剪）
+    source: str
+    state: str
+    task: str = ""
+    model: str = ""
+    done: int = 0
+    total: int = 0
+    case_id: str = ""
+    verdict: str = ""
+    position: int = 0
+    holder: str = ""
+    eta_s: float | None = None
+    waited_s: float = 0.0
+    error: str = ""
+    reason: str = ""
+    queued_at: str = ""
+    started_at: str = ""
+    finished_at: str | None = None
+    #: 能不能真的取消：只有本进程发起的运行可以
+    cancellable: bool = False
+    n_error: int = 0
+    dataset_id: str | None = None
+
+
+class QueueView(BaseModel):
+    max_pending: int
+    jobs: list[ProgressView]
+
+
+class CancelView(BaseModel):
+    run_id: str
+    state: str
+    cancelled: bool
+    message: str
 
 
 class RunView(BaseModel):
@@ -89,6 +180,7 @@ def _dataset_view(record: Any) -> DatasetView:
         id=record.id, n_cases=record.n_cases, upstream=record.upstream,
         revision=record.revision, license=record.license, loader=record.loader,
         splits=record.splits, imported_at=record.imported_at, notes=record.notes,
+        selectable=record.id in set(builtin_dataset_names()),
     )
 
 
@@ -114,6 +206,63 @@ def _grade_view(record: Any) -> GradeView:
         invalid_format=record.invalid_format, out_of_set=record.out_of_set,
         trace_id=record.trace_id, error=record.error, metrics=record.metrics,
     )
+
+
+def _progress_view(job: JobView | None, row: Any, state: AppState) -> ProgressView:
+    """把"内存里的任务状态"与"库里的 run 记录"合成一个视图。
+
+    内存优先于库，但只在任务还活着的时候优先：终态一律以库为准，
+    因为 runner 收尾写的 n_done/n_cases 才是这次运行的最终事实。
+    """
+    info = state.gpu_lock.peek()
+    eta = info.eta_s(utc_now_iso()) if info is not None else None
+    base = ProgressView(
+        run_id=row.id if row is not None else (job.run_id if job else ""),
+        source="db", state=str(row.status) if row is not None else "unknown",
+        task=row.task_id if row is not None else "",
+        model=row.model_id if row is not None else "",
+        done=int(row.n_done) if row is not None else 0,
+        total=int(row.n_cases) if row is not None else 0,
+        started_at=row.started_at if row is not None else "",
+        finished_at=row.finished_at if row is not None else None,
+        n_error=int(row.n_error) if row is not None else 0,
+        dataset_id=row.dataset_id if row is not None else None,
+        holder=info.owner if info is not None else "", eta_s=eta,
+    )
+    if job is None:
+        return base
+    if job.state in LIVE_STATES:
+        return ProgressView(**{
+            **base.model_dump(), "source": "service", "state": job.state,
+            "task": job.task, "model": job.model, "cancellable": True,
+            "done": job.done, "case_id": job.case_id, "verdict": job.verdict,
+            "position": job.position, "waited_s": job.waited_s,
+            "queued_at": job.queued_at,
+            # holder 只在"真的在等锁"时才有意义。持有者就是自己时说"GPU 正被 api-eval:… 占用"，
+            # 界面会读成"有人在跟我抢 GPU"，而事实是我的评测正在正常跑
+            "holder": job.holder,
+            "eta_s": base.eta_s if job.holder else None,
+            # job.total 在第一条样本之前是 0，而 run 行一写出来就有 n_cases：
+            # 已经开跑的任务要用库里那个更可信的总数，否则进度条显示 0/0
+            "total": job.total or base.total,
+            "started_at": job.started_at or base.started_at,
+        })
+    # 已结束：状态与进度以库为准，但只有服务侧才知道的失败原因在内存里。
+    # 没有 run 行时（排队中就被取消）库里根本没有这件事的痕迹，只能报内存状态
+    return ProgressView(**{
+        **base.model_dump(), "source": "service", "cancellable": False,
+        "state": base.state if row is not None else job.state,
+        "task": job.task, "model": job.model,
+        "error": job.error, "reason": job.reason, "position": 0,
+        "queued_at": job.queued_at, "holder": "", "eta_s": None,
+        "started_at": job.started_at or base.started_at,
+        "finished_at": base.finished_at or job.finished_at,
+    })
+
+
+def _job_view(job: JobView, state: AppState) -> ProgressView:
+    row = EvalRepo(state.runtime.db).get_run(job.run_id)
+    return _progress_view(job, row, state)
 
 
 @router.get("/datasets", response_model=list[DatasetView])
@@ -164,8 +313,6 @@ def gpu_status(state: AppState = Depends(get_state)) -> GpuStatusView:
     只读锁文件，不参与竞争。看板用它把"排队中"显示成有 ETA 的状态，
     否则用户只会看到界面卡住，然后去 kill 进程。
     """
-    from onyx.core.clock import utc_now_iso
-
     lock = state.gpu_lock
     info = lock.peek()
     if info is None:
@@ -220,3 +367,121 @@ def compare(
     if not with_cases:
         payload["cases"] = []
     return payload
+
+
+# ── 发起评测（S23）─────────────────────────────────────────────────
+@router.get("/tasks", response_model=list[TaskView])
+def list_tasks() -> list[TaskView]:
+    """可跑的评测任务，以及它们默认用哪份数据、产出哪些指标。
+
+    选项从 `specs()` 现读而不是在前端硬编码：硬编码的清单会在新装一个任务插件时
+    变成"界面看不到、CLI 却能跑"的那种裂缝。
+    """
+    out: list[TaskView] = []
+    for task_id in sorted(specs()):
+        try:
+            task = build_task(task_id, model="")
+        except (KeyError, ValueError, TypeError) as exc:
+            # 一个坏任务不该把整个列表打空：那会让人以为"一个任务都没有"
+            out.append(TaskView(id=task_id, name=task_id, error=f"{type(exc).__name__}: {exc}"[:200]))
+            continue
+        dataset = getattr(task, "dataset", None)
+        out.append(TaskView(
+            id=task_id, name=getattr(task, "name", task_id),
+            requires=sorted(str(cap) for cap in getattr(task, "requires", ()) or ()),
+            metrics=list(getattr(task, "metric_names", ()) or ()),
+            labels=[str(label) for label in getattr(task, "labels", ()) or ()],
+            default_dataset=dataset.id if dataset is not None else "",
+            dataset_revision=dataset.revision if dataset is not None else "",
+            n_cases=len(dataset) if dataset is not None else None,
+            splits=dataset.splits() if dataset is not None else {},
+            max_tokens=getattr(task, "max_tokens", None),
+            temperature=getattr(task, "temperature", None),
+        ))
+    return out
+
+
+@router.post("/runs", response_model=SubmitView, status_code=202)
+def submit_run(body: RunRequest, state: AppState = Depends(get_state)) -> SubmitView:
+    """发起一次评测：**入队并立刻返回 run_id**，不等结果。
+
+    与 `onyx eval run` 共用同一个 runner、同一把 GPU 锁、同一份任务注册表，
+    所以界面发起与命令行发起的差异只有"谁点的按钮"这一件事（记在 run 的 config.trigger 里）。
+    校验失败返回 422 并列出可选项；队列已满返回 429。
+    只读看板（`--read-only`）上这个端点返回 403。
+    """
+    view = state.eval_service.submit(SubmitRequest(
+        task=body.task, model=body.model, k=body.k, limit=body.limit, split=body.split,
+        seed=body.seed, dataset=body.dataset, max_tokens=body.max_tokens,
+        max_wall_ms=body.max_wall_ms, lock_timeout=body.lock_timeout,
+        unload_others=body.unload_others, notes=body.notes,
+    ))
+    return SubmitView(
+        run_id=view.run_id, state=view.state, position=view.position,
+        task=view.task, model=view.model,
+    )
+
+
+@router.get("/queue", response_model=QueueView)
+def queue(state: AppState = Depends(get_state)) -> QueueView:
+    """本进程的任务队列：谁在跑、谁在等、前面还有几个。
+
+    只反映这个服务发起的任务；CLI 的任务通过 `/api/gpu` 的持有者看到。
+    """
+    return QueueView(
+        max_pending=state.eval_service.max_pending,
+        jobs=[_job_view(job, state) for job in state.eval_service.jobs()],
+    )
+
+
+@router.get("/runs/{run_id}/progress", response_model=ProgressView)
+def run_progress(run_id: str, state: AppState = Depends(get_state)) -> ProgressView:
+    """一条运行的进度。内存快照优先，其次库里的 run 记录。
+
+    `source` 必须读出来：界面发起的运行有逐条进度和取消开关，
+    CLI 发起的运行只有 runner 每 10 条落一次库的检查点。
+    把后者显示成"可以取消"是撒谎。
+    """
+    job = state.eval_service.snapshot(run_id)
+    row = EvalRepo(state.runtime.db).get_run(run_id)
+    if job is None and row is None:
+        raise HTTPException(status_code=404, detail=f"找不到 run {run_id!r}")
+    return _progress_view(job, row, state)
+
+
+@router.post("/runs/{run_id}/cancel", response_model=CancelView)
+def cancel_run(run_id: str, state: AppState = Depends(get_state)) -> CancelView:
+    """请求取消一条运行。`cancelled=true` 表示**取消已登记**，终态要接着读 progress。
+
+    取消不打断进行中的那条请求：半截请求的 trace 比没有 trace 更难解释，
+    所以运行会在两条样本之间停下。
+    """
+    job = state.eval_service.cancel(run_id)
+    if job is not None:
+        if job.state in LIVE_STATES:
+            return CancelView(
+                run_id=run_id, state=job.state, cancelled=True,
+                message="取消已登记，会在下一条样本前停下"
+                + ("（还在等 GPU 锁，会立刻退出排队）" if job.holder else ""),
+            )
+        return CancelView(
+            run_id=run_id, state=job.state, cancelled=job.state == "cancelled",
+            message=f"这条运行已经是终态（{job.state}），取消是幂等的：什么都没改",
+        )
+
+    row = EvalRepo(state.runtime.db).get_run(run_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"找不到 run {run_id!r}")
+    if row.status != "running":
+        return CancelView(
+            run_id=run_id, state=str(row.status), cancelled=False,
+            message=f"这条运行已经是终态（{row.status}），不需要取消",
+        )
+    # 库里有 running 行而这个进程没有对应任务 ⇒ 它是别的进程（CLI）在跑。
+    # 我们既没有它的取消开关，也不该去动它的锁：说"取消不了"比假装取消成功诚实
+    holder = state.gpu_lock.peek()
+    raise HTTPException(
+        status_code=409,
+        detail=f"这条 run 由 {holder.owner if holder else '另一个进程'} 在跑，不是本服务发起的，"
+               "取消要回到那个进程（Ctrl-C）",
+    )

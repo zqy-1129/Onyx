@@ -9,6 +9,7 @@ from fastapi import Request
 
 from onyx.api.sse import SseBroker
 from onyx.eval.gpu_lock import GpuLock, default_lock_path
+from onyx.eval.service import EvalService
 from onyx.runtime import Runtime
 from onyx.store.repos import ModelRepo, TraceRepo, UsageRepo
 
@@ -24,6 +25,9 @@ class AppState:
     #: 必须是**跨进程**的文件锁：评测跑在 `onyx eval` 这个进程里，看板跑在
     #: `onyx serve` 里，用 threading.Lock 的话两边各自锁各自的，什么都没防住。
     gpu_lock: GpuLock
+    #: 界面发起的评测走这条进程内单飞队列（S23）。它用的是**同一把锁的路径**，
+    #: 所以"看板发起的评测"与"CLI 发起的评测"照样互斥——只是本进程内再多排一层队。
+    eval_service: EvalService
 
     @classmethod
     def of(
@@ -33,6 +37,13 @@ class AppState:
     ) -> AppState:
         from onyx.eval.gpu_lock import DEFAULT_GPU_STALE_AFTER_S
 
+        lock = GpuLock(
+            gpu_lock_path or default_lock_path(),
+            owner=f"serve:{runtime.provider.id}",
+            stale_after_s=(
+                DEFAULT_GPU_STALE_AFTER_S if gpu_stale_after_s is None else gpu_stale_after_s
+            ),
+        )
         return cls(
             runtime=runtime,
             broker=broker or SseBroker(),
@@ -42,12 +53,10 @@ class AppState:
             # 默认机器级路径；只有测试与"确实要换一台 GPU"的部署才覆盖它。
             # 阈值由调用方注入（配置文件 [gpu].stale_after_s）而不是在这里读全局配置：
             # 装配层决定"用哪把锁、多快算死"，这里只负责照做。
-            gpu_lock=GpuLock(
-                gpu_lock_path or default_lock_path(),
-                owner=f"serve:{runtime.provider.id}",
-                stale_after_s=(
-                    DEFAULT_GPU_STALE_AFTER_S if gpu_stale_after_s is None else gpu_stale_after_s
-                ),
+            gpu_lock=lock,
+            eval_service=EvalService(
+                runtime.gateway, runtime.db,
+                gpu_lock_path=lock.path, gpu_stale_after_s=lock.stale_after_s,
             ),
         )
 
