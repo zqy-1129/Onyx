@@ -1,0 +1,18 @@
+[project]
+name = "onyx-example-task"
+version = "0.1.0"
+description = "Onyx 扩展点样板：外部评测任务插件（onyx.tasks）"
+requires-python = ">=3.12"
+# 不声明 onyx 依赖：装插件时不该去索引里找一个同名第三方包。
+# 插件在 onyx 的环境里运行，import 得到就够了。
+dependencies = []
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["example_task"]
+
+[project.entry-points."onyx.tasks"]
+example_char_count = "example_task.task:spec"

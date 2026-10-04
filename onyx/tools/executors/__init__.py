@@ -1,8 +1,12 @@
 """L4 执行器。每个执行器只负责"怎么调"，
 参数校验/沙箱/超时/错误归一全部由 `executor.guarded_call` 统一处理。
 
-`executor_for` 是唯一的分发点：新增一种执行器只需要在这里登记，
-调用方（CLI、评测、循环）不用改。
+`executor_for` 是唯一的分发点：新增一种执行器只需要登记（内置改这里，
+外部插件走 entry points `onyx.tool_executors`），调用方（CLI、评测、循环）不用改。
+
+插件形状：` Callable[[ToolDef], ToolExecutor]`（通常是执行器类本身）。
+配置从 `ToolDef` 里带（`impl_ref` / `extra`），不靠注册时的全局参数——
+否则"同一个工具在不同 case 里打到不同后端"就没有可追溯的解释了。
 """
 
 from __future__ import annotations
@@ -11,6 +15,7 @@ import importlib
 from typing import Any
 
 from onyx.core.errors import ToolUnknown
+from onyx.discovery import GROUP_TOOL_EXECUTORS, discover
 from onyx.tools.executor import ToolExecutor
 from onyx.tools.spec import ToolDef, ToolKind
 
@@ -22,6 +27,7 @@ __all__ = [
     "MockReplayExecutor",
     "PythonFnExecutor",
     "executor_for",
+    "executor_kinds",
 ]
 
 #: 已实现的执行器种类 → 构造器。
@@ -41,7 +47,17 @@ _PENDING: dict[str, str] = {
     str(ToolKind.OLLAMA_BUILTIN): "S16（引擎内建工具，需先跑 P21 探针）",
 }
 
+#: 内建种类（不含插件）——契约测试与审计用它，值是稳定的
 EXECUTOR_KINDS: tuple[str, ...] = tuple(sorted({*_BUILDERS, *_LAZY}))
+
+
+def _plugin_builders() -> dict[str, Any]:
+    return discover(GROUP_TOOL_EXECUTORS, {})
+
+
+def executor_kinds() -> tuple[str, ...]:
+    """内建 + 插件注册的执行器种类。"""
+    return tuple(sorted({*EXECUTOR_KINDS, *_plugin_builders()}))
 
 
 def executor_for(
@@ -60,9 +76,14 @@ def executor_for(
     """
     wanted = kind or str(definition.kind)
     if wanted == str(ToolKind.FIXTURE):
-        # mock 通道优先于一切：评测期定义照旧发给模型，执行换成桩。
+        # mock 通道优先于一切，也优先于插件：评测的零副作用保证不能被外部实现劫走。
         # 注意 http 定义被强制成 fixture 后就**不会**发请求，transport 也就不再有意义。
         return MockReplayExecutor(definition, responses, default=default)
+    # 其余种类：插件优先（同名覆盖是 DESIGN §13 留的"就地替换实现"口子，
+    # 覆盖关系由 `onyx plugins` 显式列出，不悄悄发生）。
+    plugin = _plugin_builders().get(wanted)
+    if plugin is not None:
+        return plugin(definition)
     if wanted in _LAZY:
         module_name, _, attr = _LAZY[wanted].partition(":")
         lazy_builder: Any = getattr(importlib.import_module(module_name), attr)
@@ -73,6 +94,6 @@ def executor_for(
         raise ToolUnknown(
             f"执行器 {wanted!r} 尚未实现" + (f"，计划在 {pending}" if pending else ""),
             detail={"kind": wanted, "tool": definition.name,
-                    "available": list(EXECUTOR_KINDS), "planned": pending or ""},
+                    "available": list(executor_kinds()), "planned": pending or ""},
         )
     return builder(definition)

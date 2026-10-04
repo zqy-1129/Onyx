@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 from pathlib import Path
 
@@ -282,6 +283,32 @@ def test_takeover_is_exclusive_even_when_both_see_a_stale_lock(lock_path):
     wins = [a._try_write(a.peek()), b._try_write(b.peek())]
     assert sum(wins) == 1, f"两个接管者都以为自己拿到了锁: {wins}"
     assert read_lock(lock_path).owner == ("a" if wins[0] else "b")
+
+
+def test_transient_rename_denial_still_allows_takeover(lock_path, monkeypatch):
+    """Windows 上 `rename` 会因"文件正被别的句柄打开"短暂 EACCES（杀软/索引器）。
+
+    一次失败就放弃 = **没人能接管死锁**，于是评测无限排队等一个已经死掉的持有者。
+    这比误抢一次更糟，所以接管必须重试，而"实在不行就覆盖"依然不许（那会打破互斥）。
+    """
+    dead = _lock(lock_path, "dead", stale_after_s=0.02)
+    dead.acquire()
+    dead.heartbeat(1, 10)
+    time.sleep(0.08)
+
+    real_rename = os.rename
+    attempts = {"n": 0}
+
+    def flaky(src, dst):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise PermissionError(13, "另一个程序正在使用此文件")
+        return real_rename(src, dst)
+
+    monkeypatch.setattr(os, "rename", flaky)
+    info = _lock(lock_path, "taker", stale_after_s=0.02).acquire(timeout=1.0)
+    assert info.owner == "taker"
+    assert attempts["n"] >= 2, "第一次被拒后必须重试，而不是直接排队等一个死者"
 
 
 def test_a_live_holder_that_heartbeats_cannot_be_displaced(lock_path):

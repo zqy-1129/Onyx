@@ -47,6 +47,9 @@ def default_lock_path() -> Path:
 #: 调小它会误伤活着的持有者，让两个评测同时占 GPU——那正是这把锁要防的事。
 DEFAULT_STALE_AFTER_S = 180.0
 DEFAULT_POLL_S = 0.5
+#: 接管死锁时搬走旧锁文件的重试次数。Windows 的 rename 会被"文件正被别的句柄打开"
+#: 短暂拒绝（杀软/索引器），一次就放弃等于没人能接管死锁。
+CLAIM_RETRIES = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,11 +227,19 @@ class GpuLock:
 
         token = f"{os.getpid()}.{self.clock.monotonic_ns()}"
         moved = self.path.with_name(f"{self.path.name}.stolen.{token}")
-        try:
-            os.rename(self.path, moved)
-        except OSError:
-            # 别人先搬走了，或文件刚好消失 ⇒ 回去重新排队
-            return False
+        # Windows 上 `rename` 会因为别的句柄正打开这个文件而短暂 EACCES（杀软/索引器
+        # 很常见）。把它当成"别人先搬走了"就放弃，后果是**没人能接管一把死锁**——
+        # 评测会无限排队等一个已经死掉的持有者，这是锁最坏的失效方式。
+        for attempt in range(CLAIM_RETRIES):
+            try:
+                os.rename(self.path, moved)
+                break
+            except FileNotFoundError:
+                return False  # 别人先搬走了，或文件刚好消失 ⇒ 回去重新排队
+            except OSError:
+                if attempt == CLAIM_RETRIES - 1:
+                    return False  # 始终搬不动就排队，绝不"实在不行就覆盖"
+                time.sleep(0.005 * (attempt + 1))
         try:
             stale = read_lock(moved)
             if stale is not None and not self._is_stale(stale):

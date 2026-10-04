@@ -6,6 +6,7 @@ CLI、REST API、评测 runner 都从这里拿实例——**只允许有一个�
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -20,7 +21,13 @@ from onyx.settings import Settings, load_settings
 from onyx.store.db import Database
 from onyx.store.records import ProviderRecord
 from onyx.store.repos import ModelRepo
-from onyx.store.sinks import EventFanout, JsonlEventSink, RecordSink, SqliteRecordSink
+from onyx.store.sinks import (
+    EventFanout,
+    JsonlEventSink,
+    RecordSink,
+    SqliteRecordSink,
+    build_event_sink,
+)
 
 
 @dataclass
@@ -100,6 +107,7 @@ def build_runtime(
     sample_gpu: bool = False,
     event_log: bool = True,
     provider_kwargs: dict[str, Any] | None = None,
+    event_sinks: Sequence[str] = (),
 ) -> Runtime:
     resolved = settings or load_settings()
     resolved.ensure_dirs()
@@ -111,6 +119,11 @@ def build_runtime(
     events = EventFanout()
     if event_log:
         events.add(JsonlEventSink(resolved.data_dir / "events.ndjson"))
+    # 具名 sink 走 `onyx.sinks` 注册表：加一个导出后端只需要装一个包，
+    # 不需要在这里多一个 if，也不需要给内核 CLI 加一组 flag。
+    # 构造失败**必须冒出来**：--sink otlp 静默不导出，比直接报错危险得多。
+    for name in event_sinks:
+        events.add(build_event_sink(name, data_dir=resolved.data_dir))
 
     provider = build_provider(
         provider_kind, id=provider_id, base_url=base_url, **(provider_kwargs or {})

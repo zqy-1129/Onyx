@@ -596,17 +596,34 @@ CONTRACT_VERSION = 1
 
 ## 13. 扩展点（六个注册表，全部走 entry points）
 
-| group | 契约 | 加一个实现即可支持 |
-|---|---|---|
-| `onyx.providers` | `LlmProvider` | vLLM / llama.cpp server / LM Studio / 云端基线 |
-| `onyx.tasks` | `EvalTask` | 新评测（RAG 忠实度、代码生成、多语言） |
-| `onyx.graders` | `Grader` | 新判据（自定义 rubric、执行式判分） |
-| `onyx.sinks` | `Sink` | Langfuse / OTLP / Kafka / 只读导出 |
-| `onyx.tool_executors` | `ToolExecutor` | MCP、HTTP、DB、内置工具 |
-| `onyx.observers` | `EventVisitor` | 新异常规则、成本模型、告警 |
+| group | 契约 | 加一个实现即可支持 | 接线 |
+|---|---|---|---|
+| `onyx.providers` | `LlmProvider` | vLLM / llama.cpp server / LM Studio / 云端基线 | ✅ |
+| `onyx.tasks` | `EvalTask`（或 `TaskSpec`） | 新评测（RAG 忠实度、代码生成、多语言） | ✅ |
+| `onyx.graders` | `Grader` | 新判据（自定义 rubric、执行式判分） | ⏸ 未接线 |
+| `onyx.sinks` | `EventSink` builder `(**opts) -> sink` | Langfuse / OTLP / Kafka / 只读导出 | ✅ |
+| `onyx.tool_executors` | `(ToolDef) -> ToolExecutor` | MCP、HTTP、DB、内置工具 | ✅ |
+| `onyx.observers` | `EventVisitor` | 新异常规则、成本模型、告警 | ✅ |
 
 - 注册方式：`[project.entry-points."onyx.tasks"] intent_zh = "plugins.intent:Task"`；内核用 `importlib.metadata` 发现，**不扫描目录、不写死 if/else**。
-- `plugins/` 提供两个样板实现，兼作扩展点的活体测试：内核若不能容纳一个外部实现，说明抽象错了。
+- 六个 group 共用一套语义（`onyx/discovery.py`）：坏插件跳过但记进台账、**同名覆盖**（插件覆盖内置）且覆盖关系可查、
+  诊断命令（`onyx plugins` / `onyx eval tasks` / `onyx doctor`）必须把失败打印出来并以非 0 退出。
+  只隔离不报告 = 把"插件没生效"伪装成"插件正常工作"。
+- **`onyx.graders` 尚未接线**，且不是遗漏：判据 today 全部由任务直接调用（`exact`/`set_match`/…），
+  没有"按名字分发判据"的消费点。在没有消费点之前先建一个注册表就是死代码，
+  它会等 `structured_extraction` 这类"由 YAML 指定判据"的任务出现时一并实现。
+- **契约里的关键字参数就是契约**：`gateway` 按 `generate(req, trace_id=..., on_event=...)` 调用，
+  所以这三者必须都出现在 `LlmProvider` 协议上（曾遗漏 `trace_id`，导致照协议实现的外部 provider 必崩 TypeError）。
+  `tests/contract/test_provider_contract.py` 用签名断言钉住，并对**外部插件实现**跑同一套断言——
+  内置实现与内核一起过拟合是察觉不到的。
+- **执行器种类允许外部值**：`ToolKind` 是内建集合（枚举不能长出新成员），
+  `ToolDef.kind` 因此接受 `ToolKind | str`，外部种类限制成小写 slug；
+  导入边界仍拒绝未注册的种类（拼写错误必须当场炸，而不是躺进库里等某次调用）。
+- `ProviderInfo.kind` 是 closed enum（在 `core/types`）：外部引擎选最接近的一个，
+  真实身份放 `extra`。**看板与评测一律按能力位（`caps`）分支，不按 kind 字符串分支** ——
+  按名字/前缀猜能力会让外部实现一进来就被误判，且 skip 记录里的 `missing` 会变成假信息。
+- `plugins_example/`（仓库根，独立可安装的两个小包）就是上面这些契约的活体测试：
+  内核若不能容纳一个外部实现，`scripts/check_extension_boundary.py` 会直接把这次提交判失败。
 - 所有契约带版本与能力协商；配置外置 `onyx.yaml`（providers、keep_alive 策略、GPU 锁、数据集缓存、sandbox 白名单）。
 
 ---

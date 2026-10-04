@@ -16,9 +16,12 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from onyx.core.types import Cap, Generation, GenerationRequest, ToolSpec
+
+if TYPE_CHECKING:
+    from onyx.eval.datasets.loader import Dataset
 
 
 class Verdict(StrEnum):
@@ -172,36 +175,49 @@ def headline_of(aggregate: dict[str, Any]) -> tuple[str, Any] | None:
     return None
 
 
-class TaskRegistry:
-    """任务注册表。S16 会接 entry points，让第三方任务不改内核就能注册。"""
+@dataclass(frozen=True, slots=True)
+class TaskSpec:
+    """任务登记项：怎么构造它，以及默认数据集从哪来。
 
-    def __init__(self) -> None:
-        self._tasks: dict[str, Callable[[], EvalTask]] = {}
+    这是 `onyx.tasks` 扩展点的**交接形状**（DESIGN §13）：外部包既可以交一个
+    `TaskSpec`（自带数据集载入器），也可以只交一个 `EvalTask` 实现类
+    （此时 `dataset=None`，跑的时候必须显式 `--dataset`）。
 
-    def register(self, task_id: str | None = None) -> Callable[[Callable[[], Any]], Any]:
-        def decorator(factory: Callable[[], Any]) -> Callable[[], Any]:
-            key = task_id or getattr(factory, "id", None) or factory.__name__
-            self._tasks[key] = factory
-            return factory
+    没有默认数据集时**必须报错**而不是猜一个：静默退回某个内置数据集，
+    等于用另一份数据评测却报着同一个任务名，分数从此不可解释。
+    """
 
-        return decorator
+    factory: Callable[..., EvalTask]
+    dataset: Callable[[], Dataset] | None = None
 
-    def add(self, task_id: str, factory: Callable[[], EvalTask]) -> None:
-        self._tasks[task_id] = factory
-
-    def get(self, task_id: str) -> EvalTask | None:
-        factory = self._tasks.get(task_id)
-        return factory() if factory else None
-
-    def names(self) -> tuple[str, ...]:
-        return tuple(sorted(self._tasks))
-
-    def __contains__(self, task_id: object) -> bool:
-        return task_id in self._tasks
-
-    def __len__(self) -> int:
-        return len(self._tasks)
+    def default_dataset(self, task_id: str) -> Dataset:
+        if self.dataset is None:
+            raise KeyError(
+                f"任务 {task_id!r} 没有默认数据集；请用 --dataset file:<路径> 指定，"
+                "或先 onyx eval import 导入再按 id 引用"
+            )
+        return self.dataset()
 
 
-#: 全局注册表。内置任务在 `onyx/eval/tasks/__init__.py` 里登记
-REGISTRY = TaskRegistry()
+def coerce_task_spec(name: str, obj: Any) -> TaskSpec:
+    """把 entry point 加载到的对象规约成 `TaskSpec`。
+
+    只接受两种形状：`TaskSpec`，或直接实现 EvalTask 协议的类。其它形状必须被拒
+    并说清期望是什么——插件作者最需要的是"我交的东西为什么不算任务"，
+    而不是一个消失在日志里的 warning。
+    """
+    if isinstance(obj, TaskSpec):
+        return obj
+    if isinstance(obj, type):
+        missing = [attr for attr in ("load", "build", "grade", "aggregate")
+                   if not hasattr(obj, attr)]
+        if missing:
+            raise TypeError(
+                f"onyx.tasks 插件 {name!r} 不是 EvalTask：缺少 {', '.join(missing)}()。"
+                "请交一个实现 EvalTask 协议的类，或 TaskSpec(factory=..., dataset=...)"
+            )
+        return TaskSpec(obj)
+    raise TypeError(
+        f"onyx.tasks 插件 {name!r} 加载得到 {type(obj).__name__}，"
+        "期望 EvalTask 实现类或 TaskSpec 实例"
+    )

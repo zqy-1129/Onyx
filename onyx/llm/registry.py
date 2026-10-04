@@ -3,21 +3,18 @@
 内置实现静态注册，外部插件通过 entry point 注册：
     [project.entry-points."onyx.providers"]
     my_engine = "my_pkg.provider:MyProvider"
-发现失败（插件坏了）只记警告并跳过——一个坏插件不该让整个看板起不来。
+发现语义（坏插件隔离、失败可见、同名覆盖）由 `onyx.discovery` 统一实现，
+六个扩展点共用同一套，不会出现"provider 组容忍坏插件、task 组不容忍"这种分裂。
 """
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Callable
-from importlib.metadata import EntryPoints, entry_points
 from typing import Any
 
+from onyx.discovery import GROUP_PROVIDERS
+from onyx.discovery import discover as discover_entries
 from onyx.llm.providers.base import LlmProvider
-
-log = logging.getLogger("onyx.llm.registry")
-
-ENTRY_POINT_GROUP = "onyx.providers"
 
 
 def _builtin_ollama(**kwargs: Any) -> LlmProvider:
@@ -38,23 +35,9 @@ BUILTIN: dict[str, Callable[..., LlmProvider]] = {
 }
 
 
-def _plugin_entries() -> EntryPoints:
-    try:
-        return entry_points(group=ENTRY_POINT_GROUP)
-    except Exception as exc:  # noqa: BLE001 - 老版本 importlib.metadata 签名不同，退化即可
-        log.warning("entry point 发现失败: %s", exc)
-        return []  # type: ignore[return-value]
-
-
 def discover() -> dict[str, Callable[..., LlmProvider]]:
     """内置 + 插件。同名时插件覆盖内置（便于就地替换实现做实验）。"""
-    found: dict[str, Callable[..., LlmProvider]] = dict(BUILTIN)
-    for entry in _plugin_entries():
-        try:
-            found[entry.name] = entry.load()
-        except Exception as exc:  # noqa: BLE001 - 坏插件隔离
-            log.warning("插件 provider %s 加载失败: %s", entry.name, exc)
-    return found
+    return discover_entries(GROUP_PROVIDERS, BUILTIN)
 
 
 def available_kinds() -> list[str]:

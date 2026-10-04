@@ -2,6 +2,6 @@
 
 from __future__ import annotations
 
-from .base import AdminProvider, EventCB, LlmProvider, StreamingProvider, emit
+from .base import AdminProvider, EventCB, LlmProvider, emit, unsupported_detail
 
-__all__ = ["AdminProvider", "EventCB", "LlmProvider", "StreamingProvider", "emit"]
+__all__ = ["AdminProvider", "EventCB", "LlmProvider", "emit", "unsupported_detail"]

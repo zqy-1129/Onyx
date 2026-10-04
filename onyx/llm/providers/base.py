@@ -7,7 +7,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
 from typing import Any, Protocol, runtime_checkable
 
 from onyx.core.event import TraceEvent
@@ -35,16 +35,15 @@ class LlmProvider(Protocol):
     def show_model(self, name: str) -> ModelDetail: ...
     def running(self) -> list[LoadedModel]: ...
     def generate(
-        self, req: GenerationRequest, *, on_event: EventCB | None = None
+        self,
+        req: GenerationRequest,
+        *,
+        trace_id: str = "",
+        on_event: EventCB | None = None,
     ) -> Generation: ...
-
-
-class StreamingProvider(Protocol):
-    """可选能力：支持增量流。不支持时 gateway 退化为一次性返回。"""
-
-    def generate_stream(
-        self, req: GenerationRequest, *, on_event: EventCB | None = None
-    ) -> Iterator[TraceEvent]: ...
+    # `trace_id` 必须在协议里：gateway 一律用关键字传它（事件要挂到正确的那条 trace）。
+    # 协议里没写、实现里却有 = 照着协议写的外部 provider 一定崩在 TypeError 上。
+    # `tests/contract/test_provider_contract.py` 用签名断言把这条钉住。
 
 
 class AdminProvider(Protocol):

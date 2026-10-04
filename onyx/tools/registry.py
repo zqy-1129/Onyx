@@ -22,6 +22,7 @@ from onyx.tools.spec import (
     ToolDef,
     ToolKind,
     audit_many,
+    coerce_kind,
     cost_report,
     openai_json,
 )
@@ -105,7 +106,7 @@ class ToolRegistry:
     def to_def(record: ToolDefRecord) -> ToolDef:
         return ToolDef(
             name=record.name, description=record.description, parameters=record.schema_json,
-            kind=ToolKind(record.kind), side_effect=SideEffect(record.side_effect),
+            kind=record.kind, side_effect=SideEffect(record.side_effect),
             impl_ref=record.impl_ref, version=record.version, tags=record.tags,
             owner=record.owner, enabled=record.enabled, timeout_ms=record.timeout_ms,
             doc=record.doc, examples=tuple(record.examples), extra=dict(record.extra),
@@ -137,6 +138,20 @@ def _bump(version: str) -> int:
         return 2
 
 
+def _known_kinds() -> set[str]:
+    """导入定义时允许的执行器种类。
+
+    = 全部内建值（含尚未实现的 `mcp` / `ollama_builtin`：**先定义后实现**是允许的，
+    注册表得能收下未来的工具）+ 已安装插件注册的种类。
+    其它 slug 一律拒绝：`pythonn_fn` 这种拼写错误必须在导入时就炸，
+    而不是躺进库里等某次调用才发现。
+    """
+    # 局部导入：`tools.executors` 反过来不依赖注册表，但内核内部保持单向依赖更稳
+    from onyx.tools.executors import executor_kinds
+
+    return {str(kind) for kind in ToolKind} | set(executor_kinds())
+
+
 def defs_from_payload(payload: Any) -> list[ToolDef]:
     """从 YAML/JSON 载入的定义列表构造 ToolDef。
 
@@ -156,9 +171,16 @@ def defs_from_payload(payload: Any) -> list[ToolDef]:
         if not name:
             raise ValueError(f"第 {index} 项缺少 name")
         try:
-            kind = ToolKind(str(raw.get("kind") or "python_fn"))
+            # 内建种类归一成枚举；插件注册的种类（`onyx.tool_executors`）保留 slug。
+            kind: ToolKind | str = coerce_kind(str(raw.get("kind") or "python_fn"))
         except ValueError as exc:
-            raise ValueError(f"工具 {name} 的 kind 非法: {raw.get('kind')!r}") from exc
+            raise ValueError(f"工具 {name} 的 kind 非法: {raw.get('kind')!r}（{exc}）") from exc
+        if str(kind) not in _known_kinds():
+            raise ValueError(
+                f"工具 {name} 的 kind 非法: {raw.get('kind')!r}；"
+                f"允许 {sorted(_known_kinds())}"
+                "（外部执行器要先装提供该种类的包，再导入定义）"
+            )
         # 缺 side_effect 不能静默取默认值：记下"未标注"，让审计报 ERROR
         side_effect_untagged = "side_effect" not in raw
         try:

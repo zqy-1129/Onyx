@@ -76,6 +76,79 @@ def version() -> None:
     typer.echo(f"onyx {__version__} · python {platform.python_version()} · {sys.platform}")
 
 
+# ── plugins（扩展点体检，DESIGN §13）────────────────────────────────
+@app.command()
+def plugins() -> None:
+    """列出六个扩展点的实际装配结果：内建 / 已注册插件 / 覆盖 / 加载失败。
+
+    这个命令会**真的加载**每个插件——诊断的意义就在于让"装了但没生效"现形。
+    有插件加载失败时退出码 1：装了坏插件的环境不该被判定为正常。
+    """
+    from rich.console import Console
+    from rich.table import Table
+
+    from onyx.discovery import (
+        GROUP_GRADERS,
+        GROUP_OBSERVERS,
+        GROUP_PROVIDERS,
+        GROUP_SINKS,
+        GROUP_TASKS,
+        GROUP_TOOL_EXECUTORS,
+        failures,
+        plugin_names,
+    )
+    from onyx.eval.tasks import BUILTIN_TASKS, specs
+    from onyx.llm.registry import BUILTIN as BUILTIN_PROVIDERS
+    from onyx.llm.registry import available_kinds
+    from onyx.obs.visitors import builtin_visitors, default_visitors
+    from onyx.store.sinks import BUILTIN_SINKS, sink_names
+    from onyx.tools.executors import EXECUTOR_KINDS, executor_kinds
+
+    # (group, 内建名, 装配后的全量名字)；listing 为 None 表示这个组还没接线
+    listings = [
+        (GROUP_PROVIDERS, sorted(BUILTIN_PROVIDERS), available_kinds),
+        (GROUP_TASKS, sorted(BUILTIN_TASKS), lambda: sorted(specs())),
+        (GROUP_GRADERS, [], None),
+        (GROUP_SINKS, sorted(BUILTIN_SINKS), sink_names),
+        (GROUP_TOOL_EXECUTORS, sorted(EXECUTOR_KINDS), executor_kinds),
+        (GROUP_OBSERVERS, sorted(v.name for v in builtin_visitors()),
+         lambda: sorted(v.name for v in default_visitors())),
+    ]
+
+    console = Console()
+    table = Table(title="扩展点（entry points）", pad_edge=False)
+    table.add_column("group", style="cyan", no_wrap=True)
+    table.add_column("内建")
+    table.add_column("插件")
+    table.add_column("装配后")
+    table.add_column("坏插件", style="red")
+
+    broken = 0
+    for group, builtin, listing in listings:
+        if listing is None:
+            table.add_row(group, "[dim]—[/]", "[dim]—[/]", "[dim]—[/]",
+                          "[dim]未接线：没有按名字分发判据的消费点[/]")
+            continue
+        declared = sorted(plugin_names(group))
+        wired = sorted(listing())
+        failed = sorted({f.name for f in failures() if f.group == group})
+        broken += len(failed)
+        overrides = set(builtin) & set(declared)
+        table.add_row(
+            group,
+            ", ".join(builtin) or "[dim]—[/]",
+            ", ".join(f"{n}[dim]↻内置[/]" if n in overrides else n for n in declared)
+            or "[dim]—[/]",
+            ", ".join(wired) or "[dim]—[/]",
+            ", ".join(failed) or "",
+        )
+
+    console.print(table)
+    for failure in failures():
+        console.print(f"[red]✗[/] {failure}")
+    raise typer.Exit(1 if broken else 0)
+
+
 # ── db ─────────────────────────────────────────────────────────────
 @db_app.command("init")
 def db_init(
@@ -123,6 +196,21 @@ def _blob_count(settings: Settings) -> str:
 
 
 # ── doctor ─────────────────────────────────────────────────────────
+def _extension_failures() -> list[str]:
+    """问一遍五个已接线的注册表（这会真正加载插件），返回坏插件的描述。"""
+    from onyx.discovery import failures
+    from onyx.eval.tasks import specs
+    from onyx.llm.registry import available_kinds
+    from onyx.obs.visitors import default_visitors
+    from onyx.store.sinks import sink_names
+    from onyx.tools.executors import executor_kinds
+
+    for probe in (available_kinds, lambda: sorted(specs()), sink_names, executor_kinds,
+                  lambda: [v.name for v in default_visitors()]):
+        probe()
+    return [str(f) for f in failures()]
+
+
 @app.command()
 def doctor(
     db: Path = typer.Option(None, "--db", help="数据库路径"),
@@ -171,6 +259,13 @@ def doctor(
             f"{len(refs) - len(missing)}/{len(refs)} 可解析",
             "原始证据缺失，检查 .data/blobs 是否被清理",
         ))
+
+    bad_plugins = _extension_failures()
+    checks.append(CheckResult(
+        "扩展点插件全部可加载", not bad_plugins,
+        "; ".join(bad_plugins) or "无坏插件",
+        "onyx plugins 看是哪个 group 的哪个插件坏了",
+    ))
 
     if not skip_network:
         checks.append(_check_ollama(ollama_url))
@@ -257,19 +352,33 @@ traces_app = typer.Typer(help="trace：列表、详情、重放", no_args_is_hel
 app.add_typer(traces_app, name="traces")
 
 
-def _runtime(url: str, db: Path | None, *, sample_gpu: bool = True, provider_kind: str = "ollama"):
+def _runtime(
+    url: str, db: Path | None, *, sample_gpu: bool = True, provider_kind: str = "ollama",
+    event_sinks: tuple[str, ...] = (),
+):
     """构造运行时。
 
-    `provider_kind` 是 DESIGN §13 的扩展点在 CLI 上的出口：换成 `mock` 就能在没有
-    引擎的机器上跑通整条链路（含工具循环与评测），这也是离线测试的依据。
+    `provider_kind` 与 `event_sinks` 是 DESIGN §13 的扩展点在 CLI 上的出口：
+    前者换成 `mock` 就能在没有引擎的机器上跑通整条链路（含工具循环与评测，
+    这也是离线测试的依据），后者让事件流多路导出到任一已注册的 sink。
     """
     from onyx.runtime import build_runtime
 
-    return build_runtime(
-        provider_kind=provider_kind, base_url=url,
-        db_path=str(db) if db else None,
-        sample_gpu=sample_gpu and provider_kind == "ollama", event_log=False,
-    )
+    # provider_id 必须跟着 kind 走：用 `--provider mock`/插件跑出来的 trace 若仍记成
+    # "ollama-local"，那"这个数字来自哪个引擎"就是假的——而它是整个看板的立身之本。
+    provider_id = "ollama-local" if provider_kind == "ollama" else f"{provider_kind}-local"
+    try:
+        return build_runtime(
+            provider_kind=provider_kind, provider_id=provider_id, base_url=url,
+            db_path=str(db) if db else None,
+            sample_gpu=sample_gpu and provider_kind == "ollama", event_log=False,
+            event_sinks=event_sinks,
+        )
+    except (KeyError, ValueError) as exc:
+        # 扩展点写错名字（provider/sink）是配置错误：报出可选项然后退出，
+        # 不能退化成"用默认的跑下去"——那会让用户以为导出真的在发生。
+        typer.echo(str(exc).strip("'"), err=True)
+        raise typer.Exit(2) from None
 
 
 @models_app.command("sync")
@@ -340,11 +449,17 @@ def chat(
     prompt: str = typer.Argument(..., help="用户消息"),
     model: str = typer.Option(..., "--model", "-m"),
     url: str = typer.Option("http://127.0.0.1:11434", "--url"),
+    provider: str = typer.Option(
+        "ollama", "--provider", help="ollama | mock | 插件 kind（onyx plugins 看全量）"
+    ),
     db: Path = typer.Option(None, "--db"),
     stream: bool = typer.Option(False, "--stream"),
     max_tokens: int = typer.Option(512, "--max-tokens"),
     thinking: bool = typer.Option(None, "--thinking/--no-thinking"),
     tool: str = typer.Option("", "--tool", help="逗号分隔的演示工具名，如 weather"),
+    sink: list[str] = typer.Option(
+        [], "--sink", help="额外的事件导出 sink（onyx.sinks 注册表），可重复；如 jsonl"
+    ),
 ) -> None:
     """发一次真实对话并把它完整落库（token / 延迟 / 工具 / 原始证据）。"""
     from rich.console import Console
@@ -354,7 +469,7 @@ def chat(
     from onyx.runtime import sync_models
 
     console = Console()
-    runtime = _runtime(url, db)
+    runtime = _runtime(url, db, provider_kind=provider, event_sinks=tuple(sink))
     try:
         sync_models(runtime)
         tools = tuple(
@@ -393,18 +508,18 @@ def chat(
             rows = [
                 ("输入 token", usage.in_tokens), ("输出 token", usage.out_tokens),
                 ("来源 / 置信度", f"{usage.source} / {usage.confidence}"),
-                ("drift", None if usage.drift_pct is None else f"{usage.drift_pct:.2%}"),
+                ("drift", _pct(usage.drift_pct)),
                 ("工具定义 token", sum(p.tokens for p in usage.parts if p.part == "tool_defs") or "—"),
                 ("模板控制符", sum(p.tokens for p in usage.parts if p.part == "template_ctl") or "—"),
             ]
         else:
             rows = [("usage", "无")]
         rows += [
-            ("TTFT", f"{result.latency.get('ttft_ms'):.1f}ms" if result.latency.get("ttft_ms") else "—"),
+            ("TTFT", _fmt(result.latency.get("ttft_ms"), 1, "ms")),
             ("prefill 模式", result.latency.get("prefill_mode") or "—"),
             ("prefill TPS", _fmt(result.latency.get("prefill_tps"))),
             ("decode TPS", _fmt(result.latency.get("decode_tps"))),
-            ("wall", _fmt(result.latency.get("wall_ms"), "ms")),
+            ("wall", _fmt(result.latency.get("wall_ms"), 1, "ms")),
             ("异常", ", ".join(sorted({c for c, _, _ in result.anomalies})) or "无"),
         ]
         for name, value in rows:
@@ -413,10 +528,6 @@ def chat(
         console.print(f"[dim]onyx traces show {result.trace_id}[/dim]")
     finally:
         runtime.close()
-
-
-def _fmt(value: object, suffix: str = "") -> str:
-    return f"{value:.1f}{suffix}" if isinstance(value, int | float) else "—"
 
 
 # ── traces ─────────────────────────────────────────────────────────
@@ -492,9 +603,10 @@ def traces_show(
             u = bundle.usage
             console.print(f"\n[bold]采信[/bold] in={u.in_tokens} out={u.out_tokens} "
                           f"thinking={u.thinking_tokens} source={u.source} conf={u.confidence} "
-                          f"drift={u.drift_pct}")
-            console.print(f"[bold]延迟[/bold] ttft={_fmt(u.ttft_ms, 'ms')} prefill={u.prefill_mode} "
-                          f"({_fmt(u.prefill_ms_per_token, 'ms/tok')}) "
+                          f"drift={_pct(u.drift_pct)}")
+            console.print(f"[bold]延迟[/bold] ttft={_fmt(u.ttft_ms, 1, 'ms')} "
+                          f"prefill={u.prefill_mode} "
+                          f"({_fmt(u.prefill_ms_per_token, 2, 'ms/tok')}) "
                           f"prefill_tps={_fmt(u.prefill_tps)} decode_tps={_fmt(u.decode_tps)}")
         alt_table = Table(title="各来源计数（对账）", pad_edge=False)
         for column in ("source", "in", "out", "thinking", "cached", "ok", "note"):
@@ -752,6 +864,9 @@ def serve(
         None, "--gpu-lock",
         help="GPU 锁文件路径；默认机器级路径。多卡机器用它给每个服务一条锁"
     ),
+    sink: list[str] = typer.Option(
+        [], "--sink", help="额外的事件导出 sink（onyx.sinks 注册表），可重复；如 jsonl"
+    ),
 ) -> None:
     """启动 REST + SSE 服务（看板后端）。"""
     import uvicorn
@@ -759,7 +874,7 @@ def serve(
     from onyx.api.app import create_app
 
     app_obj = create_app(base_url=url, db_path=str(db) if db else None,
-                         gpu_lock_path=gpu_lock_path)
+                         gpu_lock_path=gpu_lock_path, event_sinks=tuple(sink))
     typer.echo(f"Onyx API: http://{host}:{port}/api/docs")
     uvicorn.run(app_obj, host=host, port=port, log_level="info")
 
@@ -1393,7 +1508,7 @@ def eval_ls(
             )
         console.print(table)
 
-        typer.echo(f"内置任务: {', '.join(task_ids())}")
+        typer.echo(f"任务（含插件）: {', '.join(task_ids())}")
 
         runs = repo.list_runs(limit=limit)
         run_table = Table(title=f"最近 {len(runs)} 次运行", pad_edge=False)
@@ -1407,6 +1522,49 @@ def eval_ls(
         console.print(run_table)
     finally:
         database.close()
+
+
+@eval_app.command("tasks")
+def eval_tasks() -> None:
+    """列出已注册任务（内建 + `onyx.tasks` 插件），并显示能力要求与坏插件。
+
+    默认数据集那一列刻意**不**调用载入器：插件的载入器可能要联网拉数据，
+    一个"列一下任务"的命令不该因此卡住；这里只需要知道"有没有自带数据"。
+    """
+    from rich.console import Console
+    from rich.table import Table
+
+    from onyx.discovery import GROUP_TASKS, failures
+    from onyx.eval.tasks import BUILTIN_TASKS, specs
+
+    console = Console()
+    found = specs()
+    table = Table(title=f"评测任务（{len(found)}）", pad_edge=False)
+    # id 折行而不是裁掉：`onyx eval tasks | grep example` 是这一步的自测命令，
+    # 被截断成 `example_char_co…` 的 id 既查不到也复制不了
+    table.add_column("id", overflow="fold")
+    for column in ("名称", "来源", "需要能力", "指标数", "默认数据集"):
+        table.add_column(column)
+    for task_id in sorted(found):
+        spec = found[task_id]
+        factory = spec.factory
+        caps = sorted(str(c) for c in getattr(factory, "requires", ()) or ())
+        metrics = getattr(factory, "metric_names", ()) or ()
+        table.add_row(
+            task_id,
+            str(getattr(factory, "name", "") or "—"),
+            "内建" if task_id in BUILTIN_TASKS else "插件",
+            ", ".join(caps) or "—",
+            str(len(metrics)) if metrics else "—",
+            "自带" if spec.dataset is not None else "需 --dataset",
+        )
+    console.print(table)
+
+    broken = [f for f in failures() if f.group == GROUP_TASKS]
+    for failure in broken:
+        console.print(f"[red]✗[/] {failure}")
+    if broken:
+        raise typer.Exit(1)
 
 
 #: 主分数的候选指标在 `onyx.eval.task.HEADLINE_METRICS`：列表页、矩阵与导出报告
@@ -1759,14 +1917,26 @@ def _print_run_report(console, report, task, *, k: int, seed: int | None, split:
     )
 
 
-def _fmt(value, digits: int = 3) -> str:
-    """未知显示「—」，绝不显示 0（UI_DESIGN R2）。"""
+def _pct(value) -> str:
+    """百分比显示，未知仍是「—」。`drift_pct` 是小数比例，不是 0–100。"""
+    return "—" if value is None else f"{value:.2%}"
+
+
+def _fmt(value, digits: int = 3, suffix: str = "") -> str:
+    """未知显示「—」，绝不显示 0（UI_DESIGN R2）。
+
+    这里曾经有**两份同名 `_fmt`**：一份第二参数是 `suffix`（S3 的 chat/traces），
+    一份是 `digits`（S13 的 eval）。后定义的那份把前者遮蔽，于是
+    `_fmt(ttft_ms, "ms")` 变成 `digits="ms"`，`f"{v:.ms f}"` 直接 ValueError——
+    而值为 None 时会提前返回「—」，所以只有"真的有数字"的那条路才炸。
+    ruff 的 F811 因为"前一份已被使用"不会报，单测没覆盖到才让它活到了现在。
+    """
     if value is None:
         return "—"
     if isinstance(value, bool):
         return "是" if value else "否"
     if isinstance(value, int | float):
-        return f"{value:.{digits}f}"
+        return f"{value:.{digits}f}{suffix}"
     return str(value)
 
 

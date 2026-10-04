@@ -50,12 +50,13 @@ def create_app(
     db_path: Path | str | None = None,
     sample_gpu: bool = True,
     gpu_lock_path: Path | str | None = None,
+    event_sinks: tuple[str, ...] = (),
     cors_origins: tuple[str, ...] = ("http://localhost:5173", "http://127.0.0.1:5173"),
 ) -> FastAPI:
     owns_runtime = runtime is None
     resolved = runtime or build_runtime(
         base_url=base_url, provider_id=provider_id, db_path=db_path,
-        sample_gpu=sample_gpu, event_log=False,
+        sample_gpu=sample_gpu, event_log=False, event_sinks=event_sinks,
     )
 
     @asynccontextmanager

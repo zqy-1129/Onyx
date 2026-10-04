@@ -1007,12 +1007,14 @@ cd onyx/web && npx tsc --noEmit && npx vitest run && npm run build
 
 **产出文件**
 ```
-onyx/plugins_example/{example_task,example_provider}/   # 独立可 pip -e 安装的小包
-onyx/llm/providers/openai_compat.py                     # vLLM / LM Studio / Xinference（验证抽象）
-onyx/tools/executors/mcp.py                             # 任意 MCP server 的工具纳入注册表与测试
-onyx/store/sinks/otlp.py（或 langfuse.py）               # 事件流导出，验证 Sink 抽象
+plugins_example/{example_task,example_provider}/      # 独立可 pip -e 安装的小包（放仓库根，理由见 S16a 记录）
+onyx/discovery.py                                     # 六个 group 共用的发现语义
+onyx/llm/providers/openai_compat.py                   # vLLM / LM Studio / Xinference（验证抽象）
+onyx/tools/executors/mcp.py                           # 任意 MCP server 的工具纳入注册表与测试
+onyx/store/sinks/otlp.py（或 langfuse.py）             # 事件流导出，验证 Sink 抽象
 docs/eval-recipes.md
-tests/contract/test_plugin_discovery.py
+tests/contract/{test_plugin_discovery,test_provider_contract}.py
+scripts/check_extension_boundary.{py,sh}
 ```
 这一步是**抽象的验收测试**：
 - 第二 provider 必须**只实现 `LlmProvider`** 就能让全部看板与评测工作；若需要改 `core/` 或 `gateway.py`，说明抽象泄漏 → 记 issue 并在 DESIGN §13 补契约，不许在 gateway 里加 `if kind == ...`。
@@ -1028,7 +1030,98 @@ uv run pytest tests/contract -q
 ```
 **验收 DoD（M6 出口）**：`git diff` 显示接入新 provider **未修改** `onyx/core/**`、`onyx/llm/gateway.py`、`onyx/obs/**`；新 task 未修改 `onyx/eval/runner.py`。这条用脚本断言（`scripts/check_extension_boundary.sh`），不靠人review。
 
-**提交**：`feat(plugins): entry-point discovery, openai-compatible provider, mcp executor`
+**提交**：分四次，每次一个可独立验证的出口
+`feat(plugins): entry-point discovery for all registries, example plugins, boundary gate`（S16a）→
+`feat(llm): openai-compatible provider + provider contract suite`（S16b）→
+`feat(store): export sink validating the EventSink abstraction`（S16c）→
+`feat(tools): mcp executor + tool discovery into the registry`（S16d）
+
+---
+
+### S16a 已交付（扩展点固化 + 样板插件 + 边界门禁）
+
+**实际产出**
+```
+onyx/discovery.py                                   # 六个 group 共用的发现语义（隔离/可见/覆盖/缓存）
+onyx/llm/registry.py                                # 改用共用语义（原来自己实现了一份）
+onyx/eval/tasks/__init__.py                         # onyx.tasks 接线：BUILTIN_TASKS + specs()
+onyx/eval/task.py                                   # TaskSpec / coerce_task_spec；删掉没人用的 TaskRegistry
+onyx/store/sinks/registry.py                        # onyx.sinks 接线 + build_event_sink(name, **opts)
+onyx/tools/executors/__init__.py                    # onyx.tool_executors 接线；fixture 通道抢不走
+onyx/obs/visitors/__init__.py                       # onyx.observers 接线：插件一律排在内置之后
+onyx/tools/spec.py, onyx/tools/registry.py          # ToolKind 之外允许插件 slug（见下"改到的内核"）
+onyx/runtime.py, onyx/api/app.py, onyx/cli.py       # event_sinks 装配点 + --sink/--provider 出口 + plugins/eval tasks 命令
+plugins_example/example_task/                       # 外部 EvalTask 插件（自带数据集与指标）
+plugins_example/example_provider/                   # 外部 LlmProvider 插件（只实现协议）
+scripts/check_extension_boundary.py(.sh)            # M6 出口 DoD 的机器断言
+tests/contract/{conftest,test_provider_contract,test_plugin_discovery}.py
+tests/unit/{test_cli_plugins,test_cli_traces,test_extension_boundary}.py
+```
+样板包放在**仓库根的 `plugins_example/`** 而不是计划里写的 `onyx/plugins_example/`：
+`[tool.hatch.build.targets.wheel] packages = ["onyx"]` 会把后者一起打进 onyx 的 wheel，
+而"外部包"必须是**另一个可独立安装的 distribution**，否则 entry point 根本不成立。
+
+**接线之后各注册表的语义（一处实现，六个 group 共用）**
+- 坏插件：跳过 + 记进进程级台账（`failures()`，重复尝试累加 attempts），内置实现不受影响；
+- 失败可见：`onyx plugins` / `onyx eval tasks` 会打印台账并以退出码 1 结束，`onyx doctor` 多一条体检项；
+- 同名覆盖：插件覆盖内置，覆盖关系在 `onyx plugins` 里标 `↻内置`，不悄悄发生；
+- 例外：`kind="fixture"` 永远走桩实现——评测的零副作用保证不能被外部实现劫走；
+- 缓存：`entry_points()` 单次约 6ms 且注册表在热路径上被反复问，所以按 group 缓存原始声明、
+  按 `(group, name)` 缓存已加载值；**失败不缓存**，所以坏插件的 attempts 会持续增长（保持可见）。
+
+**改到的内核与为什么**（这些都不是"为某个实现开小灶"，而是把契约补全）
+1. `LlmProvider.generate` 的协议里**没有 `trace_id`**，而 gateway 一直按
+   `generate(req, trace_id=..., on_event=...)` 调用 → 照协议写的外部 provider 必然 TypeError。
+   协议补上 `trace_id: str = ""`，并由 `test_generate_signature_matches_how_gateway_calls_it` 钉住。
+   同时删掉从未被任何调用点使用的 `StreamingProvider`：它的文档声称"不支持时 gateway 退化为
+   一次性返回"，而真实机制是 `req.stream` —— 留在契约里就是一条会被照抄的假话。
+2. `ToolKind` 是 closed enum，插件种类（`"shout"` / 未来的 `"mcp_xxx"`）**无法被表示**，
+   `onyx.tool_executors` 就只剩"覆盖内建"一种用法。改法：`ToolDef.kind: ToolKind | str`，
+   构造时用 `coerce_kind` 归一（内建仍是枚举成员，口径不变），外部值限制成小写 slug；
+   **导入边界**（`defs_from_payload`）仍然拒绝不认识的种类——拼错的 kind 必须当场炸，
+   而不是躺进库里等某次调用才发现。`_PENDING` 的 `mcp`/`ollama_builtin` 保持可导入：先定义后实现是允许的。
+3. CLI `_runtime` 之前把非 ollama 的 provider 也记成 `provider_id="ollama-local"`，
+   于是 `--provider mock|echo` 跑出来的 trace 在库里自称来自 ollama —— 这是"数字来自哪个引擎"的假信息。
+   现在按 kind 生成 `echo-local` / `mock-local`，ollama 保持原 id 以兼容既有标定数据。
+
+**顺带修掉的既有缺陷**（都是"测试没覆盖到才活到现在"的那一类）
+- `onyx/cli.py` 里有**两份同名 `_fmt`**：S3 的那份第二参数是 `suffix`，S13 加的那份是 `digits`，
+  后定义者把前者遮蔽 → `onyx traces show` 在**任何 ttft 为数字的 trace** 上直接
+  `ValueError: Format specifier missing precision`（值为 None 时提前返回「—」，所以 mock-only 测试看不见；
+  ruff 的 F811 因"前一份被使用过"也不报）。合并成一份 `_fmt(value, digits=3, suffix="")`，
+  补 `tests/unit/test_cli_traces.py`：行为回归 + **顶层不许有同名定义**的结构断言。
+- `onyx eval tasks` 这个计划里点名的自测命令**此前不存在**（只有 `eval ls` 顺带列一行）。
+- `onyx plugins` 表格里任务 id 被 rich 截断成 `example_char_co…`，`| grep example` 会查不到 →
+  id 列改成 `overflow="fold"`。
+- GPU 锁接管在 Windows 上会被"文件正被别的句柄打开"短暂拒绝：一次失败就放弃等于
+  **没人能接管死锁**（评测无限排队等一个已死的持有者）。改成有界重试（3 次），
+  并补 `test_transient_rename_denial_still_allows_takeover`。"实在不行就覆盖"依然禁止。
+
+**自测（真机，全部实际执行）**
+```bash
+uv run pytest                              # 852 passed, 1 skipped（含 tests/contract 57 项）
+uv run ruff check .                         # All checks passed
+uv run lint-imports                         # 3 contracts kept
+uv run python scripts/check_extension_boundary.py --files $(git status --porcelain ...)
+                                            # ✓ 接入 1 个实现未触碰受保护的内核文件
+uv run --with-editable plugins_example/example_task onyx eval tasks
+                                            # example_char_count | 数汉字（扩展点样板）| 插件 | chat | 3 | 自带
+ONYX_DATA_DIR=/tmp/... uv run --with-editable plugins_example/example_task \
+  onyx eval run --task example_char_count --provider mock --model mock/echo
+                                            # 8/8 · accuracy 0.000 · format_valid_rate 0.000 · in 960 / out 192 · 78ms
+uv run --with-editable plugins_example/example_provider \
+  onyx chat "测试出处" --provider echo --model echo/static
+                                            # provider_id=echo-local · usage=heuristic/low(8/6)
+                                            # 异常=LOW_CONFIDENCE_USAGE, NO_ENGINE_COUNT · 无引擎计数的项显示「—」而不是 0
+```
+外部任务跑通一次评测时 `onyx/eval/runner.py` 未被修改；外部 provider 被完整记录时
+`onyx/core/**`、`onyx/llm/gateway.py`、`onyx/obs/**` 未被修改 —— 由脚本判定，不靠人 review。
+
+**已知小缺口（记在这里，不藏）**
+- `onyx.serve --provider X` 还没有对应 flag（serve 只走 ollama）；
+- 非 ollama provider 的 `base_url` 仍记录 CLI `--url` 的默认值（`http://127.0.0.1:11434`），
+  修它需要把散在 6 处的 url 默认值提成常量并区分"用户没填"，属于独立一次改动；
+- `onyx.providers add/list`（计划自测里提到的命令）尚未存在，与 S16b 的第二 provider 一起做。
 
 ---
 

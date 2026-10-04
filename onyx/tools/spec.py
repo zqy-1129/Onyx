@@ -31,6 +31,34 @@ class ToolKind(StrEnum):
     FIXTURE = "fixture"
 
 
+#: 外部（插件）执行器种类的形状约束。
+#: 放开成"任意字符串"会让 `kind="Http "` 这类拼写错误一路走到分发点才炸；
+#: 限制成小写 slug 既让插件能自带种类，又保留早失败。
+_KIND_SLUG = re.compile(r"^[a-z][a-z0-9_]{1,31}$")
+
+
+def coerce_kind(value: ToolKind | str) -> ToolKind | str:
+    """内建种类归一成枚举；插件种类保留 slug 字符串。
+
+    `ToolKind` 是**内建集合**，枚举不能长出新成员——否则"接一个外部执行器"
+    就要改 `core/tools 契约`，而"不改内核才能接扩展"正是 M6 要证伪的那件事
+    （见 `scripts/check_extension_boundary.py`）。
+    """
+    if isinstance(value, ToolKind):
+        return value
+    text = str(value)
+    try:
+        return ToolKind(text)
+    except ValueError:
+        pass
+    if not _KIND_SLUG.match(text):
+        raise ValueError(
+            f"工具种类 {text!r} 既不是内建种类，也不是合法 slug"
+            "（^[a-z][a-z0-9_]{1,31}$）"
+        )
+    return text
+
+
 class SideEffect(StrEnum):
     """沙箱决策依据。未标注就是审计错误——不能默认当成只读。"""
 
@@ -51,7 +79,7 @@ class ToolDef:
     name: str
     description: str = ""
     parameters: dict[str, Any] = field(default_factory=dict)
-    kind: ToolKind = ToolKind.PYTHON_FN
+    kind: ToolKind | str = ToolKind.PYTHON_FN
     side_effect: SideEffect = SideEffect.READ
     impl_ref: str = ""
     version: str = "1"
@@ -62,6 +90,11 @@ class ToolDef:
     doc: str = ""
     examples: tuple[dict[str, Any], ...] = ()
     extra: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        # 定义一构造就归一：`kind` 决定分发路径，留到分发点才发现拼错等于
+        # 让一条坏定义在注册表里躺很久，直到某次调用才炸
+        object.__setattr__(self, "kind", coerce_kind(self.kind))
 
     @property
     def hash(self) -> str:
