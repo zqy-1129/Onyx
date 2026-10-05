@@ -2381,11 +2381,51 @@ uv run ruff check . · uv run lint-imports（3 kept）· check_extension_boundar
 
 ## S32 — 长上下文中文集（M11 第三步）
 
-本机 16GB 能测出的最有价值的维度：4k / 8k / 16k 三档，每档是"在长文里埋 2–3 个可回答的事实"，
-测的是**检索式抽取**而不是摘要（摘要无法机械判分）。
-`CONTEXT_NEAR_LIMIT` / `CONTEXT_OVERFLOW` 已有异常码，长上下文跑起来正好让这两个码参与真实观测。
-前提：先量清楚每个模型实际载入的 `num_ctx`（`/api/models` 已有），
-否则"16k 全错"可能是被截断而不是能力问题——这种分数比没有分数更坏。
+本机 16GB 能测出的最有价值的维度。**测检索式抽取而不是摘要**（摘要无法机械判分）。
+
+**先做前提实测（计划要求：不清楚实际载入的 `num_ctx` 就跑，"16k 全错"可能是被截断）**
+2026-10-05 在 qwen3.5:9b 上实测：
+- `/api/tags` 的 card `context_length` = **262,144**，而 `/api/ps` 报的**实际载入** = **131,072**
+  ⇒ 两者差一个数量级，看 card 会高估；`obs/visitors/gpu.py` 用的正是**实际载入**那一份
+  （`CONTEXT_NEAR_LIMIT` ≥0.9、`CONTEXT_OVERFLOW` >1.0 都按它算）。
+- 传 `options.num_ctx=20480` 之后 `/api/ps` 立刻回报 `context_length=20480`，显存从 9.32G 降到 5.73G
+  ⇒ Ollama **确实按请求采纳 num_ctx**，所以"窗口是多少"这件事可以由任务钉死，而不是猜引擎默认。
+- 中文长度换算：实测 0.6–0.7 token/汉字 ⇒ 4k/8k/16k 三档分别写 ~6,000 / ~12,000 / ~24,000 汉字，
+  而**分数只按引擎回报的真实 in_tokens 判断是否越界**，不靠这个估算。
+
+**产出文件（计划）**
+```
+onyx/eval/datasets/builtin/longctx_zh.py       # 生成器：组合式中文段落填充 + 埋 3 个可精确匹配的事实
+onyx/eval/tasks/long_context.py                # 任务本体：钉 num_ctx、按位置与档位分桶、越界不记分
+onyx/eval/tasks/__init__.py · loader.py        # 注册 + 数据集别名 + revision
+onyx/cli.py                                    # eval run --num-ctx（任务侧窗口旋钮，默认由任务给）
+tests/unit/test_longctx_zh_dataset.py          # 埋点必在文中、答案唯一可判、三档单调变长、可复现
+tests/unit/test_long_context_grade.py          # 形态表 + 越界/截断的处理 + 分桶分母
+tests/unit/test_long_context_run.py            # mock 真跑：by_position、跳过的原因、trace 下钻
+```
+
+**四条设计决定**
+1. **窗口由任务显式钉住**（默认 20,480，可 `--num-ctx` 覆盖）。一次运行只用一个窗口值：
+   逐条改 `num_ctx` 会让引擎反复重载，把"测长上下文"变成"测重载速度"。
+2. **越界不记分**：`grade` 读引擎回报的 `in_tokens`，超过 `num_ctx` 的样本判 `SKIPPED`
+   并写明"输入 N tok 超过窗口 M，结果不可信"。这是「未知 ≠ 0 分」在长上下文上的形态——
+   被截断的检索失败如果被算成"模型不会"，分数就会指导人去换模型，而该改的是窗口配置。
+   聚合里 `skipped_truncated` 与 `verdicts.skipped` 都能看见它。
+3. **答案必须可精确匹配**：每个埋点是一句带独特数值/编号/日期的事实，问题是"值是多少"，
+   输出格式沿用 S30 的 JSON 纪律（`{q1:…, q2:…, q3:…}`），判分复用 `parse_json` + `field_em`
+   （S30 之后它会按数值比，`3.6` 与 `3.60` 不会被算错）。
+4. **位置是主角**：每条埋点标 `first/middle/last`，`by_position` 各带分母——
+   "中部检索最差"（lost in the middle）在单一总分里完全看不见，
+   而它恰好是长上下文唯一能指导你"文档怎么排"的结论。`by_bucket`（4k/8k/16k）同理。
+
+**自测**
+```bash
+uv run pytest tests/unit/test_longctx_zh_dataset.py tests/unit/test_long_context_grade.py -q
+uv run onyx eval run --task long_context --model qwen3.5:9b --seed 42 --num-ctx 20480   # 真机
+uv run onyx eval run --task long_context --model qwen3.5:9b --split 16k                  # 单档跑
+```
+**DoD**：三条同源对新任务全绿；`by_position` 与 `by_bucket` 每格带分母；
+真机一次并留下实测 in_tokens 与窗口的比值（`ctx_util`）；越界样本走 skip 且有原因；矩阵 5 列。
 
 ## S33 — embedding 任务（M11 收口）
 
