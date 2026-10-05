@@ -2028,10 +2028,12 @@ onyx/config.py                          # [alerts] 段 + _SCHEMA 键（severitie
                                         # window_s/min_count/cooldown_s/poll_s/file/enabled）
 onyx/api/deps.py · onyx/api/app.py      # AppState.alert_service + lifespan 起停
 onyx/api/routes/alerts.py               # GET /api/alerts（触发历史）· GET /api/alerts/rules（生效规则与出处）
-onyx/cli.py                             # onyx alerts ls · onyx alerts test --channel file
-onyx/web/src/pages/Fleet.tsx            # 顶部一行 + 触发历史面板
+onyx/cli.py                             # onyx alerts ls · onyx alerts test
+onyx.example.toml                       # [alerts] 一节（每个键都真的被消费）
 tests/unit/test_alert_rules.py · test_alert_service.py · test_api_alerts.py · test_cli_alerts.py
 ```
+界面那部分（Fleet 顶部一行 + 触发历史面板）归 **S29**：它是"看得见的触达"，
+和告警内核的提交分开，内核坏与页面坏才是两件事。
 
 **接口**
 - `Rule(codes, severities, exclude_codes, window_s, min_count, cooldown_s)`；

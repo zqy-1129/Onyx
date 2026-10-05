@@ -1090,6 +1090,111 @@ def models_rm(
         runtime.close()
 
 
+alerts_app = typer.Typer(help="告警：触发历史与出口自检", no_args_is_help=True)
+app.add_typer(alerts_app, name="alerts")
+
+
+@alerts_app.command("ls")
+def alerts_ls(
+    db: Path = typer.Option(None, "--db"),
+    limit: int = typer.Option(30, "--limit"),
+    code: str = typer.Option(None, "--code", help="只看某个异常码"),
+    status: str = typer.Option(None, "--status", help="sent / failed"),
+    include_test: bool = typer.Option(False, "--include-test",
+                                      help="把 `alerts test` 造的行也列出来"),
+) -> None:
+    """列出告警的触发历史。
+
+    空表要读成"没通知过任何事"而不是"告警坏了"，所以这里同时打印当前生效的判据与出口：
+    "我没收到通知"的四种原因（没命中 / 被 cooldown 挡了 / 渠道失败 / 没装配出口）先分清两种。
+    """
+    from rich.console import Console
+    from rich.table import Table
+
+    from onyx.config import alert_channels, alert_rule
+    from onyx.store.repos import AlertRepo
+
+    settings = _settings()
+    cfg = _config()
+    rule = alert_rule(cfg)
+    channels = alert_channels(cfg, settings.data_dir)
+    database = Database(_db_path(settings, db))
+    try:
+        rows = AlertRepo(database).list_triggers(
+            code=code, status=status, include_test=include_test, limit=limit)
+        console = Console()
+        console.print(
+            f"[dim]判据：级别 {'/'.join(rule.severities) or '（未指定）'} · "
+            f"{rule.window_s}s 内满 {rule.min_count} 次触发 · cooldown {rule.cooldown_s}s · "
+            f"轮询 {rule.poll_s:g}s · 出口 "
+            f"{'、'.join(c.name for c in channels) or '（无）'} · 出处 {rule.source}[/dim]"
+        )
+        if not rows:
+            console.print("[yellow]没有触发记录[/yellow] —— 要么窗口里没出现过符合条件的异常，"
+                          "要么命中了但在 cooldown 里（被挡的不写行，这是刻意的）")
+            return
+        table = Table(title=f"告警触发（{len(rows)}）", pad_edge=False)
+        for column in ("时间", "码", "级别", "次数", "渠道", "状态", "测试", "说明"):
+            table.add_column(column)
+        for rec in rows:
+            table.add_row(
+                rec.created_at[:19], rec.code, rec.severity,
+                f"{rec.n_in_window}/{rec.window_s}s",
+                rec.channel,
+                "✓ sent" if rec.status == "sent" else f"✗ {rec.status}",
+                "✓" if rec.is_test else "",
+                rec.detail[:60],
+            )
+        console.print(table)
+        for rec in rows:
+            if rec.status != "sent":
+                # 表格里的"说明"会被终端宽度截断，而失败原因恰恰是全文才有用的那部分
+                console.print(f"[red]✗ {rec.channel} · {rec.code}：{rec.detail}[/red]")
+    finally:
+        database.close()
+
+
+@alerts_app.command("test")
+def alerts_test(
+    db: Path = typer.Option(None, "--db"),
+    code: str = typer.Option("CONTEXT_OVERFLOW", "--code", help="用哪个异常码的文案来试"),
+    channel: str = typer.Option(None, "--channel", help="出口名（默认全试）"),
+) -> None:
+    """走一遍出口，确认"通知真的能到我手上"。
+
+    这条命令**不起后台线程**，只手工投一条标了 is_test 的消息：
+    它落库时不参与 cooldown，也不会让人误以为真出过事。
+    """
+    from onyx.config import alert_channels, alert_rule
+    from onyx.obs.alerts.service import AlertService
+
+    settings = _settings()
+    cfg = _config()
+    rule = alert_rule(cfg)
+    if not rule.enabled:
+        typer.echo("[alerts].enabled = false —— 出口不会装，通知也不会发", err=True)
+        raise typer.Exit(2)
+    channels = alert_channels(cfg, settings.data_dir)
+    if not channels:
+        typer.echo("没有可用出口（检查 [alerts].file 与数据目录是否可写）", err=True)
+        raise typer.Exit(2)
+
+    database = Database(_db_path(settings, db))
+    try:
+        service = AlertService(database, rule=rule, channels=channels)
+        rows = service.send_test(code=code, channel_filter=channel)
+        if not rows:
+            typer.echo(f"没有名为 {channel} 的出口（可选项："
+                       f"{'、'.join(c.name for c in channels)}）", err=True)
+            raise typer.Exit(2)
+        for rec in rows:
+            mark = "✓" if rec.status == "sent" else "✗"
+            typer.echo(f"{mark} {rec.channel}: {rec.detail}")
+        typer.echo("这是测试消息：库里那行标着 is_test=1，不影响真实 cooldown")
+    finally:
+        database.close()
+
+
 def _remaining(expires_at: str) -> str:
     from datetime import datetime
 
@@ -1562,7 +1667,7 @@ def serve(
 
     from onyx.api.app import create_app
     from onyx.api.auth import is_loopback
-    from onyx.config import ENV_TOKEN
+    from onyx.config import ENV_TOKEN, alert_channels, alert_rule
     from onyx.eval.gpu_lock import DEFAULT_GPU_STALE_AFTER_S
 
     cfg = _config()
@@ -1600,6 +1705,8 @@ def serve(
                          gpu_lock_path=lock,
                          gpu_stale_after_s=pick(cfg.gpu.stale_after_s, DEFAULT_GPU_STALE_AFTER_S),
                          event_sinks=sinks,
+                         alert_rule=alert_rule(cfg),
+                         alert_channels=tuple(alert_channels(cfg, _settings().data_dir)),
                          token=secret, read_only=bool(readonly))
     typer.echo(
         f"Onyx API: http://{host}:{port}/api/docs"

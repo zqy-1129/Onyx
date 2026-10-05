@@ -78,6 +78,26 @@ class ServeConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class AlertConfig:
+    """`[alerts]`：什么异常、到什么程度、发到哪。
+
+    判据的默认值不在这里抄一份——它们的家是 `obs/alerts/rules.py`，
+    这里只留"人改过的值"，没改的就是 None（沿用 S20 的分层规矩）。
+    """
+
+    enabled: bool | None = None
+    severities: tuple[str, ...] | None = None
+    codes: tuple[str, ...] | None = None
+    exclude_codes: tuple[str, ...] | None = None
+    window_s: int | None = None
+    min_count: int | None = None
+    cooldown_s: int | None = None
+    poll_s: float | None = None
+    #: 本地文件出口的路径。没写就是 `<数据目录>/alerts/alerts.jsonl`（按天分片）
+    file: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class Config:
     data_dir: str | None = None
     provider: ProviderConfig = field(default_factory=ProviderConfig)
@@ -85,6 +105,7 @@ class Config:
     retention: RetentionConfig = field(default_factory=RetentionConfig)
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
     serve: ServeConfig = field(default_factory=ServeConfig)
+    alerts: AlertConfig = field(default_factory=AlertConfig)
     sinks: tuple[str, ...] | None = None
     #: 真正读到的文件（没有就是空元组）——报告里必须说清数是从哪份文件来的
     sources: tuple[Path, ...] = ()
@@ -111,6 +132,12 @@ _SCHEMA: dict[str | None, dict[str, tuple[type, ...]]] = {
         "default_timeout_ms": (int,),
     },
     "serve": {"host": (str,), "port": (int,), "token": (str,), "read_only": (bool,)},
+    "alerts": {
+        "enabled": (bool,),
+        "severities": (list,), "codes": (list,), "exclude_codes": (list,),
+        "window_s": (int,), "min_count": (int,), "cooldown_s": (int,), "poll_s": (int, float),
+        "file": (str,),
+    },
     "sinks": {"events": (list,)},
 }
 
@@ -266,6 +293,17 @@ def load_config(path: Path | str | None = None) -> Config:
             token=_text(read("serve", "token")),
             read_only=_flag(read("serve", "read_only")),
         ),
+        alerts=AlertConfig(
+            enabled=_flag(read("alerts", "enabled")),
+            severities=_str_list(read("alerts", "severities")),
+            codes=_str_list(read("alerts", "codes")),
+            exclude_codes=_str_list(read("alerts", "exclude_codes")),
+            window_s=_integer(read("alerts", "window_s")),
+            min_count=_integer(read("alerts", "min_count")),
+            cooldown_s=_integer(read("alerts", "cooldown_s")),
+            poll_s=_seconds(read("alerts", "poll_s")),
+            file=_text(read("alerts", "file")),
+        ),
         sinks=_str_list(read("sinks", "events")),
         sources=(chosen,),
         unknown=tuple(unknown),
@@ -351,4 +389,78 @@ def effective(cfg: Config) -> list[Setting]:
         token_source,
     ))
     add("sinks.events", cfg.sinks, None, ())
+
+    # [alerts] 的默认值来自 rules（它的家），这里只负责报告"哪一层决定了它"
+    from onyx.obs.alerts.rules import (
+        DEFAULT_ALERT_COOLDOWN_S,
+        DEFAULT_ALERT_MIN_COUNT,
+        DEFAULT_ALERT_POLL_S,
+        DEFAULT_ALERT_SEVERITIES,
+        DEFAULT_ALERT_WINDOW_S,
+    )
+
+    a = cfg.alerts
+    add("alerts.enabled", a.enabled, None, True)
+    add("alerts.severities", a.severities, None, DEFAULT_ALERT_SEVERITIES)
+    add("alerts.codes", a.codes, None, ())
+    add("alerts.exclude_codes", a.exclude_codes, None, ())
+    add("alerts.window_s", a.window_s, None, DEFAULT_ALERT_WINDOW_S)
+    add("alerts.min_count", a.min_count, None, DEFAULT_ALERT_MIN_COUNT)
+    add("alerts.cooldown_s", a.cooldown_s, None, DEFAULT_ALERT_COOLDOWN_S)
+    add("alerts.poll_s", a.poll_s, None, DEFAULT_ALERT_POLL_S)
+    add("alerts.file", a.file, None, "<数据目录>/alerts/alerts.jsonl")
     return rows
+
+
+def alert_rule(cfg: Config):
+    """把 `[alerts]` 合成**一条**生效规则。
+
+    serve 的后台线程与 `onyx alerts test` 都用它：两处各拼一份参数的话，
+    "测试时能发、真出事不发"这种分歧就再也查不动了。
+    每个键都按"`None` 才是没给"处理——`min_count = 0`、`severities = []` 是显式意图，
+    不能悄悄回落默认值（同 `pick()` 的规矩）。
+    """
+    from onyx.obs.alerts.rules import (
+        DEFAULT_ALERT_COOLDOWN_S,
+        DEFAULT_ALERT_MIN_COUNT,
+        DEFAULT_ALERT_POLL_S,
+        DEFAULT_ALERT_SEVERITIES,
+        DEFAULT_ALERT_WINDOW_S,
+        AlertRule,
+    )
+
+    a = cfg.alerts
+    from_file = any(value is not None for value in (
+        a.enabled, a.severities, a.codes, a.exclude_codes, a.window_s, a.min_count,
+        a.cooldown_s, a.poll_s, a.file,
+    ))
+    return AlertRule(
+        severities=DEFAULT_ALERT_SEVERITIES if a.severities is None else a.severities,
+        codes=a.codes or (),
+        exclude_codes=a.exclude_codes or (),
+        window_s=DEFAULT_ALERT_WINDOW_S if a.window_s is None else a.window_s,
+        min_count=DEFAULT_ALERT_MIN_COUNT if a.min_count is None else a.min_count,
+        cooldown_s=DEFAULT_ALERT_COOLDOWN_S if a.cooldown_s is None else a.cooldown_s,
+        poll_s=DEFAULT_ALERT_POLL_S if a.poll_s is None else a.poll_s,
+        enabled=True if a.enabled is None else a.enabled,
+        source="file" if from_file else "default",
+    )
+
+
+def alert_file_path(cfg: Config, data_dir: Path):
+    """文件出口的落点。没配就用数据目录里那个——本地"一定能落"的那条出口。"""
+    from onyx.obs.alerts.channels import default_alert_path
+
+    return Path(cfg.alerts.file) if cfg.alerts.file else default_alert_path(data_dir)
+
+
+def alert_channels(cfg: Config, data_dir: Path) -> list:
+    """装配出口。没配的渠道**不装**，而不是装一个"什么都不发"的渠道：
+    后者会让 `alerts ls` 显示"有出口"，而它从来没成功投递过任何东西。
+    """
+    from onyx.obs.alerts.channels import FileChannel
+
+    channels: list = []
+    if alert_rule(cfg).enabled:
+        channels.append(FileChannel(alert_file_path(cfg, data_dir)))
+    return channels

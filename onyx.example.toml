@@ -56,3 +56,22 @@ port = 8787
 # 事件导出（`onyx.sinks` 注册表里的名字）。命令行的 --sink 会覆盖这里。
 # 例：events = ["jsonl", "otlp"]，OTLP 的端点等参数走各自的环境变量
 events = []
+
+[alerts]
+# 告警只有 `onyx serve` 在跑时才会发：判定读库轮询，不挂在任何一次请求上
+# （在被观测的请求里发外部 HTTP，等于让观测者影响被测）。
+# 出口默认是本地文件 `<数据目录>/alerts/alerts-YYYYMMDD.jsonl`，每次命中与投递结果
+# 同时落一行到库里的 `alert_trigger`，所以"那天到底通知没通知"查得到。
+# 自检：`onyx alerts test`（造一条标了 is_test 的消息走一遍出口）· 历史：`onyx alerts ls`
+# enabled = true
+# 只盯 error 级。warn 级在本地是常态（低置信计数、缓存命中），推给人会训练出"忽略通知"的习惯。
+# severities = ["error"]
+# 想固定盯某几个码就列出来（写不存在的码会在 config show 里看得见，但永远不会命中）
+# codes = ["CONTEXT_OVERFLOW", "ORPHAN_TOOL_CALL", "PROVIDER_ERROR"]
+# 反过来，某个一直刷屏的码可以请出去：
+# exclude_codes = []
+# window_s = 300        # 窗口：数"这段时间里出现了几次"
+# min_count = 1         # 到几次才算事。error 级默认 1 —— 本地评测出事时最需要的是立刻停手
+# cooldown_s = 600      # 同一条码命中后 10 分钟内不再重复：一件事说一遍
+# poll_s = 5.0          # 问一次库的间隔。判据以库里的异常行为准，所以重启不会重复轰炸
+# file = "D:/Projects/Onyx/.data/alerts/alerts.jsonl"

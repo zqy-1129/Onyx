@@ -83,6 +83,28 @@ def test_a_failed_delivery_still_has_a_row(alerts):
     assert alerts.counts_by_status() == {"failed:webhook": 1}
 
 
+def test_counts_by_status_honours_the_since_window(alerts):
+    alerts.insert_trigger(_trigger("old", created_at="2026-10-04T01:00:00+00:00"))
+    alerts.insert_trigger(_trigger("new", created_at="2026-10-05T01:00:00+00:00"))
+    assert alerts.counts_by_status() == {"sent:file": 2}
+    assert alerts.counts_by_status(since="2026-10-05T00:00:00+00:00") == {"sent:file": 1}
+
+
+def test_last_real_trigger_times_come_back_in_one_query(alerts):
+    alerts.insert_trigger(_trigger("a", code="CONTEXT_OVERFLOW",
+                                   created_at="2026-10-05T01:00:00+00:00"))
+    alerts.insert_trigger(_trigger("b", code="CONTEXT_OVERFLOW",
+                                   created_at="2026-10-05T02:00:00+00:00"))
+    alerts.insert_trigger(_trigger("c", code="TOOL_LOOP",
+                                   created_at="2026-10-05T03:00:00+00:00"))
+    alerts.insert_trigger(_trigger("t", code="TOOL_LOOP", is_test=True,
+                                   created_at="2026-10-05T09:00:00+00:00"))
+    assert alerts.last_real_trigger_times() == {
+        "CONTEXT_OVERFLOW": "2026-10-05T02:00:00+00:00",
+        "TOOL_LOOP": "2026-10-05T03:00:00+00:00",
+    }, "取每码最近一次，且测试行不参与"
+
+
 def test_test_rows_stay_out_of_the_real_history(alerts):
     """`alerts test` 造的行不能污染"上次真的通知是什么时候"。"""
     alerts.insert_trigger(_trigger("probe", channel="test", is_test=True,

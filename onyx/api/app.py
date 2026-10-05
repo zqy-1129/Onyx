@@ -61,6 +61,8 @@ def create_app(
     token: str | None = None,
     read_only: bool = False,
     event_sinks: tuple[str, ...] = (),
+    alert_rule: Any = None,
+    alert_channels: tuple[Any, ...] = (),
     cors_origins: tuple[str, ...] = ("http://localhost:5173", "http://127.0.0.1:5173"),
 ) -> FastAPI:
     owns_runtime = runtime is None
@@ -77,8 +79,15 @@ def create_app(
         if orphans:
             log.warning("服务启动时发现 %d 条没跑完的评测，已标为 error：%s",
                         len(orphans), ", ".join(orphans[:5]))
+        if state.alert_service is not None:
+            state.alert_service.start()
+            log.info("告警轮询已启动：出口 %s · 每 %.1fs 问一次库",
+                     ", ".join(c.name for c in state.alert_service.channels),
+                     state.alert_service.poll_s)
         yield
-        # 先停 worker 再关库：反过来会让正在写 grade 的线程对着一个已关闭的连接报错
+        # 先停后台线程再关库：反过来会让正在写的线程对着一个已关闭的连接报错
+        if state.alert_service is not None:
+            state.alert_service.stop()
         state.eval_service.shutdown()
         if owns_runtime:
             resolved.close()
@@ -99,19 +108,21 @@ def create_app(
         install_auth(app, token=token, read_only=read_only)
 
     state = AppState.of(resolved, gpu_lock_path=gpu_lock_path,
-                        gpu_stale_after_s=gpu_stale_after_s)
+                        gpu_stale_after_s=gpu_stale_after_s,
+                        alert_rule=alert_rule, alert_channels=alert_channels)
     # gateway 的事件同时进 SSE 广播
     resolved.events.add(state.broker)
     app.state.onyx = state
     app.state.owns_runtime = owns_runtime
 
-    from onyx.api.routes import evals, fleet, playground, tools, traces
+    from onyx.api.routes import alerts, evals, fleet, playground, tools, traces
 
     app.include_router(fleet.router)
     app.include_router(traces.router)
     app.include_router(playground.router)
     app.include_router(evals.router)
     app.include_router(tools.router)
+    app.include_router(alerts.router)
 
     @app.exception_handler(OnyxError)
     async def _onyx_error(_: Request, exc: OnyxError) -> JSONResponse:

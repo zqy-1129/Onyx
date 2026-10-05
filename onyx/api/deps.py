@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from fastapi import Request
 
 from onyx.api.sse import SseBroker
 from onyx.eval.gpu_lock import GpuLock, default_lock_path
 from onyx.eval.service import EvalService
+from onyx.obs.alerts.service import AlertService
 from onyx.runtime import Runtime
 from onyx.store.repos import ModelRepo, TraceRepo, UsageRepo
 
@@ -28,12 +31,16 @@ class AppState:
     #: 界面发起的评测走这条进程内单飞队列（S23）。它用的是**同一把锁的路径**，
     #: 所以"看板发起的评测"与"CLI 发起的评测"照样互斥——只是本进程内再多排一层队。
     eval_service: EvalService
+    #: 告警轮询（S27）。`None` = 这个进程没被装配成会发通知——
+    #: 判不出来就装作"有出口"，会让人以为没收到通知是网络问题。
+    alert_service: Any = None
 
     @classmethod
     def of(
         cls, runtime: Runtime, broker: SseBroker | None = None,
         *, gpu_lock_path: Path | str | None = None,
         gpu_stale_after_s: float | None = None,
+        alert_rule: Any = None, alert_channels: Sequence[Any] = (),
     ) -> AppState:
         from onyx.eval.gpu_lock import DEFAULT_GPU_STALE_AFTER_S
 
@@ -58,6 +65,10 @@ class AppState:
                 runtime.gateway, runtime.db,
                 gpu_lock_path=lock.path, gpu_stale_after_s=lock.stale_after_s,
             ),
+            # 规则与出口都由装配层（cli serve）注入：deps 不读全局配置文件，
+            # 否则测试里 create_app(...) 会悄悄往自己的临时目录写通知
+            alert_service=(AlertService(runtime.db, rule=alert_rule, channels=alert_channels)
+                           if alert_rule is not None else None),
         )
 
 

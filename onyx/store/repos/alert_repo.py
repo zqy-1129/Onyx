@@ -80,6 +80,18 @@ class AlertRepo:
         )
         return str(rows[0]["created_at"]) if rows else None
 
+    def last_real_trigger_times(self) -> dict[str, str]:
+        """所有 code 的"上次真的投过"，一次查询拿完。
+
+        轮询每几秒跑一次，逐 code 查会把一次判定变成二十几次查询；
+        这张表本来就不大，GROUP BY 更便宜也更诚实。
+        """
+        rows = self.db.query(
+            "SELECT code, MAX(created_at) AS at FROM alert_trigger "
+            "WHERE is_test=0 GROUP BY code"
+        )
+        return {str(r["code"]): str(r["at"]) for r in rows if r["at"]}
+
     def counts_by_status(self, *, since: str | None = None) -> dict[str, int]:
         sql = "SELECT status, channel, COUNT(*) AS n FROM alert_trigger WHERE is_test=0"
         params: Sequence[object] = ()
