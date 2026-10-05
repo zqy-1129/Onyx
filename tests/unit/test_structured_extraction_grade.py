@@ -46,6 +46,13 @@ def _cases() -> list[dict[str, Any]]:
             "tags": ["template"], "meta": {},
         },
         {
+            "id": "pos-3", "ord": 3, "kind": "single",
+            "input": {"text": "陈杰在杭州预约维修。"},
+            "expect": {"fields": {"person": "陈杰", "place": "杭州", "event": "预约维修"},
+                       "keys": ["event", "person", "place"]},
+            "tags": ["template"], "meta": {},
+        },
+        {
             "id": "neg-1", "ord": 2, "kind": "none",
             "input": {"text": "今天天气不错，适合出去走走。"},
             "expect": {"fields": {}, "keys": []}, "tags": ["none"], "meta": {},
@@ -230,6 +237,22 @@ def test_score_ci_is_the_same_statistic_as_score():
     assert ci["low_confidence"] is True
 
 
+def test_no_schema_check_ran_means_schema_verified_is_unknown():
+    """一条都没走到 schema 检查时，`schema_verified` 必须是 None 而不是 True。
+
+    "没校验过"与"校验过且通过"在界面上都只有一位布尔，
+    把它们混起来等于把 jsonschema 缺席或格式全坏伪装成合规（DESIGN §9.4 / 未知≠0）。
+    """
+    task = _task()
+    case = _case("pos-1")
+    aggregate = task.aggregate(_grades(
+        task.grade(case, _gen("这不是 JSON")),
+        task.grade(case, _gen("抱歉，我无法处理。")),
+    ))
+    assert aggregate["json_valid_rate"] == 0.0
+    assert aggregate["schema_verified"] is None, "没做过 schema 校验，不许报「真校验过」"
+
+
 def test_engine_errors_leave_the_capability_denominator():
     task = _task()
     pos = _case("pos-1")
@@ -281,5 +304,44 @@ def test_system_prompt_declares_the_required_fields_of_this_case():
     neg = task.build(_case("neg-1")).messages[0].content
     for name in FIELDS:
         assert name in pos
-    assert "空对象" in neg and "amount" not in neg.split("必须包含的字段")[1].split("；")[0]
+    assert "空对象" in neg
+    assert neg.split("必须包含的字段")[1].split("。")[0] == "：（无，输出空对象即可）"
     assert task.build(_case("pos-1")).thinking is False
+
+
+def test_json_number_style_is_not_an_extraction_error():
+    """`500` 与 `500.0` 是同一笔钱：按字符串比会把 JSON 写法算成抽错。
+
+    真机第一跑 amount 的字段级 EM 只有 0.211（19 条），
+    逐条看下去大部分掉分的正是写成整数的 500 / 1500。
+    """
+    task = _task()
+    grade = task.grade(_case("pos-1"), _gen(_dump(dict(FIELDS, amount=500))))
+    assert grade.verdict is Verdict.CORRECT and grade.score == 1.0
+
+
+def test_a_string_amount_is_still_wrong():
+    """放宽只针对写法：`"500元"` 单位没去掉，是真的没抽对（schema 那一层先拦下）。"""
+    grade = _task().grade(_case("pos-1"), _gen(_dump(dict(FIELDS, amount="500元"))))
+    assert grade.metrics["schema_valid"] is False and "amount" in grade.error
+
+
+def test_made_up_event_word_is_marked_out_of_vocabulary():
+    """造词与"选错了另一个类别"分开计：修法一个是提示词与词表说明，一个是模型分不清。"""
+    case = _case("pos-3")
+    fields = dict(case.expect["fields"], event="修电脑")
+    grade = _task().grade(case, _gen(_dump(fields)))
+    assert grade.out_of_set is True
+    assert grade.metrics["off_vocabulary"] == ["event"]
+    assert grade.verdict is not Verdict.CORRECT
+
+    aggregate = _task().aggregate([grade])
+    assert aggregate["off_vocabulary_rate"] == 1.0
+    assert aggregate["schema_valid_rate"] == 1.0, "结构与词表是两个维度，不许挤在一起"
+
+
+def test_in_vocab_event_is_not_marked_out_of_set():
+    case = _case("pos-3")
+    grade = _task().grade(case, _gen(_dump(case.expect["fields"])))
+    assert grade.out_of_set is False and grade.verdict is Verdict.CORRECT
+    assert _task().aggregate([grade])["off_vocabulary_rate"] == 0.0

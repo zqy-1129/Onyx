@@ -167,13 +167,13 @@ def test_the_exam_provenance_lands_with_the_run(env):
 
     record = EvalRepo(env[0]).get_dataset(report.dataset_id)
     assert report.dataset_id == "structured_ie-v1"
-    assert report.dataset_revision == "seed=20261003", (
+    assert report.dataset_revision == "seed=20261003+anchor=2026-03-01", (
         "跑完的 report 不带考卷来历，进程内调用方就只能去库里再查一遍——"
         "而字段声明的就是「每个结果都要能回答这是哪份数据考出来的」"
     )
     assert record is not None
     assert record.id == "structured_ie-v1"
-    assert record.revision == "seed=20261003"
+    assert record.revision == "seed=20261003+anchor=2026-03-01"
     assert record.license == "generated-in-repo"
     assert record.splits["none"] == 5 and record.splits["hard"] == 4
     stored = EvalRepo(env[0]).get_run(report.run_id)

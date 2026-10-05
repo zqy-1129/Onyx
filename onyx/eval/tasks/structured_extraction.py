@@ -29,6 +29,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
+from datetime import date, timedelta
 from typing import Any
 
 from onyx.core.types import (
@@ -42,7 +43,12 @@ from onyx.core.types import (
     TraceContext,
     TracePurpose,
 )
-from onyx.eval.datasets.builtin.structured_ie import FIELD_TYPES, schema_for
+from onyx.eval.datasets.builtin.structured_ie import (
+    ANCHOR,
+    FIELD_TYPES,
+    VALUE_VOCAB,
+    schema_for,
+)
 from onyx.eval.datasets.loader import Dataset
 from onyx.eval.graders.json_schema import check_schema, field_em, parse_json
 from onyx.eval.metrics import (
@@ -59,9 +65,35 @@ SYSTEM_PROMPT = (
     "从用户给的中文句子里抽取结构化信息。\n"
     "只输出一个 JSON 对象，不要输出解释、前后缀或代码围栏。\n"
     "只允许这些字段：{fields}。\n"
-    "必须包含的字段：{required}；字段值必须来自原句，不要改写。\n"
+    "必须包含的字段：{required}。\n"
+    "{values}"
     "句子里没有可抽取的信息时，输出 {{}}（一个空对象），不要编造字段。"
 )
+
+#: 每个字段的取值口径。**必须写进提示词**：真机跑第一次时发现，原 prompt 只说
+#: "字段值必须来自原句，不要改写"，而期望值却是 ISO 日期与纯数值——
+#: 于是 `date` 的字段级 EM 是 **0.000（15 条全错）**：模型照原句抄了「3 月 4 号」，
+#: 我们却要求 `2026-03-04`。那不是模型不会抽，是考卷没说清答题格式，
+#: 而分数看起来完全像是能力问题（DESIGN §9.4 防的就是这种误读）。
+#: 归一化本身仍是可判定的要求：中文数字换算与相对日期换算都留着，因为它们是真的能力项。
+def _value_rules() -> str:
+    vocabulary = "".join(
+        f"「{name}」的取值只能是：{'、'.join(values)}。\n"
+        for name, values in VALUE_VOCAB.items()
+    )
+    anchor = date.fromisoformat(ANCHOR)
+    tomorrow = (anchor + timedelta(days=1)).isoformat()
+    return (
+        "人名、机构、地点、事件照原句抄写，不要改写、不要加标点。\n"
+        + vocabulary
+        + f"日期输出 YYYY-MM-DD；句中的相对说法按锚定日 {ANCHOR} 换算，"
+        f"例如该日的「明天」是 {tomorrow}。\n"
+        "金额只输出数值，不带单位、引号与千分位；中文数字要换算成阿拉伯数字，"
+        "例如「三千二」是 3200。\n"
+    )
+
+
+VALUE_RULES = _value_rules()
 
 #: 拒答的本地形态。与 intent 任务各写一份是刻意的：这是一段面向中文措辞的启发式清单，
 #: 抽成公共常量会让两个任务被迫共用同一份判定阈值
@@ -79,7 +111,7 @@ class StructuredExtraction:
         "n_total", "n_attributable", "n_judged", "verdicts",
         "score", "score_ci", "field_em", "field_em_ci", "exact_object_rate",
         "json_valid_rate", "schema_valid_rate", "schema_verified",
-        "format_valid_rate", "invalid_format_rate", "refusal_rate",
+        "format_valid_rate", "invalid_format_rate", "off_vocabulary_rate", "refusal_rate",
         "none_total", "none_correct_rate", "hallucinated_fields",
         "per_field", "k", "pass_hat_k", "pass_at_k", "stability_gap",
         "low_confidence", "scoring",
@@ -193,11 +225,17 @@ class StructuredExtraction:
         compared = field_em(expected, actual)
         matched, total = int(compared["matched"]), int(compared["total"])
         all_ok = matched == total and not compared["unexpected"]
+        # 值落在词表之外是**幻觉**，与"抽了另一个在表里的值"是两种病：
+        # 前者改词表说明与"不要改写"，后者才是分不清类别（与 out_of_label 同一条理由）
+        off = sorted(
+            name for name, allowed in VALUE_VOCAB.items()
+            if name in expected and actual.get(name) not in allowed
+        )
         return Grade(
             case_id=case.id, score=float(compared["score"] or 0.0),
             verdict=(Verdict.CORRECT if all_ok
                      else Verdict.PARTIAL if matched else Verdict.WRONG),
-            passed=all_ok, invalid_format=not clean,
+            passed=all_ok, invalid_format=not clean, out_of_set=bool(off),
             metrics={
                 "expected_keys": list(keys), "expected": expected, "predicted": actual,
                 "json_valid": True, "schema_valid": True,
@@ -205,6 +243,7 @@ class StructuredExtraction:
                 "field_matched": matched, "field_total": total,
                 "per_field_ok": compared["per_field"],
                 "missing": compared["missing"], "unexpected": compared["unexpected"],
+                "off_vocabulary": off,
                 "text": text[:200],
             },
         )
@@ -254,6 +293,7 @@ class StructuredExtraction:
                 "n": len(usable),
             }
 
+        checked = [g for g in attributable if "schema_verified" in g.metrics]
         by_case: dict[str, list[bool]] = {}
         for grade in attributable:
             if grade.passed is not None:
@@ -282,12 +322,19 @@ class StructuredExtraction:
             "schema_valid_rate": rate(
                 sum(1 for g in attributable if g.metrics.get("schema_valid")), len(attributable)),
             # jsonschema 缺席时退化成"只查 required 与顶层类型"，
-            # 那只能报"没发现问题"，不能报"合规"——这一位就是用来戳穿这种混淆的
-            "schema_verified": all(g.metrics.get("schema_verified", True) for g in attributable),
+            # 那只能报"没发现问题"，不能报"合规"——这一位就是用来戳穿这种混淆的。
+            # 一条都没走到 schema 检查时是 None（未知）：格式全坏的 run
+            # 不许把"没校验过"显示成"校验过且通过"
+            "schema_verified": (
+                all(g.metrics["schema_verified"] for g in checked) if checked else None
+            ),
             "format_valid_rate": rate(
                 sum(1 for g in attributable if not g.invalid_format), len(attributable)),
             "invalid_format_rate": rate(
                 sum(1 for g in attributable if g.invalid_format), len(attributable)),
+            # 值不在词表里（"退款申请"而不是"退款"）：这是造词，与"选错了类别"分开计
+            "off_vocabulary_rate": rate(
+                sum(1 for g in attributable if g.out_of_set), len(attributable)),
             "refusal_rate": rate(counts.get(Verdict.REFUSED.value, 0), n),
             "none_total": len(negatives),
             "none_correct_rate": rate(none_ok, len(negatives)),
@@ -306,7 +353,7 @@ class StructuredExtraction:
     def _system_text(self, keys: Sequence[str]) -> str:
         fields = "、".join(f"{name}:{FIELD_TYPES[name]}" for name in FIELD_TYPES)
         required = "、".join(sorted(keys)) if keys else "（无，输出空对象即可）"
-        return SYSTEM_PROMPT.format(fields=fields, required=required)
+        return SYSTEM_PROMPT.format(fields=fields, required=required, values=VALUE_RULES)
 
 
 def _is_clean_json_object(text: str) -> bool:

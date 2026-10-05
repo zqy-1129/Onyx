@@ -2825,6 +2825,7 @@ _REPORT_METRICS = (
     ("out_of_label_rate", "格式"), ("hallucinated_tool_rate", "格式"),
     ("parse_fail_rate", "格式"),
     ("json_valid_rate", "格式"), ("schema_valid_rate", "格式"),
+    ("off_vocabulary_rate", "格式"),
     ("pass_hat_k", "稳定性"), ("pass_at_k", "稳定性"), ("stability_gap", "稳定性"),
 )
 

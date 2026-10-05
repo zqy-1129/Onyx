@@ -301,6 +301,21 @@ def test_field_em_reports_per_field_results():
     assert field_em({}, {"a": 1})["score"] is None
 
 
+def test_field_em_compares_numbers_as_numbers():
+    """`500` 与 `500.0` 是同一笔钱。
+
+    按字符串比会把 JSON 的写法差异算成抽取错误：真实跑一次时 amount 的
+    字段级 EM 只有 0.211，逐条看下去大部分掉的正是写成整数的 500 / 1500。
+    """
+    assert field_em({"amount": 500.0}, {"amount": 500})["matched"] == 1
+    assert field_em({"amount": 12800.0}, {"amount": 12800})["per_field"]["amount"] is True
+    # 但"单位没去掉"仍然是错：放宽只针对写法，不针对内容
+    assert field_em({"amount": 500.0}, {"amount": "500元"})["matched"] == 0
+    assert field_em({"amount": 500.0}, {"amount": 501.0})["matched"] == 0
+    # bool 不许被当成数值：`True == 1` 是最经典的假匹配
+    assert field_em({"flag": True}, {"flag": 1})["matched"] == 0
+
+
 # ── set_match ─────────────────────────────────────────────────────
 def test_set_match_hand_computed():
     result = set_match(["a", "b", "c"], ["b", "c", "d"])

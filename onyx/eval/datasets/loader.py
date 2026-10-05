@@ -312,11 +312,12 @@ _BUILTIN: dict[str, dict[str, Any]] = {
     },
     "structured_ie": {
         "build": _build_structured_ie,
-        # revision 必须写生成参数而不是版本号：期望值随 seed 变，
-        # 而"同一份数据换了内容"这件事只能靠 revision 变化在两次分数之间被发现
-        "revision": "seed=20261003",
+        # revision 写的是**决定期望值的全部参数**（seed + 锚定日），而不是版本号：
+        # 条数不变、内容变了的修正是最常见的"两个分数其实不可比"，
+        # 光看 `seed=20261003` 会发现不了这件事。改生成器就必须改这一行。
+        "revision": "seed=20261003+anchor=2026-03-01",
         "notes": "生成器：模板槽位轮换 + 人工难例（中文数字/相对日期/多主体）+ 无可抽取负样本；"
-                 "见 onyx/eval/datasets/builtin/structured_ie.py",
+                 "相对日期的期望值由锚定日算出；见 onyx/eval/datasets/builtin/structured_ie.py",
     },
 }
 

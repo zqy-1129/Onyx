@@ -178,9 +178,7 @@ def _type_ok(value: Any, declared: str) -> bool:
 
 def field_em(expected: Mapping[str, Any], actual: Mapping[str, Any]) -> dict[str, Any]:
     """字段级精确匹配率。返回逐字段结果，便于定位到底哪个字段总是错。"""
-    from onyx.eval.graders.exact import exact
-
-    per_field = {name: exact(want, actual.get(name)) for name, want in expected.items()}
+    per_field = {name: _field_ok(want, actual.get(name)) for name, want in expected.items()}
     matched = sum(1 for ok in per_field.values() if ok)
     return {
         "per_field": per_field,
@@ -190,3 +188,20 @@ def field_em(expected: Mapping[str, Any], actual: Mapping[str, Any]) -> dict[str
         "missing": sorted(name for name in expected if name not in actual),
         "unexpected": sorted(name for name in actual if name not in expected),
     }
+
+
+def _field_ok(want: Any, got: Any) -> bool:
+    """单个字段的比较。数值字段按**数值**比。
+
+    `500` 与 `500.0` 是同一笔钱：按字符串比会把 JSON 的写法差异算成抽取错误，
+    而真实跑一次就是这样——qwen3.5:9b 的 amount 有 19 条可判定样本，
+    按字符串比只有 4 条对，其中大部分掉的正是写成整数的 500 / 1500。
+    反过来，`"500元"` 不算对：单位没去掉是真的没抽对（那一层由 schema 先拦）。
+    """
+    from onyx.eval.graders.exact import exact, numeric
+
+    if isinstance(want, bool) or isinstance(got, bool):
+        return exact(want, got)
+    if isinstance(want, int | float) and isinstance(got, int | float):
+        return numeric(want, got)
+    return exact(want, got)

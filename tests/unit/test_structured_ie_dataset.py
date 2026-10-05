@@ -26,6 +26,7 @@ from onyx.eval.datasets.builtin.structured_ie import (
     ORGS,
     PERSONS,
     PLACES,
+    VALUE_VOCAB,
     build_cases,
     schema_for,
     stats,
@@ -33,6 +34,7 @@ from onyx.eval.datasets.builtin.structured_ie import (
 )
 from onyx.eval.datasets.loader import load_builtin
 from onyx.eval.graders.json_schema import check_schema
+from onyx.eval.tasks import build_task
 
 
 def test_same_seed_reproduces_the_same_cases():
@@ -179,6 +181,37 @@ def test_hard_cases_are_tagged_and_carry_their_note():
     ).isoformat(), "句中有两个相对时间时取第一个（昨天），不是取最后一个"
 
 
+def test_event_values_stay_inside_the_declared_vocabulary():
+    """词表是提示词的一部分：期望值落在词表外，模型照词表输出反而被判错。"""
+    vocab = set(VALUE_VOCAB["event"])
+    offenders = [
+        (case["id"], fields["event"])
+        for case in build_cases()
+        for fields in [case["expect"]["fields"]]
+        if "event" in fields and fields["event"] not in vocab
+    ]
+    assert not offenders, f"期望值不在词表里: {offenders[:3]}"
+    # 词表必须真的出现在提示词里，否则它只是数据模块里的一段死代码
+    task = build_task("structured_extraction", model="mock/x")
+    prompt = task.build(next(c for c in task.load() if "event" in c.expect["fields"])).messages[0].content
+    assert all(value in prompt for value in vocab), "提示词没把 event 的取值给出来"
+
+
+def test_prompt_declares_the_normalization_the_grader_demands():
+    """期望值要求 ISO 日期与纯数值，提示词就必须这么说。
+
+    真机第一次跑：`date` 的字段级 EM 是 0.000（15 条全错），
+    因为模型照原句抄了「3 月 4 号」而我们要求 `2026-03-04`——
+    那时旧提示词写的恰恰是"字段值必须来自原句，不要改写"。
+    考卷没说清答题格式，分数却长得像能力问题。
+    """
+    task = build_task("structured_extraction", model="mock/x")
+    prompt = task.build(next(c for c in task.load() if "date" in c.expect["fields"])).messages[0].content
+    assert "YYYY-MM-DD" in prompt and ANCHOR in prompt
+    assert "只输出数值" in prompt and "千分位" in prompt
+    assert "不要改写" in prompt
+
+
 def test_every_field_has_enough_denominator():
     """字段分布可见：只有 person 抽得准时，单一总分说不清哪里坏了。"""
     cases = build_cases()
@@ -210,6 +243,6 @@ def test_load_builtin_carries_the_exam_provenance():
     dataset = load_builtin("structured_ie")
     assert dataset.id == "structured_ie-v1"
     assert dataset.upstream == "builtin:structured_ie"
-    assert dataset.revision == "seed=20261003"
+    assert dataset.revision == "seed=20261003+anchor=2026-03-01"
     assert dataset.loader == "builtin.structured_ie"
     assert dataset.license == "generated-in-repo"

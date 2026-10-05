@@ -43,6 +43,7 @@ def _next_week_day(iso_weekday: int) -> str:
     """下一个 ISO 周（周一是首日）里指定星期几的那天。0=周一。"""
     return _offset(7 - _ANCHOR_DAY.weekday() + iso_weekday)
 
+
 PERSONS = ("张伟", "李娜", "王芳", "陈杰", "赵敏", "周立")
 ORGS = ("支付宝", "招商银行", "国家电网", "美团", "腾讯客服")
 PLACES = ("北京", "上海", "广州", "深圳", "杭州", "成都")
@@ -122,6 +123,11 @@ FIELD_TYPES: dict[str, str] = {
     "person": "string", "org": "string", "place": "string",
     "event": "string", "amount": "number", "date": "string",
 }
+
+#: 取值是封闭集合的字段：提示词必须把词表给出来，否则"事件抽错"测的是猜词而不是抽取
+#: （与 intent 任务必须声明标签集同一条理由）。词表与 `EVENTS` 同源，
+#: 所以期望值一定落在集合内——否则考卷自己就不合规
+VALUE_VOCAB: dict[str, tuple[str, ...]] = {"event": EVENTS}
 
 
 def schema_for(keys: Sequence[str]) -> dict[str, Any]:
