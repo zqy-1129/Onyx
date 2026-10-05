@@ -2812,6 +2812,10 @@ def eval_run(
 _REPORT_METRICS = (
     ("macro_f1", "内容"), ("accuracy", "内容"), ("balanced_accuracy", "内容"),
     ("must_call_acc", "内容"),
+    # 结构化抽取的四个内容口径：score 只数结构合规的样本，exact_object_rate 是端到端严格值，
+    # none_correct_rate 单看负样本（少抽/多抽在这里才看得见）
+    ("score", "内容"), ("field_em", "内容"), ("exact_object_rate", "内容"),
+    ("none_correct_rate", "内容"),
     ("hit_at_1", "选择"), ("set_f1", "选择"),
     ("no_call_rate", "选择"), ("wrong_tool_rate", "选择"),
     ("false_call_rate", "选择"), ("refusal_rate", "选择"),
@@ -2820,6 +2824,7 @@ _REPORT_METRICS = (
     ("format_valid_rate", "格式"), ("invalid_format_rate", "格式"),
     ("out_of_label_rate", "格式"), ("hallucinated_tool_rate", "格式"),
     ("parse_fail_rate", "格式"),
+    ("json_valid_rate", "格式"), ("schema_valid_rate", "格式"),
     ("pass_hat_k", "稳定性"), ("pass_at_k", "稳定性"), ("stability_gap", "稳定性"),
 )
 

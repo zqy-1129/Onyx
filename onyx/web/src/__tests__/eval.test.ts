@@ -44,6 +44,8 @@ describe('主分数选择', () => {
     // "模型得了 0 分"——两者的修法完全相反
     expect(headlineOf({ macro_f1: null, pass_hat_k: 0.4 })).toEqual({ key: 'macro_f1', value: null })
     expect(headlineOf({ must_call_acc: 0.639 })).toEqual({ key: 'must_call_acc', value: 0.639 })
+    // 主分数让位给稳定性指标，等于把"对不对"藏起来只报"稳不稳"（与后端 HEADLINE_METRICS 同序）
+    expect(headlineOf({ score: 0.667, pass_hat_k: 0.5 })).toEqual({ key: 'score', value: 0.667 })
     expect(headlineOf({})).toBeNull()
   })
 

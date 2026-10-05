@@ -15,8 +15,9 @@ import { EvalLaunchPanel, type ResumeTarget } from './EvalLaunch'
 import { THIN_COVERAGE } from './EvalMatrix'
 
 /** 主分数：按与后端 HEADLINE_METRICS 相同的优先级挑第一个出现过的键。
- *  取"出现过"而不是"非空"——值为 null 表示未定义，它仍然是这个任务的主分数。 */
-const HEADLINE = ['macro_f1', 'accuracy', 'must_call_acc', 'pass_hat_k', 'score']
+ *  取"出现过"而不是"非空"——值为 null 表示未定义，它仍然是这个任务的主分数。
+ *  `score` 排在 `pass_hat_k` 之前：稳定性指标不许顶掉任务自己的主分数。 */
+const HEADLINE = ['macro_f1', 'accuracy', 'must_call_acc', 'score', 'pass_hat_k']
 
 export function headlineOf(aggregate: Record<string, unknown>): { key: string; value: number | null } | null {
   for (const key of HEADLINE) {

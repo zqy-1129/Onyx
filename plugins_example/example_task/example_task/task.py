@@ -6,8 +6,8 @@
    记录——"没分数"与"跑了但 0 分"必须可区分（DESIGN §9.1）。
 2. **`metric_names` 与 `aggregate` 同源**：声明了却产不出的指标，在界面上和
    "这项能力 0 分"长得一模一样（UI_DESIGN R2）。内核的
-   `tests/unit/test_tool_selection_grade.py::test_declared_metric_names_are_actually_produced`
-   对内置任务断言的就是这条；契约测试对插件跑同一条。
+   `tests/contract/test_task_contract.py::test_declared_metrics_are_exactly_produced`
+   对**每一个注册任务**（内置与插件一起参数化）断言的就是这条。
 3. **内容与格式正交**：`verdict` 只管答得对不对，`invalid_format` 只管听不听话
    （DESIGN §9.4）。本地小模型这两类错误极常见，混成一个正确率就会把格式问题
    误读成能力问题。

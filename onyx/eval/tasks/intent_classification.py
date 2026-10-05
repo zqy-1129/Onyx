@@ -74,10 +74,16 @@ class IntentClassification:
     #: 纯文本分类不需要 tools / structured_output；声明为空集，
     #: 这样任何 provider 都能跑，`check_capabilities` 永远不会 skip
     requires: frozenset[Cap] = frozenset()
+    #: 与 `aggregate()` 的键**完全一致**（tests/contract/test_task_contract.py 双向断言）。
+    #: 少声明一个，看板就少一列可解释的分母；多声明一个，那一列永远是「—」，
+    #: 而「—」与"这项 0 分"在界面上长得一模一样。
     metric_names = (
         "macro_f1", "macro_f1_ci", "accuracy", "balanced_accuracy",
+        "per_class_f1", "top_confusions", "confusion", "labels",
         "format_valid_rate", "out_of_label_rate", "invalid_format_rate", "refusal_rate",
-        "per_class_f1", "top_confusions", "pass_hat_k", "pass_at_k", "stability_gap",
+        "pass_hat_k", "pass_at_k", "stability_gap", "k",
+        "n_total", "n_attributable", "n_judged", "verdicts",
+        "low_confidence", "scoring",
     )
 
     def __init__(

@@ -291,6 +291,12 @@ def _build_tool_calls_zh():
     return build_cases()
 
 
+def _build_structured_ie():
+    from onyx.eval.datasets.builtin.structured_ie import build_cases
+
+    return build_cases()
+
+
 #: 内置数据集登记表。加一个数据集只需要在这里加一行 + 一个生成器模块
 _BUILTIN: dict[str, dict[str, Any]] = {
     "intent_zh": {
@@ -303,6 +309,14 @@ _BUILTIN: dict[str, dict[str, Any]] = {
         "revision": "seed=20261003",
         "notes": "手写工具调用样本，含 no_call_needed 子集；"
                  "见 onyx/eval/datasets/builtin/tool_calls_zh.py",
+    },
+    "structured_ie": {
+        "build": _build_structured_ie,
+        # revision 必须写生成参数而不是版本号：期望值随 seed 变，
+        # 而"同一份数据换了内容"这件事只能靠 revision 变化在两次分数之间被发现
+        "revision": "seed=20261003",
+        "notes": "生成器：模板槽位轮换 + 人工难例（中文数字/相对日期/多主体）+ 无可抽取负样本；"
+                 "见 onyx/eval/datasets/builtin/structured_ie.py",
     },
 }
 

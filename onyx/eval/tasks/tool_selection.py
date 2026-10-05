@@ -70,13 +70,16 @@ class ToolSelection:
     #: 需要原生工具调用能力。不支持时**必须 skip 并写明原因**，
     #: 不做隐式降级——用提示词模拟出来的分数无法与原生支持比较，却看不出区别
     requires: frozenset[Cap] = frozenset({Cap.TOOLS})
+    #: 与 `aggregate()` 的键完全一致，理由见 intent_classification 的同名注释
     metric_names = (
         "must_call_acc", "must_call_acc_ci", "no_call_rate", "false_call_rate",
-        "wrong_tool_rate",
+        "wrong_tool_rate", "hallucinated_tool_rate",
         "hit_at_1", "set_precision", "set_recall", "set_f1",
-        "hallucinated_tool_rate", "parse_fail_rate",
         "args_exact_rate", "args_subset_rate", "args_field_rate", "args_relaxed_share",
-        "pass_hat_k", "pass_at_k", "stability_gap", "by_kind",
+        "args_match_kinds", "by_kind", "parse_fail_rate",
+        "pass_hat_k", "pass_at_k", "stability_gap", "k",
+        "n_total", "n_attributable", "n_must_call", "n_no_call_needed",
+        "n_bootstrap_units", "verdicts", "low_confidence", "scoring",
     )
 
     def __init__(

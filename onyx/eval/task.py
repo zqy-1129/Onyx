@@ -159,7 +159,9 @@ def check_capabilities(task: EvalTask, caps: Iterable[Cap]) -> Skip | None:
 
 #: 主分数（headline）候选，按优先级。列表页、矩阵、导出报告**共用这一份**：
 #: 同一个 run 在不同界面显示不同的"头号分数"会让人怀疑所有数字。
-HEADLINE_METRICS = ("macro_f1", "accuracy", "must_call_acc", "pass_hat_k", "score")
+#: `score`（任务自己声明的主分数）排在 `pass_hat_k` 之前：后者是**稳定性**指标，
+#: 把它当主分数等于用"稳不稳"顶掉"对不对"——新任务一旦同时产出两者就会显示错那一列。
+HEADLINE_METRICS = ("macro_f1", "accuracy", "must_call_acc", "score", "pass_hat_k")
 
 
 def headline_of(aggregate: dict[str, Any]) -> tuple[str, Any] | None:

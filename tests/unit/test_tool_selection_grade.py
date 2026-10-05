@@ -26,7 +26,7 @@ from onyx.core.types import (
 from onyx.eval.datasets.builtin.tool_calls_zh import TOOLS, _tool_spec
 from onyx.eval.datasets.loader import Dataset
 from onyx.eval.task import Case, Verdict, check_capabilities
-from onyx.eval.tasks import build_task, task_ids
+from onyx.eval.tasks import BUILTIN_TASKS, build_task, task_ids
 from onyx.eval.tasks.tool_selection import ToolSelection
 
 TOOL_NAMES = tuple(TOOLS)
@@ -487,8 +487,14 @@ def test_skip_reason_says_what_would_be_needed():
     assert skip.as_grade().verdict is Verdict.SKIPPED
 
 
-def test_registry_lists_both_tasks():
-    assert task_ids() == ("intent_classification", "tool_selection")
+def test_registry_lists_every_builtin_task():
+    """注册表按 id 排序列出全部内置任务。
+
+    对着 `BUILTIN_TASKS` 断言而不是写死两个名字：新增任务时这条不该失败，
+    它该失败的是"新任务没被契约测试覆盖"（那条在 tests/contract/test_task_contract.py）。
+    """
+    assert task_ids() == tuple(sorted(BUILTIN_TASKS))
+    assert "tool_selection" in task_ids() and "structured_extraction" in task_ids()
 
 
 def test_builtin_dataset_covers_every_kind_and_keeps_the_dangerous_tool_present():
@@ -559,16 +565,3 @@ def _repeated_grades(cases: int, *, k: int = 3):
                                        "arguments": {"city": "北京"}},)))
         out.extend(replace(grade, case_id=case.id, seq=seq) for seq in range(k))
     return out
-
-
-@pytest.mark.parametrize("task_id", sorted({"intent_classification", "tool_selection"}))
-def test_declared_metric_names_are_actually_produced(task_id):
-    """`metric_names` 是 UI 与报表的契约：声明了却产不出，那一列就永远是「—」。
-
-    这类漂移不报错也不崩溃，只是让一个指标看起来"一直未知"，
-    而它和"这项能力 0 分"在界面上长得一模一样。
-    """
-    task = build_task(task_id, model="mock/x")
-    produced = set(task.aggregate([]))
-    missing = set(task.metric_names) - produced
-    assert not missing, f"{task_id} 声明了但产不出: {sorted(missing)}"
