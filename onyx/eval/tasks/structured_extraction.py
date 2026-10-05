@@ -259,7 +259,8 @@ class StructuredExtraction:
             passed=empty, invalid_format=not clean,
             error="" if empty else f"句中没有可抽取信息，却造出了 {invented}",
             metrics={
-                "expected_keys": [], "json_valid": True, "schema_valid": empty,
+                "expected_keys": [], "expected": {}, "predicted": actual,
+                "json_valid": True, "schema_valid": empty,
                 "schema_verified": True, "hallucinated": invented, "field_total": 0,
                 "text": text[:200],
             },

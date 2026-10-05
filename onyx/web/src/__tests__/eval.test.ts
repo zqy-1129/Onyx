@@ -7,7 +7,7 @@
 import { describe, expect, it } from 'vitest'
 import { statusSymbol } from '../components/primitives'
 import { fmtCi, fmtDelta, fmtScore, deltaTone, UNKNOWN } from '../format'
-import { headlineOf, headlineText, thinNote, verdictBadge } from '../pages/EvalRuns'
+import { gradeValueCell, headlineOf, headlineText, thinNote, verdictBadge, verdictOptions } from '../pages/EvalRuns'
 import { cellIsThin, THIN_COVERAGE } from '../pages/EvalMatrix'
 import { pickRuns, verdictFlips, LOW_PAIRS } from '../pages/Regression'
 import type { MatrixCell, PairedCase, RunView } from '../api/types'
@@ -71,6 +71,32 @@ describe('判定配色', () => {
     expect(verdictBadge('wrong')).toBe('badge badge-warn')
     expect(verdictBadge('bad_args')).toBe('badge badge-warn')
     expect(verdictBadge('skipped')).toBe('badge badge-unknown')
+  })
+})
+
+describe('grade 表的取值与筛选项', () => {
+  it('对象值渲染成 k=v，而不是 [object Object]', () => {
+    // 结构化抽取的期望/预测是字段集合；String(obj) 会让那一列什么都没说
+    expect(gradeValueCell({ person: '张伟', amount: 500 })).toBe('person=张伟 · amount=500')
+    expect(gradeValueCell('转账')).toBe('转账')
+    expect(gradeValueCell(null)).toBe(UNKNOWN)
+    expect(gradeValueCell(undefined)).toBe(UNKNOWN)
+    // 空对象是"句子里没有可抽取信息"这个正确答案，不许显示成「—」
+    expect(gradeValueCell({})).toBe('{}')
+    // 空字符串必须显式画出来：`org=` 后面什么都没有会让人以为渲染坏了，
+    // 而那恰恰是模型"多抽了一个空占位字段"的真实形态
+    expect(gradeValueCell({ org: '' })).toBe('org=""')
+    expect(gradeValueCell(['get_weather', 'send_mail'])).toBe('get_weather · send_mail')
+    expect(gradeValueCell([])).toBe('（空）')
+  })
+
+  it('判定筛选项来自这次运行自己的分布', () => {
+    // 硬编码清单曾经漏掉 partial：45 条里 27 条筛不出来，而界面看起来一切正常
+    const options = verdictOptions({ verdicts: { correct: 30, wrong: 12, partial: 3 } })
+    expect(options.map((o) => o.value)).toEqual(['', 'correct', 'wrong', 'partial'])
+    expect(options[3].label).toBe('partial (3)')
+    expect(verdictOptions(undefined).map((o) => o.value)).toEqual([''])
+    expect(verdictOptions({ verdicts: { error: 0 } }).map((o) => o.value)).toEqual([''])
   })
 })
 

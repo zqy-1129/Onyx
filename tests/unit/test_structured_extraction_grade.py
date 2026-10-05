@@ -171,6 +171,8 @@ def test_negative_case_wants_an_empty_object():
     grade = _task().grade(_case("neg-1"), _gen("{}"))
     assert grade.verdict is Verdict.CORRECT and grade.score == 1.0
     assert grade.metrics["field_total"] == 0 and grade.metrics["hallucinated"] == []
+    # 期望/预测要留着给界面：负样本那两行显示「—」会让人以为这条没判
+    assert grade.metrics["expected"] == {} and grade.metrics["predicted"] == {}
 
 
 def test_inventing_a_field_on_a_negative_case_is_named():

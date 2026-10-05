@@ -204,7 +204,7 @@ export function EvalRunsPage({ selectedRunId }: { selectedRunId?: string }) {
           />
         ) : null}
       </Panel>
-      {active ? <GradesPanel runId={active} /> : null}
+      {active && activeRun ? <GradesPanel run={activeRun} /> : null}
     </>
   )
 }
@@ -225,11 +225,46 @@ export function verdictBadge(verdict: string): string {
   return 'badge badge-neutral'
 }
 
-const VERDICTS = ['', 'correct', 'wrong', 'no_call', 'wrong_tool', 'bad_args', 'invalid_format',
-  'out_of_label', 'hallucinated_tool', 'error', 'skipped']
+/** 「期望 / 预测」两列的取值可能是标量（意图标签、工具名），也可能是对象
+ *  （结构化抽取的字段集合）。直接 `String(obj)` 会渲染成 `[object Object]`——
+ *  那一列于是什么都没说，而"看不出抽了哪些字段"恰恰是这任务最需要看出来的东西。
+ */
+export function gradeValueCell(value: unknown): string {
+  if (value === null || value === undefined) return UNKNOWN
+  if (Array.isArray(value)) {
+    return value.length ? value.map((item) => gradeValueCell(item)).join(' · ') : '（空）'
+  }
+  if (typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>)
+    // 空对象是"没有可抽取信息"这个正确答案本身，必须显示成 {} 而不是「—」
+    if (!entries.length) return '{}'
+    return entries.map(([key, item]) => `${key}=${gradeValueCell(item)}`).join(' · ')
+  }
+  if (typeof value === 'string' && !value) return '""'
+  return String(value)
+}
 
-function GradesPanel({ runId }: { runId: string }) {
+/** 判定筛选项来自**这次运行自己的判定分布**。
+ *  写死一份词表会漏：`partial` 就在硬编码清单之外，
+ *  于是 45 条里有 27 条筛不出来，而界面看起来一切正常。
+ */
+export function verdictOptions(
+  aggregate: Record<string, unknown> | undefined,
+): Array<{ value: string; label: string }> {
+  const counts = (aggregate?.verdicts ?? {}) as Record<string, unknown>
+  const entries = Object.entries(counts)
+    .filter(([, n]) => Number(n) > 0)
+    .sort((a, b) => Number(b[1]) - Number(a[1]) || a[0].localeCompare(b[0]))
+  return [
+    { value: '', label: '全部' },
+    ...entries.map(([verdict, n]) => ({ value: verdict, label: `${verdict} (${n})` })),
+  ]
+}
+
+function GradesPanel({ run }: { run: RunView }) {
+  const runId = run.id
   const [verdict, setVerdict] = useState('')
+  const options = verdictOptions(run.aggregate)
   const grades = useApi<GradeView[]>(
     () => api.evalGrades(runId, { verdict: verdict || null, limit: 500 }),
     { deps: [runId, verdict] },
@@ -247,12 +282,12 @@ function GradesPanel({ runId }: { runId: string }) {
     {
       key: 'expected',
       header: '期望',
-      render: (g) => <span className="mono small">{String(g.metrics.expected ?? UNKNOWN)}</span>,
+      render: (g) => <span className="mono small">{gradeValueCell(g.metrics.expected)}</span>,
     },
     {
       key: 'actual',
       header: '预测',
-      render: (g) => <span className="mono small">{String(g.metrics.predicted ?? g.metrics.actual ?? UNKNOWN)}</span>,
+      render: (g) => <span className="mono small">{gradeValueCell(g.metrics.predicted ?? g.metrics.actual)}</span>,
     },
     {
       key: 'error',
@@ -282,8 +317,8 @@ function GradesPanel({ runId }: { runId: string }) {
         <label className="field">
           <span className="field-label">只看判定</span>
           <select className="select" value={verdict} onChange={(e) => setVerdict(e.target.value)}>
-            {VERDICTS.map((v) => (
-              <option key={v} value={v}>{v || '全部'}</option>
+            {options.map((option) => (
+              <option key={option.value} value={option.value}>{option.label}</option>
             ))}
           </select>
         </label>
