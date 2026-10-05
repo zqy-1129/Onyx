@@ -102,6 +102,22 @@ class EvalRepo:
                                 (dataset_id,))
         return int(row["n"]) if row else 0
 
+    def prune_stale_cases(self, dataset_id: str, keep_ids: Iterable[str]) -> int:
+        """删掉这份数据集里既不属于当前样本集、也**没有被任何 grade 引用**的旧行。
+
+        case id 是内容哈希，所以生成器一改就是一批新 id。旧行全留着，`list_cases` 就会把两个
+        版本的样本混在一起数；旧行乱删，历史分数就点不回它那条样本（这正是"删除数据集"没做的原因）。
+        所以判据是引用完整性，不是"看起来旧"。
+        """
+        keep = [str(case_id) for case_id in keep_ids]
+        where = ["dataset_id=?", "id NOT IN (SELECT case_id FROM grade)"]
+        params: list[object] = [dataset_id]
+        if keep:
+            where.insert(1, f"id NOT IN ({','.join('?' * len(keep))})")
+            params.extend(keep)
+        cursor = self.db.execute(f"DELETE FROM eval_case WHERE {' AND '.join(where)}", tuple(params))
+        return int(cursor.rowcount or 0)
+
     # ── 任务 ──────────────────────────────────────────────────────
     def upsert_task(self, rec: TaskRecord) -> str:
         self.db.execute(

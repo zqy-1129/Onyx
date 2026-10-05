@@ -384,10 +384,18 @@ class EvalRunner:
     # ── 落库前置 ──────────────────────────────────────────────────
     def _ensure_persisted(self) -> None:
         dataset = self.dataset
-        if dataset is not None and self.repo.get_dataset(dataset.id) is None:
+        if dataset is not None:
             dataset_record, cases = dataset.to_records()
-            self.repo.upsert_dataset(dataset_record)
-            self.repo.upsert_cases(cases)
+            existing = self.repo.get_dataset(dataset.id)
+            # 只在"库里没有"时写是不够的：case id 是内容哈希，生成器一改就是一批新 id，
+            # 而 dataset_id 不变。真机踩过——S32 给长上下文加干扰项之后，那轮 9 条 grade
+            # 有一条都点不回自己的样本，`dataset.revision` 还停在旧串。
+            # revision 变了就必须重写；旧样本只删掉**没被任何 grade 引用过**的那些，
+            # 因为历史分数还要靠它们回答"当时考的是哪一份"。
+            if existing is None or existing.revision != dataset.revision:
+                self.repo.upsert_dataset(dataset_record)
+                self.repo.upsert_cases(cases)
+                self.repo.prune_stale_cases(dataset.id, [rec.id for rec in cases])
         self.repo.upsert_task(TaskRecord(
             id=self.task.id, name=getattr(self.task, "name", self.task.id),
             metrics=tuple(getattr(self.task, "metric_names", ())),

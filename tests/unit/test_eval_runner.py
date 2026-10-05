@@ -569,3 +569,60 @@ def test_trigger_is_persisted_as_provenance(env):
 
     other = runner.run(RunConfig(model=MODEL))
     assert EvalRepo(env[0]).get_run(other.run_id).config["trigger"] == "cli"
+
+
+def _same_id_dataset(*, prefix: str, revision: str) -> Dataset:
+    """同一份 dataset_id 的另一**版**考卷：case id 是内容哈希，所以四条全换了。"""
+    cases = [
+        {
+            "id": f"{prefix}{index}", "ord": index,
+            "input": {"instruction": f"第 {index} 条：转账"},
+            "expect": {"label": "转账"}, "tags": [], "kind": "single",
+        }
+        for index in range(4)
+    ]
+    return Dataset(id="tiny", cases=tuple(cases), upstream="test", revision=revision)
+
+
+def test_a_regenerated_dataset_refreshes_the_stored_cases(env):
+    """revision 变了就必须重写样本，否则**分数点不回样本**、库里的 revision 还在说旧话。
+
+    这条是被 S32 的真机逼出来的：给长上下文数据集加干扰项之后 9 条 case 全换了 id，
+    而 runner 只在"库里没有这份数据集"时才写样本 ⇒ 那一轮 9 条 grade 有一条都点不回去，
+    `dataset.revision` 也停在干扰项之前那一份。"每个分数都能回答它是哪份数据考出来的"
+    是 M11 全部工作的立足点，所以这里把它断言成一段可跑的代码。
+    """
+    repo = EvalRepo(env[0])
+    first, _ = _runner(env, _scripts("转账"), dataset=_same_id_dataset(prefix="a", revision="r1"))
+    run_a = first.run(RunConfig(model=MODEL, limit=1))
+    assert repo.get_dataset("tiny").revision == "r1"
+    assert {rec.id for rec in repo.list_cases("tiny")} == {"a0", "a1", "a2", "a3"}
+
+    second, _ = _runner(env, _scripts("转账"), dataset=_same_id_dataset(prefix="b", revision="r2"))
+    run_b = second.run(RunConfig(model=MODEL, limit=1))
+
+    assert repo.get_dataset("tiny").revision == "r2", "revision 不跟着重写，比较就无从判断可比性"
+    stored = {rec.id for rec in repo.list_cases("tiny")}
+    # a0 被第一次运行的 grade 引用过 ⇒ 必须留着（历史分数靠它回到当时那条样本）；
+    # a1–a3 从没被判定过 ⇒ 是纯粹的陈旧行，留着只会让"这份考卷有几条"变成数不清楚
+    assert stored == {"a0", "b0", "b1", "b2", "b3"}
+    for report in (run_a, run_b):
+        for grade in repo.list_grades(report.run_id):
+            assert grade.case_id in stored, f"{report.run_id} 的分数点不回样本"
+
+
+def test_prune_stale_cases_never_touches_a_referenced_row(env):
+    """注入缺陷自检：把一条**有 grade** 的样本放进"该删"的范围里，它也不许被删。
+
+    只按"不在当前样本集里"删行会撕断分数历史——那正是本项目拒绝实现"删除数据集"的理由。
+    """
+    repo = EvalRepo(env[0])
+    runner, _ = _runner(env, _scripts("转账"), dataset=_same_id_dataset(prefix="a", revision="r1"))
+    report = runner.run(RunConfig(model=MODEL, limit=2))
+
+    removed = repo.prune_stale_cases("tiny", ["a0", "a3"])
+    assert removed == 1, "只有 a2（既不在保留集也没历史）该被删掉"
+    stored = {rec.id for rec in repo.list_cases("tiny")}
+    assert stored == {"a0", "a1", "a3"}, "被 grade 引用的 a1 必须活着"
+    for grade in repo.list_grades(report.run_id):
+        assert grade.case_id in stored
