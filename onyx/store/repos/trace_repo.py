@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import asdict
+from typing import Any
 
 from onyx.core.clock import utc_now_iso
 from onyx.store.codec import dumps, loads_dict
@@ -204,6 +205,56 @@ class TraceRepo:
             )
             for r in self.db.query(sql, tuple(params))
         ]
+
+    def anomaly_stats(self, *, since: str | None = None) -> dict[str, dict[str, Any]]:
+        """code → {n, severity}。看板的异常 chip 用它，而不是自己猜级别。
+
+        级别取异常行上记的那份：以后把某个码降级，不该让历史看起来"没出过事"。
+        """
+        sql = (
+            "SELECT code, severity, COUNT(*) AS n FROM anomaly"
+            + (" WHERE created_at>=?" if since else "")
+            + " GROUP BY code, severity ORDER BY n DESC"
+        )
+        rows = self.db.query(sql, (since,) if since else ())
+        out: dict[str, dict[str, Any]] = {}
+        for r in rows:
+            code = str(r["code"])
+            entry = out.setdefault(code, {"n": 0, "severities": []})
+            entry["n"] += int(r["n"])
+            if r["severity"] not in entry["severities"]:
+                entry["severities"].append(str(r["severity"]))
+        return out
+
+    def error_anomaly_summary(self, *, since: str) -> dict[str, Any]:
+        """error 级异常的总览：Fleet 顶部那一行要说的"N 条 + 最近是哪条"。
+
+        级别用**行里记的 severity**而不是回查 SPECS：异常发生时是什么级别就永远是什么级别，
+        以后把某个码降级也不该让历史看起来"没出过事"（反之亦然）。
+        """
+        totals = self.db.query(
+            "SELECT COUNT(*) AS n FROM anomaly WHERE created_at>=? AND severity='error'",
+            (since,),
+        )
+        by_code = self.db.query(
+            "SELECT code, COUNT(*) AS n FROM anomaly WHERE created_at>=? AND severity='error' "
+            "GROUP BY code ORDER BY n DESC",
+            (since,),
+        )
+        latest = self.db.query(
+            "SELECT code, trace_id, created_at FROM anomaly "
+            "WHERE created_at>=? AND severity='error' "
+            "ORDER BY created_at DESC, id DESC LIMIT 1",
+            (since,),
+        )
+        head = latest[0] if latest else None
+        return {
+            "n": int(totals[0]["n"]) if totals else 0,
+            "by_code": {str(r["code"]): int(r["n"]) for r in by_code},
+            "latest_code": str(head["code"]) if head else "",
+            "latest_at": str(head["created_at"]) if head else "",
+            "latest_trace_id": str(head["trace_id"]) if head else "",
+        }
 
     def anomaly_counts(self, *, since: str | None = None) -> dict[str, int]:
         sql = "SELECT code, COUNT(*) AS n FROM anomaly"

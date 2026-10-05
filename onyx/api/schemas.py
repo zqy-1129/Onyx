@@ -166,7 +166,15 @@ class FleetView(BaseModel):
     loaded_known: bool = True
     installed_models: int = 0
     window: dict[str, Any] = Field(default_factory=dict)
-    anomalies: dict[str, int] = Field(default_factory=dict)
+    #: code → {n, severities}。级别由后端给：chip 在前端自己写死一个 warn 的话，
+    #: error 级异常也会显示成"提醒"，而这两种事情的紧急程度完全不同
+    anomalies: dict[str, Any] = Field(default_factory=dict)
+    #: error 级异常的总览（n / by_code / 最近一条）。级别取异常行上记的那份，
+    #: 不回查规格表——降级一个码不该让历史看起来"没出过事"
+    error_anomalies: dict[str, Any] = Field(default_factory=dict)
+    #: 告警系统的状态（出口、轮询次数、最近错误）。顶部那一行要能同时说清
+    #: "出事了" 与 "通知系统本身好不好"，否则两者在界面上长得一样
+    alerts: dict[str, Any] = Field(default_factory=dict)
 
 
 class UsageSummaryView(BaseModel):

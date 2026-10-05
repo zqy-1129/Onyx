@@ -232,6 +232,43 @@ def test_anomalies(db, repos):
     assert traces.list_anomalies(limit=10)[0].severity == "error"
 
 
+def test_anomaly_stats_carries_the_severity_of_each_code(db, repos):
+    """看板 chip 的级别来自这里，不是前端自己猜（error 级显示成"提醒"是另一种谎言）。"""
+    _, traces, _ = repos
+    traces.insert_anomaly(AnomalyRecord(id="a1", code="TOKEN_DRIFT", severity="warn",
+                                        created_at="2026-10-05T01:00:00+00:00"))
+    traces.insert_anomaly(AnomalyRecord(id="a2", code="TOKEN_DRIFT", severity="error",
+                                        created_at="2026-10-05T02:00:00+00:00"))
+    traces.insert_anomaly(AnomalyRecord(id="a3", code="TOOL_LOOP", severity="error",
+                                        created_at="2026-10-05T03:00:00+00:00"))
+
+    stats = traces.anomaly_stats()
+    assert stats["TOKEN_DRIFT"]["n"] == 2
+    assert set(stats["TOKEN_DRIFT"]["severities"]) == {"warn", "error"}, "同一码出现过两种级别都要带上"
+    assert stats["TOOL_LOOP"] == {"n": 1, "severities": ["error"]}
+    assert traces.anomaly_stats(since="2026-10-05T02:30:00+00:00") == {
+        "TOOL_LOOP": {"n": 1, "severities": ["error"]}
+    }
+
+
+def test_error_anomaly_summary_points_at_one_real_trace(db, repos):
+    _, traces, _ = repos
+    traces.insert_anomaly(AnomalyRecord(id="a1", code="CONTEXT_OVERFLOW", severity="error",
+                                        trace_id="tr-1", created_at="2026-10-05T01:00:00+00:00"))
+    traces.insert_anomaly(AnomalyRecord(id="a2", code="CONTEXT_OVERFLOW", severity="error",
+                                        trace_id="tr-2", created_at="2026-10-05T02:00:00+00:00"))
+    traces.insert_anomaly(AnomalyRecord(id="a3", code="TOKEN_DRIFT", severity="warn",
+                                        trace_id="tr-3", created_at="2026-10-05T03:00:00+00:00"))
+
+    got = traces.error_anomaly_summary(since="2026-10-05T00:00:00+00:00")
+    assert got["n"] == 2 and got["by_code"] == {"CONTEXT_OVERFLOW": 2}
+    # 最近一条要能点下去：只有计数的那行话无法回答"哪次请求"
+    assert got["latest_trace_id"] == "tr-2" and got["latest_code"] == "CONTEXT_OVERFLOW"
+
+    empty = traces.error_anomaly_summary(since="2026-10-06T00:00:00+00:00")
+    assert empty["n"] == 0 and empty["latest_trace_id"] == "" and empty["by_code"] == {}
+
+
 # ── usage ──────────────────────────────────────────────────────────
 def test_usage_multi_source_and_attribution(db, repos):
     _, traces, usage = repos

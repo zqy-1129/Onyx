@@ -57,7 +57,48 @@ export interface FleetView {
   loaded_known: boolean
   installed_models: number
   window: FleetWindow
-  anomalies: Record<string, number>
+  /** code → {n, severities}。级别由后端给：前端自己写死 warn 会把 error 级也显示成"提醒" */
+  anomalies: Record<string, { n: number; severities: string[] }>
+  /** error 级异常总览（近 1h）。Fleet 顶部那一行用它 */
+  error_anomalies: ErrorAnomalySummary
+  /** 告警系统自身的状态。"出事了"与"通知系统没在跑"必须能分开看 */
+  alerts: AlertRuntime
+}
+
+export interface ErrorAnomalySummary {
+  n: number
+  by_code: Record<string, number>
+  latest_code: string
+  latest_at: string
+  latest_trace_id: string
+}
+
+export interface AlertRuntime {
+  enabled: boolean
+  channels: string[]
+  ticks: number
+  poll_s?: number
+  last_error: string
+  thread_alive: boolean
+  reason?: string
+  rule?: Record<string, unknown>
+}
+
+export interface AlertTriggerView {
+  id: string
+  created_at: string
+  code: string
+  severity: string
+  n_in_window: number
+  window_s: number
+  channel: string
+  status: string
+  detail: string
+  first_anomaly_id: string
+  last_anomaly_id: string
+  trace_ids: string[]
+  is_test: boolean
+  rule: Record<string, unknown>
 }
 
 export interface CapReportDto {

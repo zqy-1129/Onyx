@@ -149,7 +149,12 @@ def fleet(state: AppState = Depends(get_state)) -> FleetView:
         loaded_models=[_loaded_view(item) for item in loaded],
         loaded_known=residency_known,
         installed_models=len(provider.list_models()),
-        window=window, anomalies=state.traces.anomaly_counts(since=since),
+        window=window, anomalies=state.traces.anomaly_stats(since=since),
+        error_anomalies=state.traces.error_anomaly_summary(since=since),
+        alerts=(state.alert_service.status() if state.alert_service is not None
+                else {"enabled": False, "channels": [], "thread_alive": False,
+                      "last_error": "", "ticks": 0,
+                      "reason": "这个 serve 进程没有装配告警（规则来自 onyx.toml 的 [alerts]）"}),
     )
 
 

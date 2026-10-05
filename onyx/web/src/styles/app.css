@@ -280,6 +280,8 @@ textarea.input { font-family: var(--font-ui); resize: vertical; line-height: 1.5
   background: var(--bg-panel); border-radius: var(--radius-panel); padding: var(--space-2) var(--space-3);
 }
 .banner-warn { border-left-color: var(--warn); }
+/* error 与 warn 必须能一眼分开：顶部那一行的全部意义就是这两种事情的区分 */
+.banner-error { border-left-color: var(--error); }
 
 .warnbox {
   border: 1px solid var(--border); border-left: 3px solid var(--warn);

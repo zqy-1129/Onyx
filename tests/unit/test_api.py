@@ -70,6 +70,71 @@ def test_fleet_shape(client):
     assert window["by_prefill_mode"].get("cold") == 1
 
 
+def _insert_anomaly(client, code: str, severity: str, trace_id: str) -> None:
+    """直接落一条异常行（走的是生产同一个 repo 方法）。
+
+    端点测的是聚合与出处，不是异常怎么产生——那在 obs 的测试里。
+    """
+    from onyx.core.clock import utc_now_iso
+    from onyx.store.records import AnomalyRecord
+
+    state = client.app.state.onyx
+    state.traces.insert_anomaly(AnomalyRecord(
+        id=f"an-{code}", code=code, severity=severity, trace_id=trace_id,
+        created_at=utc_now_iso(),
+    ))
+
+
+def test_fleet_error_anomaly_summary_and_alert_posture(client):
+    """/api/fleet 顶部那一行的两个来源：error 级异常总览 + 告警系统自己的状态。
+
+    没装配告警时必须说破"这个进程没装配"，而不是留一个看起来像"一切正常"的空对象。
+    """
+    _chat(client)
+    _insert_anomaly(client, "CONTEXT_OVERFLOW", "error", "tr-err-1")
+    _insert_anomaly(client, "TOKEN_DRIFT", "warn", "tr-warn-1")
+
+    body = client.get("/api/fleet").json()
+    errors = body["error_anomalies"]
+    assert errors["n"] == 1 and errors["by_code"] == {"CONTEXT_OVERFLOW": 1}, "warn 级不许混进来"
+    assert errors["latest_trace_id"] == "tr-err-1", "顶部那行要能指到一次真实请求"
+
+    alerts = body["alerts"]
+    assert alerts["enabled"] is False and alerts["channels"] == []
+    assert "[alerts]" in alerts["reason"]
+
+
+def test_fleet_anomalies_carry_their_severity(client):
+    """chip 的级别由后端给：前端写死 warn 会把 error 级显示成"提醒"。"""
+    _chat(client)
+    _insert_anomaly(client, "ORPHAN_TOOL_CALL", "error", "tr-err-2")
+
+    anomalies = client.get("/api/fleet").json()["anomalies"]
+    assert anomalies["ORPHAN_TOOL_CALL"]["severities"] == ["error"]
+    assert anomalies["TOKEN_DRIFT"]["severities"] == ["warn"], "mock 通道复算偏差是 warn，不是 error"
+
+
+def test_fleet_reports_an_assembled_alert_service(tmp_path):
+    from onyx.obs.alerts.channels import FileChannel
+    from onyx.obs.alerts.rules import AlertRule
+
+    runtime = build_runtime(
+        provider_kind="mock", provider_id="mock-local", base_url="mock://",
+        db_path=tmp_path / "alerts.sqlite", event_log=False,
+        provider_kwargs={"scripts": SCRIPTS, "models": tuple(SCRIPTS)},
+    )
+    app = create_app(
+        runtime, gpu_lock_path=tmp_path / "gpu.lock",
+        alert_rule=AlertRule(), alert_channels=(FileChannel(tmp_path / "a" / "alerts.jsonl"),),
+    )
+    with TestClient(app) as c:
+        _chat(c)
+        alerts = c.get("/api/fleet").json()["alerts"]
+    assert alerts["enabled"] is True and alerts["channels"] == ["file"]
+    assert alerts["poll_s"] == 5.0 and alerts["last_error"] == ""
+    runtime.close()
+
+
 def test_residency_is_boolean_when_the_channel_reports_it(client):
     """有控制面的通道（mock 声明 ADMIN）继续给 true/false——这是原有行为，不能退化。"""
     body = client.get("/api/models").json()

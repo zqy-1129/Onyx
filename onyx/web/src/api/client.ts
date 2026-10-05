@@ -67,6 +67,8 @@ function qs(params: Record<string, string | number | boolean | null | undefined>
 
 import type {
   AdminResultView,
+  AlertRuntime,
+  AlertTriggerView,
   ChatResponse,
   ComparisonView,
   DatasetImportBody,
@@ -153,6 +155,11 @@ export const api = {
     request<AdminResultView>(`/api/admin/models/rm${qs({ name, confirm: 1 })}`, { method: 'POST' }),
   /** GPU 锁状态是**只读**的：看板轮询它不能把锁抢了 */
   gpu: () => request<GpuStatusView>('/api/gpu'),
+  /** 触发历史：回答"某天到底通知没通知"。测试行默认不混进来 */
+  alertTriggers: (params: { code?: string | null; status?: string | null; limit?: number } = {}) =>
+    request<AlertTriggerView[]>(`/api/alerts${qs(params)}`),
+  /** 告警系统自己的状态：没装配时 reason 会说清，而不是留一片空白 */
+  alertStatus: () => request<AlertRuntime>('/api/alerts/status'),
   evalDatasets: () => request<DatasetView[]>('/api/datasets'),
   /** 导入 JSONL 数据集（文本而不是路径）。覆盖已有 id 需要 allow_replace=true */
   importDataset: (body: DatasetImportBody) =>
