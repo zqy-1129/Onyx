@@ -2,7 +2,7 @@
 
 核对时间 **2026-10-05**，HEAD = M9 四步（S23 界面发起评测、S24 数据集闭环、S25 Tool Bench、
 S26 模型治理出口与续跑）+ M10 三步（S27 告警内核与文件出口、S28 通用 webhook、S29 界面可见性与多引擎定案）
-之后 ⇒ **M0–M10 全部达成**。
++ M12 第一步（S34 六页 e2e + SSE 上线消费）之后 ⇒ **M0–M10 全部达成，M12 已开始**。
 本文所有数字都是当场跑出来的（命令附在每节末尾），不是从旧文档抄的；
 `README.md` 的进度表、`docs/IMPLEMENTATION.md` 的分步档案是历史沿革，
 **这里回答的是"现在有什么、能干什么、还欠什么"**。
@@ -145,7 +145,8 @@ WAL + 批量 sink（队列满丢样本但 `dropped` 计数可见）、
 ## 2. 质量门与规模
 
 ```
-uv run pytest            # 1346 passed, 1 skipped（S17–S29 累计。M10 的告警面按文件数：store 15 / rules 20 / service 20 / webhook 15 / API 7 / CLI 8，另加 S29 落在既有的 test_repos +2、test_api +4、test_doctor +5；S17–S26 的部分见 git log 与 IMPLEMENTATION 各步档案）
+uv run pytest            # 1348 passed, 1 skipped, 36 deselected（默认档就是离线套件，CI 用它量覆盖率。M10 的告警面按文件数：store 15 / rules 20 / service 20 / webhook 15 / API 7 / CLI 8，另加落在既有文件里的 11 条）
+uv run pytest -m e2e     # 12 passed（S34：六页取数同源 10 条 + SSE 真 HTTP 消费与"断链自检"2 条。默认档把它 deselect 了，CI 里是独立一步）
 uv run pytest -m live     # 20 passed（真打 qwen3.5:9b，与评测共用机器级 GPU 锁）
 uv run pytest -m probe     # 4 passed（P 系列实验的可重跑版本）
 uv run ruff check .         # All checks passed（`ruff format` 不是门禁）
@@ -218,7 +219,7 @@ S23 在浏览器里真跑过：`--provider mock` 的 serve 上点「开始评测
 | `onyx token explain <trace>`（多源对比表） | S7 / 附录 A 的自测命令 | 功能其实存在但埋在 `traces show` 的对账表里，没有独立入口；对照"某个数字为什么被采信"这个高频问题，命令行入口是必要的 |
 | `hf_tokenizer`（T1）与 `gguf_vocab`（T2）没有实现 | P9 结论：T2 应提前为 S4 主实现 | 阶梯、采信优先级、`CounterContext.tokenizer` 插拔位都在，缺的是实现本身。后果：分段归因最多到 `fitted/medium`，做不了"逐段完全归因"；`tokens` extra（minja/tokenizers/gguf）装了也不生效。`doctor` 现在会把这件事写在明面上，`onyx token explain` 入口也还没有 |
 | `TOOL_EXEC_START` 事件的 `args_ref` 无处落库 | S17 真机 dry-run 查出来的 | 循环每次工具调用都写一个 args blob，但 schema 里没有任何列存它（`tool_call` 存的是内联 `args_json`）⇒ **每次工具循环泄漏一个小 blob**。`rotate` 能把孤儿回收掉，但正确的修法是别再写或者把它落库——别让"能删孤儿"掩盖"一直在造孤儿" |
-| `-m e2e` 用例（附录 A 的 S9 自测行） | 附录 A | 现在 **0 个 e2e 用例**：浏览器验证是手工做的（`take_snapshot` + 读 console）。手工是唯一一次 SSE 静默失效被发现的途径，也是 S23–S29 **八处**真实缺陷唯一的暴露途径（心跳判死、导入后跑不了、`tool_run` 没有写入方、锁删不掉让后面的人白等 600 秒、`n_cases` 被缩成已评条数、告警装配被 import-linter 的链顶回来、`rule_json` NOT NULL 与空快照冲突、异常 chip 把 error 写死成 warn）——但也意味着**没人记得住的那些路径**没有回归保护 |
+| **真浏览器** e2e 仍为 0（S34 补的是数据通路那一半） | G6 / 附录 A | `-m e2e` 现在有 12 条：六页取数同源 + SSE 在真 HTTP 连接上被读到 + "摘掉 broker 会红"的自检。但本仓库**没有浏览器驱动**（实测：Python 侧无 playwright，web devDeps 只有 vitest + @testing-library + jsdom），所以**渲染本身**仍靠手工 `take_snapshot`。S23–S29 手工点出的八处缺陷里六处是数据通路（已被 e2e 覆盖），两处是前端映射（由 vitest 纯函数测试钉住）。要补的是驱动那一层（Playwright + 起 vite/serve），这属于"决定要分发/给别人用"之后才划算的投入 |
 | `onyx serve --reload` | 附录 A 的自测命令 | 小：开发体验，非功能缺口（vite 的 HMR 已覆盖前端） |
 
 ### B. 明确推迟、带原因的（不是遗漏）
@@ -256,12 +257,12 @@ S23 在浏览器里真跑过：`--provider mock` 的 serve 上点「开始评测
    S26 模型治理出口与被中断运行的续跑入口，**全部达成**）。
    ~~M10 观测触达~~（S27 告警内核 + 文件出口 + `alert_trigger` / S28 通用 webhook（第三条显式网络例外）/
    S29 Fleet 可见性 + doctor「告警」项 + **一进程一引擎定案**，**全部达成**）。
-2. **`-m e2e` 用例**：把已经手工验证过的页面路径固化成回归（SSE 联通、矩阵分母显示、劣化清单下钻、
-   发起评测的排队与取消、Tool Bench 的「跑一次」、S26 的续跑与治理三动作、
-   M10 的告警顶部一行与触发面板）。M7–M10 之后这条最值钱：
-   五步的真实缺陷**全部**是浏览器点出来的，而它们现在没有任何回归保护。
+2. ~~`-m e2e` 用例~~（**S34 已交付数据通路那一半**：六页取数互相核对 + SSE 在真 HTTP 连接上被读到
+   + "摘掉 broker 就会红"的自检 + CI 独立一步并钉进门禁清单）。
+   剩下的部分是**真浏览器驱动**（Playwright 起 vite + serve），它仍欠着——见上表那一行。
 3. **M11 评测资产**（G5）：`structured_extraction`、`instruction_following`、长上下文中文集、
    embedding 任务（视觉要先解决 U8/U9 的未决实测）。每个新任务要求"三个同源"断言全绿。
+   M12 剩下的 S35（覆盖率基线 + 契约矩阵真 stdio 列）与 S36（`onyx perf` 基线）可与 M11 并行。
 4. **`token explain` + `report usage`**：都属于"每天都在用但入口缺失"。
 5. C 组三条一致性（`RECONCILED` 不发、`base_url` 默认值、兼容通道探针覆盖）适合凑成一次"口径一致性"清理。
 

@@ -2178,6 +2178,90 @@ uv run pytest                # 1346 passed（S29 新增 11 条 Python：repos 2 
 
 ---
 
+# M12 防倒退（G6）—— 方案与档案（S34–S36）
+
+判据（ROADMAP G6）：**6 页各一条 e2e，CI 上跑通且能抓到一次人为注入的 SSE 断链**；
+覆盖率有"只防跌"的基线；契约矩阵增加真 stdio 变体一列；`onyx perf` 有可比基线。
+
+**先说清这条边界（不假装覆盖了没覆盖的东西）**：
+本仓库**没有任何浏览器驱动**（实测：`playwright` 在 Python 侧不存在，`onyx/web/package.json`
+的 devDeps 里只有 vitest + @testing-library + jsdom）。所以 S34 的 e2e 定义为
+**"起真实 app + mock 引擎，按每个页面的取数顺序走一遍，断言跨端点的数字同源，
+并真的从 `/api/stream` 读帧"**——它覆盖的是**页面渲染所依赖的数据**，不是渲染本身；
+前端的映射逻辑由 vitest 的纯函数测试钉住（`fleet/evalLaunch/datasets/toolBench/governance`）。
+真浏览器仍由手工 `take_snapshot` 负责，这件事继续写在 STATUS 的"还欠什么"里。
+为什么这样切：S23–S29 手工点出的八处缺陷里，六处是**写侧/读侧数据通路**（心跳判死、导入后跑不了、
+`tool_run` 没有写入方、锁删不掉、`n_cases` 口径、`rule_json` 约束），只有 chip 级别那一处是前端映射，
+而它现在既被 `/api/fleet` 的 e2e 断言（级别必须由后端给）也被 `fleet.test.ts` 钉住。
+
+## S34 — e2e：六页取数通路 + SSE 上线消费 + 注入断链的自检（M12 第一步）✅
+
+**产出文件**
+```
+tests/e2e/conftest.py      # 一颗种好的栈：3 次对话 + 2 条评测 run + 2 个注册工具 + 1 行告警触发
+                           # 全部走生产路径（gateway / EvalRunner / registry.register / AlertService.tick）
+tests/e2e/test_pages.py     # 十断言，六页各取其数并互相核对（见下）
+tests/e2e/test_sse.py       # 真 uvicorn（只绑 127.0.0.1）+ 真 httpx 流式读取 + 断链自检
+.github/workflows/ci.yml   # `-m e2e` 独立一步
+tests/unit/test_release_surface.py  # 这一步被钉进门禁清单，且注释里"只用 mock/只绑回环"也要在
+```
+
+**六页断言的是"同源"，不是"返回 200"**
+1. **Fleet** — `window.traces` == Traces 页能数出的 `total`；`window.in/out_tokens` == Ledger 的总数；
+   `error_anomalies.n ≥ 1` 且 `latest_trace_id` 查得到；`alerts` 段说清出口与线程状态
+2. **Traces** — 列表每一行的 id/status/in_tokens 与详情里的 `trace` 头一致
+3. **Ledger** — 分桶求和 == 总数；`by_source`/`by_confidence` 加回到 **traces 条数**
+   （它们数的是"每条采信自谁"，把它当 token 量加回去就是第二个事实源）
+4. **Tool Bench** — `json_tokens == Σ 各工具 tokens`、`effective == json + template`、
+   没传 overhead 时 `template_share is None`；矩阵里 `applicable is False` 的格子**永远不是 ✓**，
+   `pending`/`unavailable` 里的执行器不许出现在列里
+5. **运行与 grade** — 每条 grade 都有 `trace_id` 且能在 `trace` 表里查到（"每个分数能点进一次真实请求"
+   的机器化版本）；未定义的 `per_class_f1` 保持 `None` 而不是变成 0
+6. **矩阵与回归** — 每格带分母且 `ci.n == cell.n`；比较结果的 `regressed/improved` 与逐 case 明细一致，
+   劣化的每条都有两个可下钻的 trace
+
+**两处实现期纠正（都写进了测试文件的注释里）**
+- **TestClient 读不到 SSE**：先按 TestClient 写了一版，结果是"一帧都读不到"，
+  而 broker 侧 `published=9`、`subscriber_count=1`。原因在 starlette TestClient 的传输层
+  会缓冲流式响应——**那是测试装置的限制，不是应用的 bug**。如果照这个写 e2e，
+  它要么永远红，要么被改成"只断言订阅成功"从而失去守断链的能力。
+  现在这一步起**真 uvicorn**（`127.0.0.1` + 随机端口）+ 真 httpx `stream()`，
+  读帧放后台线程、主线程按超时收：失败模式必须是红，不能是挂死。
+- **种子的形状决定断言有没有意义**：两个模型各答一个固定标签（转账 / 投诉），
+  配对比较才同时有净改善与净劣化；`mock/nocount` 那条请求负责产出 error 级异常，
+  否则 Fleet 顶部那一行是在断言一段没有数据的空集。
+
+**本机验证**
+```bash
+uv run pytest -m e2e            # 12 passed, 1373 deselected（≈11s）
+uv run pytest                   # 1348 passed, 1 skipped, 36 deselected
+uv run ruff check . && uv run lint-imports    # 全过 · 3 contracts kept
+uv run python scripts/check_extension_boundary.py  # 无新增扩展点实现
+```
+**DoD**：G6 的"CI 上 e2e 跑通且能抓到一次人为注入的 SSE 断链"达成 ——
+`test_a_severed_link_is_caught_not_silently_green` 就是把 broker 从总线上摘掉（当年故障的形状），
+断言流里只剩 hello；`-m e2e` 的用例数不再是 0。
+
+**提交**：
+`test(e2e): 种好的栈 + 六页取数通路 —— 断言同源而不是 200（S34 第一步）`
+`test(e2e): SSE 在真 HTTP 连接上被读到 + "断链会被发现"的自检（S34 第二步）`
+`ci: e2e 进 CI 作为独立一步，并被钉进门禁清单（S34 第三步）`
+
+## S35 — 覆盖率基线 + 契约矩阵的真 stdio 变体（M12 第二步）
+
+- 覆盖率从"floor 80（基线 90，留 10 个点）"改成 **floor 85（留 5 个点）**并写明理由：
+  门禁的目的是防跌，而 10 个点的余量足够让一次真实的退化悄悄通过。
+- 契约矩阵增加"真 stdio"一列：现在 `mcp` 列是离线假连接，真子进程路径只在
+  `tests/unit/test_tools_mcp_stdio.py`，换 MCP SDK 或换 server 时矩阵不会红。
+
+## S36 — 性能基线（M12 第三步）
+
+`onyx perf`（或 probe 套件的一条）留一组吞吐/延迟基线，改版能对比。
+前提：基线的**出处与条件**必须一起落库（引擎版本、模型、并发度、是否冷启动），
+否则下一次对比就是在比两个不同的东西。
+
+---
+
 ## 附录 A — 每步自测速查
 
 | 步 | 命令 | 绿的条件 |
@@ -2211,6 +2295,7 @@ uv run pytest                # 1346 passed（S29 新增 11 条 Python：repos 2 
 | S27 | `onyx db init` → `onyx alerts test` → `onyx alerts ls`；serve 里插一条 error 级异常 | schema v7 且迁移前自动留快照；测试行标 `is_test=1` 且不参与 cooldown；`alerts ls` 空表也打印生效判据与出处；异常落库后一个轮询周期内文件出口自己多一行 |
 | S28 | 本地假接收端 + `ONYX_ALERT_WEBHOOK_URL=… onyx serve` | 真收到 POST 200；库里 detail 是去掉 query 的 URL；停掉接收端后 webhook 行 `failed` 而文件行照样 `sent`；cooldown 内历史不增长 |
 | S29 | 浏览器看 `#/` 顶部一行与「告警触发」面板 + `onyx doctor` | chip 的级别来自后端（error ≠ warn 的图标不同）；顶部一行同时说"几条异常"和"通知系统好不好"；样本链能落到真实 trace；doctor 的「告警」项在写不下去/全失败时变红 |
+| S34 | `uv run pytest -m e2e`（默认套件把它 deselect 了，必须显式跑） | 六页取数互相核对得上；每条 grade 的 trace_id 查得到真实 trace；真 uvicorn + 真 httpx 能读到 `hello → trace_start → trace_end`；把 broker 摘掉后**只剩 hello**（断链会被发现） |
 | 门禁 | `make coverage`（`coverage run -m pytest -q`） | 离线套件分支覆盖率 ≥ 80%（S17 落地时 88%，S21 后 89%，S23/S26 后仍 89%，M10 后 90%） |
 
 ## 附录 B — 架构自测（让"模块化"可验证，而非口号）
