@@ -69,14 +69,6 @@ REFUSAL_MAX_VISIBLE = 60
 _NO_OUTPUT = "没有可判定的产出，不计满足"
 
 
-def _looks_like_refusal(text: str) -> bool:
-    """拒答判据同时要求**短**：长答案里冒出一个"抱歉"通常是内容而不是拒绝。"""
-    if len(_visible(text)) > 60:
-        return False
-    lowered = text.casefold()
-    return any(marker in lowered for marker in REFUSAL_MARKERS)
-
-
 class InstructionFollowing:
     """`EvalTask` 协议的实现。数据来自 `instructions_zh` 生成器。"""
 

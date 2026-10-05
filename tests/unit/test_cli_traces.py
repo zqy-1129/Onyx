@@ -4,15 +4,12 @@
 （S3 的那份第二参数是 `suffix`，S13 加的那份是 `digits`）。后定义的把前者遮蔽，
 `_fmt(ttft_ms, "ms")` 于是变成 `digits="ms"`，`traces show` 在**任何有数字的 trace**
 上直接 ValueError；而值为 None 时提前返回「—」，所以只有真实数据才炸——
-mock-only 的测试永远看不见。ruff 的 F811 因为"前一份被使用过"也不报。
-
-所以这个模块里除了行为回归，还有一条结构性断言：内核 CLI 不许有同名顶层定义。
+mock-only 的测试永远看不见，ruff 的 F811 也因为"前一份被使用过"不报。
+那条结构断言现在搬到了 `tests/unit/test_module_structure.py`，对全仓库生效；
+本文件只留这几条命令的行为回归。
 """
 
 from __future__ import annotations
-
-import ast
-from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner
@@ -27,7 +24,6 @@ from onyx.store.db import Database
 from onyx.store.sinks import SqliteRecordSink
 
 runner = CliRunner()
-CLI_SOURCE = Path(__file__).resolve().parents[2] / "onyx" / "cli.py"
 
 
 @pytest.fixture(autouse=True)
@@ -65,19 +61,3 @@ def test_fmt_accepts_suffix_and_digits():
     assert _fmt(None, 1, "ms") == "—", "未知不许被带上单位"
     assert _fmt(0.9876) == "0.988"
     assert _fmt(0.0, 1, "ms") == "0.0ms", "0 是测量结果，不是未知"
-
-
-def test_cli_has_no_shadowed_top_level_names():
-    """同名顶层定义会让后一份静默遮蔽前一份，而调用点分散在几百行之外。
-
-    这类 bug 不报错、不崩溃在写法上，只在"数据恰好是某种形状"时炸——
-    所以只能用结构断言挡住，而不是靠 review。
-    """
-    tree = ast.parse(CLI_SOURCE.read_text(encoding="utf-8"))
-    seen: dict[str, int] = {}
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            seen.setdefault(node.name, 0)
-            seen[node.name] += 1
-    dupes = sorted(name for name, count in seen.items() if count > 1)
-    assert not dupes, f"onyx/cli.py 里有同名顶层定义（后者遮蔽前者）: {dupes}"
