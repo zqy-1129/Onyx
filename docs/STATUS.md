@@ -2,15 +2,15 @@
 
 核对时间 **2026-10-05**，HEAD = M9 四步（S23 界面发起评测、S24 数据集闭环、S25 Tool Bench、
 S26 模型治理出口与续跑）+ M10 三步（S27 告警内核与文件出口、S28 通用 webhook、S29 界面可见性与多引擎定案）
-+ M12 第一步（S34 六页 e2e + SSE 上线消费）+ M11 第一步（S30 结构化抽取与任务契约测试）之后
-⇒ **M0–M10 全部达成，M11 与 M12 都已开始**。
++ M12 第一步（S34 六页 e2e + SSE 上线消费）+ M11 前两步（S30 结构化抽取与任务契约测试、
+S31 指令遵循与考卷有解的自检）之后 ⇒ **M0–M10 全部达成，M11 与 M12 都已开始**。
 本文所有数字都是当场跑出来的（命令附在每节末尾），不是从旧文档抄的；
 `README.md` 的进度表、`docs/IMPLEMENTATION.md` 的分步档案是历史沿革，
 **这里回答的是"现在有什么、能干什么、还欠什么"**。
 
 一句话：**不发一句命令就能完成"导入数据 → 拉模型 → 跑评测 → 续跑中断 → 看矩阵 → 下钻 trace →
 审计工具库"，而且出事会在 1 分钟内主动通知你**（本地文件 + 通用 webhook 两个出口，触发历史落库可查）。
-欠的是 S7 剩下的 `report usage` / `token explain` 两个入口、M11 剩下的三个任务，以及一批"带原因推迟"的项。
+欠的是 S7 剩下的 `report usage` / `token explain` 两个入口、M11 剩下的两个任务（S32/S33），以及一批"带原因推迟"的项。
 
 ---
 
@@ -71,15 +71,28 @@ WAL + 批量 sink（队列满丢样本但 `dropped` 计数可见）、
   这张表与它的保留规则存在了很久却没有一条路径写过它，所以"运行历史"面板会永远是空的
 
 ### L5 评测 `onyx/eval/`
-- 3 个内建任务：`intent_classification`（236 条中文意图集）、`tool_selection`（97 条工具调用集）、
-  `structured_extraction`（**S30**，45 条中文结构化抽取：模板 36 + 人工难例 4 + 「无可抽取信息」负样本 5）
+- 4 个内建任务：`intent_classification`（236 条中文意图集）、`tool_selection`（97 条工具调用集）、
+  `structured_extraction`（**S30**，45 条中文结构化抽取：模板 36 + 人工难例 4 + 「无可抽取信息」负样本 5）、
+  `instruction_following`（**S31**，39 条中文指令遵循 = 6 话题 × 3 形态 × 2 变体 + 3 难例，
+  每题 2–5 条**可机械检查**的约束，共 166 条约束判定）
+- **考卷有解是断言出来的（S31）**：每条样本带一句必然满足它全部约束的参考回答，
+  约束参数由参考回答实测派生；`unsatisfiable()` 把"无解的题"变成可跑的失败，
+  而且**注入一条收紧的约束它必须点名**（`test_the_satisfiability_detector_actually_fires`）。
+  提示语再由约束渲染回来（`phrase_for`），凡是考模型的都必须说得出
 - **任务契约测试（S30）**：`tests/contract/test_task_contract.py` 把"声明的指标 == 产出的指标、
   区间跟着它那个数、主分数不许是稳定性指标、引擎故障只留「没考到」不留 0 分"
   对 `specs()` 里**每一个**任务参数化跑（内置与插件同一套断言，新增任务不必改这个文件就会被覆盖）
 - 结构化抽取判定的三层各自成指标：`json_valid_rate`（听不听话）/ `schema_valid_rate`（结构对不对）/
   `field_em` 与 `score`（内容准不准）；负样本走 `none_correct_rate` **不进主分数**——
   混进均值等于奖励"什么都不抽"
-- 7 个评分器模块 + 类型感知参数比对（数值容差 / 日期归一 / 集合等价 / 严格档与宽松档分开报）。
+- 指令遵循同时报**三个会分叉的口径**：`score`（每条样本满足率的平均，样本等权）、
+  `micro_rate`（Σ满足 / Σ约束，约束等权）、`all_satisfied_rate`（全照做的题占比，最严）。
+  真机上它们是 0.920 / 0.916 / 0.641——只引用其中一个会讲出三种不同的故事。
+  `by_kind` 每种约束各带分母，且**没考到的类型不出现在字典里**（不是填 0）
+- **空正文不给任何约束记分（S31）**：逐条判的话 `max_chars` 与 `forbids` 会对"什么都没写"判通过，
+  于是最省 token 的答案能拿到 2/6 分。拒答反过来按产出实测，只单独占 `refusal_rate`；
+  并且"全部约束都满足"的答案永远不被拒答启发式改判
+- 8 个评分器模块 + 类型感知参数比对（数值容差 / 日期归一 / 集合等价 / 严格档与宽松档分开报）。
   S30 修正了 `field_em`：数值字段按**数值**比，`500` 与 `500.0` 是同一笔钱
 - 指标层：macro_f1 / accuracy / balanced_accuracy / P-R-F1 / 混淆对 /
   pass^k 与 pass@k / stability_gap / bootstrap CI（**按 case 重采样**，95% 区间带出处）
@@ -154,13 +167,13 @@ WAL + 批量 sink（队列满丢样本但 `dropped` 计数可见）、
 ## 2. 质量门与规模
 
 ```
-uv run pytest            # 1425 passed, 1 skipped, 36 deselected（默认档就是离线套件，CI 用它量覆盖率。S30 新增 77 条：任务契约 25 / 考卷自检 19 / 形态表 28 / mock 真跑 5，另删掉被契约测试取代的 2 条旧断言）
+uv run pytest            # 1488 passed, 1 skipped, 36 deselected（默认档就是离线套件，CI 用它量覆盖率。S31 净增 63 条：约束判定 15 / 考卷自检 14 / 形态表 20 / mock 真跑 5 / 结构门禁 2，另加契约测试因多一个任务而从 25 长到 33 的 8 条，减去被全仓库门禁取代的那条 cli 专属断言）
 uv run pytest -m e2e     # 12 passed（S34：六页取数同源 10 条 + SSE 真 HTTP 消费与"断链自检"2 条。默认档把它 deselect 了，CI 里是独立一步）
 uv run pytest -m live     # 20 passed（真打 qwen3.5:9b，与评测共用机器级 GPU 锁）
 uv run pytest -m probe     # 4 passed（P 系列实验的可重跑版本）
 uv run ruff check .         # All checks passed（`ruff format` 不是门禁）
 uv run lint-imports          # 3 contracts kept（网络例外 2 条：executors.http + sinks.otlp/alerts.webhook 合并在契约 2，每条写明是谁与为什么）
-uv run coverage run -m pytest -q && uv run coverage report   # 90% ≥ 80%（分支覆盖，离线套件，12,799 句；S30 的新代码：任务 99% / 数据生成器 92%）
+uv run coverage run -m pytest -q && uv run coverage report   # 90% ≥ 80%（分支覆盖，离线套件，13,140 句；S31 新代码：约束判定 98% / 任务 99% / 数据生成器 96%）
 uv run python scripts/check_extension_boundary.py   # 接入实现未触碰受保护内核文件（S30 因此把 RunReport 那条修复单独成一个提交）
 uv run onyx doctor            # 9 项体检（带网络 10 项）：配置 / Python / 可写 / 磁盘 / 迁移 / blob / 档位 / 告警 / 插件
 uv run onyx config show       # 每一项生效值标出来自 flag/环境/文件/默认哪一层（token 与 webhook URL 只报"已设置"）
@@ -171,6 +184,18 @@ CI：.github/workflows/ci.yml 跑上面这些（本机已验证命令本身可�
 ```
 
 真机跑过的证据（可复查，都在 git 里）：
+S31 的指令遵循在 qwen3.5:9b 上跑完 39 条（`git_rev a5f593f`，39.5s / 3,628 in / 734 out）：
+**`score 0.920 [0.884–0.952]` 但 `all_satisfied_rate` 只有 0.641**——
+"平均每条约束 92% 照做"与"只有 64% 的题全照做"是两个都真的数，引用哪一个就会讲哪一个故事，
+所以三个口径（`score` / `micro_rate` 152/166 = 0.916 / `all_satisfied_rate`）一起出。
+`by_kind` 指出薄弱环节在**结构约束**：`items_between 0.600（n=10）`、`line_count 0.667（n=3）`，
+而 `contains 0.974（n=39）`、`forbids` / `no_markdown` / `prefix` 全 1.000 —— 不是不会抄词，是不会按条数排布。
+考卷侧的自检也真跑过：`unsatisfiable()` 对全部 39 条返回空，
+而把某题字数上限收到参考回答之下时它立刻点名那道题（注入缺陷的自检是一条独立测试）。
+这一步顺带挖出自己刚写下的一个静默缺陷：`instruction_following.py` 里有**两份同名
+`_looks_like_refusal`**，早期那份还写着 `len(_visible(text))`（而 `_visible` 返回整数）——
+全量测试是绿的，因为 Python 取后一份。于是那条"不许同名顶层定义"的结构断言
+从只查 `cli.py` 升级为对整个 `onyx/` 生效（`tests/unit/test_module_structure.py`）。
 S30 的新任务在 qwen3.5:9b 上跑了三轮，**分数差异全部能归因到提交**（`git_rev` 逐条记录）：
 `2181720` ⇒ `score 0.129 [0.032–0.258]`、`date` 字段级 EM **0.000（15 条全错）**；
 查下去是**考卷自己有问题**——提示词写着"字段值必须来自原句，不要改写"，而期望值要 ISO 日期与纯数值，
@@ -247,9 +272,9 @@ S23 在浏览器里真跑过：`--provider mock` 的 serve 上点「开始评测
 | `onyx serve --reload` | 附录 A 的自测命令 | 小：开发体验，非功能缺口（vite 的 HMR 已覆盖前端） |
 
 ### B. 明确推迟、带原因的（不是遗漏）
-- `instruction_following`（S31）与长上下文中文集（S32）、embedding（S33）：M4 出口只要求"两个 task
-  真机跑通"，先做深不如先做对（`docs/IMPLEMENTATION.md` S14 一节记了理由）。
-  `structured_extraction` 已在 **S30** 落地（45 条、三层正交判定、真机 0.893 [0.786–1.000]）。
+- 长上下文中文集（S32）与 embedding（S33）：M4 出口只要求"两个 task 真机跑通"，
+  先做深不如先做对（`docs/IMPLEMENTATION.md` S14 一节记了理由）。
+  `structured_extraction`（**S30**）与 `instruction_following`（**S31**）已落地并各有一次真机运行。
 - `ollama_builtin` 执行器：必须先有 P21 的实测结论（模板里内建工具到底怎么渲染），
   否则做了也是猜的。`onyx tools contract` 那一列会显示"未实现，计划在 S16+"。
 - `onyx.graders` 扩展点：见上表（没有消费点就先不建）。
@@ -257,6 +282,9 @@ S23 在浏览器里真跑过：`--provider mock` 的 serve 上点「开始评测
   `plugins_example` + `.data` 里一张 `provider` 表就够用；等真出现"同一台机器常驻 3 个引擎"再做配置层。
 
 ### C. 已知边界（会被误读成 bug 的那些）
+- `instruction_following` 的"拒答"是**启发式**：只认自我声明式短语（`抱歉`/`我无法`/`不能回答`…）
+  且要求短于 60 个可见字符，并且**全约束满足时一律不改判**。仍然可能漏掉换了说法的拒答
+  （"这个我做不到哦"），漏掉的就是普通的不遵循——分数仍按实测走，只是不会单独出现在 `refusal_rate` 里。
 - `structured_extraction` 真机上 `date` 是 3/12 错，逐条看过都是**模型的错**，不是判据的错：
   两条把「二月二十八日」写成锚定日本身（`2026-03-01`），一条把「下周三」算成 `2026-03-08`。
   另有一处**已经露头但还没算进分数的考卷含糊**：难例"赵敏**昨天**下了一单，**后天**再退"
@@ -292,10 +320,11 @@ S23 在浏览器里真跑过：`--provider mock` 的 serve 上点「开始评测
 2. ~~`-m e2e` 用例~~（**S34 已交付数据通路那一半**：六页取数互相核对 + SSE 在真 HTTP 连接上被读到
    + "摘掉 broker 就会红"的自检 + CI 独立一步并钉进门禁清单）。
    剩下的部分是**真浏览器驱动**（Playwright 起 vite + serve），它仍欠着——见上表那一行。
-3. ~~M11 第一步~~（**S30 已交付**：`structured_extraction` 45 条 + 所有任务共用的契约测试，
-   真机 `score 0.893 [0.786–1.000]（n=28 case）`，矩阵 3 列、报告雷达图出现）。
-   剩下 **S31–S33**：`instruction_following`（约束必须可机械检查）、长上下文中文集（4k/8k/16k，
-   先量清每个模型实际 `num_ctx`）、embedding 任务（`Cap.EMBED` 终于有消费者）。
+3. ~~M11 前两步~~（**S30** `structured_extraction` 45 条 + 所有任务共用的契约测试，
+   真机 `score 0.893 [0.786–1.000]（n=28 case）`；**S31** `instruction_following` 39 条 / 10 种
+   可机械检查的约束，真机 `score 0.920`、`all_satisfied_rate 0.641`，"考卷有解"成为可跑断言）。
+   矩阵已 4 列。剩下 **S32 长上下文中文集**（4k/8k/16k，先量清每个模型实际 `num_ctx`，
+   否则"16k 全错"可能是被截断而不是能力问题）与 **S33 embedding**（`Cap.EMBED` 终于有消费者）。
    视觉仍等 U8/U9 的未决实测。M12 剩下的 S35（覆盖率基线 + 契约矩阵真 stdio 列）与
    S36（`onyx perf` 基线）可与 M11 并行。
 4. **`token explain` + `report usage`**：都属于"每天都在用但入口缺失"。

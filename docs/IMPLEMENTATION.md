@@ -2279,7 +2279,7 @@ uv run ruff check . · uv run lint-imports（3 kept）· scripts/check_extension
 `fix(eval): 抽取任务把取值口径写进提示词，数值字段按数值比` ·
 `fix(web): grade 表把字段集合渲染成 k=v，判定筛选项改成读这次运行自己的分布`
 
-## S31 — `instruction_following`：多条约束的可判定遵循（M11 第二步）
+## S31 — `instruction_following`：多条约束的可判定遵循（M11 第二步）✅
 
 **产出文件（计划）**
 ```
@@ -2294,12 +2294,13 @@ tests/unit/test_instruction_following_run.py  # mock 真跑：两个口径、by_
 ```
 
 **判据必须是代码可判的**（ROADMAP 原话）：凡需要人读才知道是否遵循的，不进这个任务——那是评审不是测量。
-约束种类（每种都必须给出**可行动的失败原因**，"没满足"不算原因）：
+落地的 10 种约束（每种都必须给出**可行动的失败原因**，"没满足"不算原因）：
 `max_chars` `min_chars` `contains`（全部出现）`forbids`（任一出现即违反）
-`items_between`（按分隔符数条目）`line_count` `zh_share_min`（汉字占比）
-`json_object`（复用 `parse_json(strict_object=True)`）`prefix` `no_code_fence` `no_markdown_prefix`。
-复用现成的 `fuzz.contains_all/contains_none`、`normalize.strip_code_fence/strip_wrappers`，
-**不新写第四套包含/归一化逻辑**。
+`items_between`（按声明的分隔符数条目）`line_count` `zh_share_min`（汉字占比）
+`json_object`（复用 `parse_json(strict_object=True)`）`prefix` `no_markdown`（列表符/标题井号/表格）。
+计划里的 11 种收成 10：`no_code_fence` 与 `no_markdown_prefix` 合成 `no_markdown`——
+代码围栏是排版形态，交给 `invalid_format` 那一维，不占约束的分母。
+复用现成的 `normalize_text`（全半角与大小写）与 `parse_json`，**不新写第四套归一化逻辑**。
 
 **核心取舍 1 —— 约束从参考回答派生，而不是先写数字再指望有人能满足。**
 每条 case 带一个 `meta.reference`：一句**必然满足该 case 全部约束**的参考文本，
@@ -2318,24 +2319,65 @@ S30 的对应物是"期望值过自己的 schema"；这里是"约束不许互相
 再加 `all_satisfied_rate`（全满足率，最严口径）。三个数各说一件事，只引用好看的那个就是说谎。
 `by_kind` 必须带分母：某类约束只考了 2 条时，它的"满足率 0.5"没有意义。
 
-**核心取舍 3 —— 空正文计 0 分但格式维度同时说清原因。**
+**核心取舍 3 —— 空正文计 0 分，但拒答按产出实测。**
 本任务的主分数是"满足了多少条约束"，空输出确实一条都没满足 ⇒ 进 `judged`、得 0；
-但 `invalid_format` / `format_valid_rate` 同层显示，且正文非空却全是 thinking 时
-沿用 P12 那句"预算被 thinking 吃光"（这是这台机器上最常见的假失败原因）。
-与 S30 的区别是有道理的：抽取任务里"没解析出 JSON"意味着内容判据无意义，
-而遵循任务里"什么都没写"就是零条遵循，不是"没考到"。
+逐条判的话 `max_chars` 与 `forbids` 会对"什么都没写"判通过，那 2/6 分是省 token 挣来的。
+计划里原本把拒答也一起清零，真做时发现那是**用启发式改写测量**：拒答有产出，就按产出逐条实测
+（一句"抱歉，我无法回答"确实只满足 2/5 条），只在 verdict 上单独标出来。
+再加两道防误判：全部约束都满足的答案**永不**被改判成拒答；清单只收自我声明式短语
+（`无法离线使用` 是一句合格的隐私说明，不该因为出现"无法"就被当成拒答）+ 60 字长度闸门。
+`empty_outputs` / `refusal_rate` / `format_valid_rate` 三列同时可见，所以"没写"与"拒了"与"没听话"分得开。
 **引擎故障（`status != OK`）仍然是 ERROR，不进能力分母**——那是环境不是模型。
 
 **`requires = {CHAT}`**：约束全是文本层面的形态，不需要受理解码也不需要工具。
 
-**自测**
+**落地时的三处与计划不同**（都是实现里发现计划不对，而不是偷工）：
+- 约束种类从 11 收到 10：`no_code_fence` 与 `no_markdown_prefix` 合成 `no_markdown`
+  （列表符/标题井号/表格三类一起看才是"别用 markdown"），代码围栏改由
+  `invalid_format` 那一维承担——它是排版形态，不该和"约束"混在同一个分母里。
+- 分条形态里 `split == "line"` 时**只用 `line_count`**，不再叠一条同义的 `items_between`：
+  两条考同一件事会让 `micro_rate` 被重复计权。
+- 拒答的处理反了：计划里写"空正文与拒答都不记分"，真做时才发现拒答**是有产出的**，
+  把它的实测清零等于用启发式改写测量。现在只有空正文记 0，拒答按逐条实测计分并单独占
+  `refusal_rate`；再加一道"全满足就不改判"的顺序保护与 60 字的长度闸门
+  （`无法`/`不能` 这类裸词从清单里删掉了——"无法离线使用"是一句合格的隐私说明）。
+
+**本机验证**
 ```bash
-uv run pytest tests/unit/test_constraint_grader.py tests/unit/test_instructions_zh_dataset.py -q
-uv run onyx eval run --task instruction_following --model qwen3.5:9b --seed 42   # 真机一次
-uv run onyx eval tasks     # 4 个任务，指标数与 aggregate 同源（契约测试自动覆盖新任务）
+uv run onyx eval tasks      # 4 个任务：指标数 22 / 22 / 26 / 29；新任务没改契约测试一行就被覆盖
+uv run pytest tests/contract/test_task_contract.py   # 33 条（从 25 长出来：4 个任务 × 8 + 1 条清单自检）
+uv run onyx eval run --task instruction_following --model qwen3.5:9b --seed 42
+  ⇒ run 01M45H2W7MD3SNAT0F2WNEP2Q2（git_rev a5f593f，39/39 done，39.5s，3,628 in / 734 out）
+     score 0.920 [0.884–0.952]（n=39 case）· micro_rate 0.916（152/166 条约束）· all_satisfied_rate 0.641（25/39 题）
+     判定 correct 25 / partial 14 · empty_outputs 0 · refusal_rate 0.000 · format_valid 1.000
+     by_kind 最弱三档：items_between 0.600（n=10）· line_count 0.667（n=3）· min_chars 0.846（n=13）
+     最强：forbids / no_markdown / prefix 全 1.000，contains 0.974（n=39）
+     ⇒ 这台机器上 9B 的薄弱环节是"分几条 / 分几行"这种**结构约束**，不是必含词；
+       三个口径 0.920 ≠ 0.916 ≠ 0.641 真的分叉，所以只引用其中一个会讲出三种不同的故事
+uv run pytest                # 1488 passed, 1 skipped, 36 deselected · 覆盖率 90%
+uv run pytest -m e2e         # 12 passed（矩阵现在是 4 列）
+uv run ruff check . · uv run lint-imports（3 kept）· check_extension_boundary（新任务没碰 runner.py/metrics.py）
+前端无改动（tsc / vitest 106 / build 复用 S30 的结果）
 ```
-**DoD**：三条同源对新任务全绿（契约测试无需为它加一行）；考卷自检那条能抓到"无解的题"；
-真机一次带 `score` / `micro_rate` / `all_satisfied_rate` 三个口径与 `by_kind` 分母；矩阵 4 列。
+新代码的覆盖：`constraints.py` 98% · `instructions_zh.py` 96% · `instruction_following.py` 99%。
+新增测试：约束判定 15 · 考卷自检 14 · 形态表 20 · mock 真跑 5 · 结构门禁 2。
+
+**顺带挖出的一处真缺陷**：S31 刚写的 `instruction_following.py` 里有**两份同名 `_looks_like_refusal`**，
+早期那份还写着 `len(_visible(text))` 而 `_visible` 返回的已经是整数——调用到被遮蔽的那一份就会 TypeError。
+全量测试是绿的（Python 取后一份），这与当年 `cli.py` 的两份 `_fmt` 是同一种静默失效。
+⇒ 那条结构断言从"只查 cli.py"升级为**对整个 `onyx/` 生效**（`tests/unit/test_module_structure.py`），
+并配一条注入缺陷的自检（把同名定义塞进去必须被点名，`@overload` 不算遮蔽）。
+
+**DoD**
+- ✅ 三条同源对新任务全绿，且**契约测试一行都没改**（参数化覆盖 `specs()`）
+- ✅ 考卷自检能抓到无解题：把某题字数上限收到参考回答之下，`unsatisfiable()` 立刻点名
+- ✅ 真机一次带三个口径与 `by_kind` 分母（每个 kind 都带 n，未考的类型不出现在字典里）
+- ✅ 矩阵 4 列（`intent / instruction_following / structured_extraction / tool_selection`）
+
+**提交**：
+`feat(eval): instruction_following 中文指令遵循 —— 考卷有解变成一条可跑的断言（S31）` ·
+`fix(test): 同名顶层定义的门禁从"只查 cli.py"升级为查整个 onyx/ —— 新文件又踩了一次` ·
+`docs(m11): S31 档案`
 
 ## S32 — 长上下文中文集（M11 第三步）
 
@@ -2471,6 +2513,7 @@ uv run python scripts/check_extension_boundary.py  # 无新增扩展点实现
 | S28 | 本地假接收端 + `ONYX_ALERT_WEBHOOK_URL=… onyx serve` | 真收到 POST 200；库里 detail 是去掉 query 的 URL；停掉接收端后 webhook 行 `failed` 而文件行照样 `sent`；cooldown 内历史不增长 |
 | S29 | 浏览器看 `#/` 顶部一行与「告警触发」面板 + `onyx doctor` | chip 的级别来自后端（error ≠ warn 的图标不同）；顶部一行同时说"几条异常"和"通知系统好不好"；样本链能落到真实 trace；doctor 的「告警」项在写不下去/全失败时变红 |
 | S30 | `onyx eval run --task structured_extraction --model qwen3.5:9b --seed 42` + `pytest tests/contract/test_task_contract.py` | 三个内置任务的**声明指标 == 产出指标**（空聚合与有样本都成立）；矩阵三列且新格带 `28/45` 分母；期望值过不了自己 schema 的条数为 0；负样本全对时主分数仍是「没考到」而不是满分 |
+| S31 | `onyx eval run --task instruction_following --model qwen3.5:9b --seed 42` + `pytest tests/unit/test_instructions_zh_dataset.py` | 39 条题的 `unsatisfiable()` 为空，而**收紧某题字数上限时它必须点名那道题**；三个口径同时出且互不相等（0.920 / 0.916 / 0.641）；`by_kind` 每种带分母且未考的类型不出现；空正文的 run 得 0 分而不是「没考到」 |
 | S34 | `uv run pytest -m e2e`（默认套件把它 deselect 了，必须显式跑） | 六页取数互相核对得上；每条 grade 的 trace_id 查得到真实 trace；真 uvicorn + 真 httpx 能读到 `hello → trace_start → trace_end`；把 broker 摘掉后**只剩 hello**（断链会被发现） |
 | 门禁 | `make coverage`（`coverage run -m pytest -q`） | 离线套件分支覆盖率 ≥ 80%（S17 落地时 88%，S21 后 89%，S23/S26 后仍 89%，M10 后 90%，S30 后仍 90%） |
 
