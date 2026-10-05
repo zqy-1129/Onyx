@@ -2178,7 +2178,7 @@ uv run pytest                # 1346 passed（S29 新增 11 条 Python：repos 2 
 
 ---
 
-# M11 评测资产（G5）—— S30 已达成，S31–S33 待做
+# M11 评测资产（G5）—— S30–S32 已达成，S33 待做
 
 判据（ROADMAP G5）：每个新任务都要求**三条同源断言全绿**（声明的指标 == 产出的指标、
 CI 的分母同源、分数能下钻到真实 trace）；真机跑一次带分母与 CI；
@@ -2271,7 +2271,7 @@ uv run ruff check . · uv run lint-imports（3 kept）· scripts/check_extension
 - ✅ `--limit` 截断时子集仍非空（契约测试与数据集测试各钉一条）
 - ✅ 雷达图出现：`onyx eval report --format html` 里那张 SVG 的阈值是"任务数 ≥3"，
   第三个任务落地后它真的画出来了（3 轴 = 三个任务，3 条模型线 = gpt-oss / mock / qwen3.5）
-- 🟡 矩阵 5–6 列：现在 3 列，还差 S31–S33
+- ✅ 矩阵 5–6 列：**S31/S32 落地后现在是 5 列**（写这条时是 3 列；每列仍带 `n_judged/n_total` 与 coverage）
 
 **提交**：
 `docs(m11): S30–S33 方案` · `fix(eval): 跑完的 RunReport 也带上考卷来历` ·
@@ -2379,7 +2379,7 @@ uv run ruff check . · uv run lint-imports（3 kept）· check_extension_boundar
 `fix(test): 同名顶层定义的门禁从"只查 cli.py"升级为查整个 onyx/ —— 新文件又踩了一次` ·
 `docs(m11): S31 档案`
 
-## S32 — 长上下文中文集（M11 第三步）
+## S32 — 长上下文中文集（M11 第三步）✅
 
 本机 16GB 能测出的最有价值的维度。**测检索式抽取而不是摘要**（摘要无法机械判分）。
 
@@ -2390,42 +2390,118 @@ uv run ruff check . · uv run lint-imports（3 kept）· check_extension_boundar
   （`CONTEXT_NEAR_LIMIT` ≥0.9、`CONTEXT_OVERFLOW` >1.0 都按它算）。
 - 传 `options.num_ctx=20480` 之后 `/api/ps` 立刻回报 `context_length=20480`，显存从 9.32G 降到 5.73G
   ⇒ Ollama **确实按请求采纳 num_ctx**，所以"窗口是多少"这件事可以由任务钉死，而不是猜引擎默认。
-- 中文长度换算：实测 0.6–0.7 token/汉字 ⇒ 4k/8k/16k 三档分别写 ~6,000 / ~12,000 / ~24,000 汉字，
-  而**分数只按引擎回报的真实 in_tokens 判断是否越界**，不靠这个估算。
+- 中文长度换算：0.68 token/汉字（16k 档实测：整篇 prompt 27,050 个 CJK 字符 ⇒ 引擎回报 16,740 tok）
+  ⇒ 4k/8k/16k 三档分别写 ~6,000 / ~12,000 / ~24,000 汉字。
+- **但"引擎回报的 in_tokens"不能拿来判越界**（这一条是做完之后才补上的实测，见下面核心取舍 2）。
 
-**产出文件（计划）**
+**产出文件**
 ```
-onyx/eval/datasets/builtin/longctx_zh.py       # 生成器：组合式中文段落填充 + 埋 3 个可精确匹配的事实
-onyx/eval/tasks/long_context.py                # 任务本体：钉 num_ctx、按位置与档位分桶、越界不记分
+onyx/eval/datasets/builtin/longctx_zh.py       # 生成器：组合式中文段落填充 + 埋 3 个可精确匹配的事实 + 同句式干扰项
+onyx/eval/datasets/builtin/longctx_zh.jsonl    # 9 条（3 档 × 3 变体），revision 记 seed/预算/有没有干扰项
+onyx/eval/tasks/long_context.py                # 任务本体：钉 num_ctx、按位置与档位分桶、被切不记分
+onyx/eval/graders/json_schema.py               # `clean_json_object` 提到公共层（三个任务共用同一套形态判据）
 onyx/eval/tasks/__init__.py · loader.py        # 注册 + 数据集别名 + revision
-onyx/cli.py                                    # eval run --num-ctx（任务侧窗口旋钮，默认由任务给）
-tests/unit/test_longctx_zh_dataset.py          # 埋点必在文中、答案唯一可判、三档单调变长、可复现
-tests/unit/test_long_context_grade.py          # 形态表 + 越界/截断的处理 + 分桶分母
-tests/unit/test_long_context_run.py            # mock 真跑：by_position、跳过的原因、trace 下钻
+onyx/cli.py                                    # eval run --num-ctx；报告加 needle_rate / confusion_rate
+tests/unit/test_longctx_zh_dataset.py          # 22 条：埋点必在文中、值唯一、位置按偏移验证、题面不歧义
+tests/unit/test_long_context_grade.py          # 27 条：形态表 + 截断/混淆的归因 + 分桶分母
+tests/unit/test_long_context_run.py            # 9 条：mock 真跑的 by_position、skip 的形状、trace 下钻
 ```
 
-**四条设计决定**
-1. **窗口由任务显式钉住**（默认 20,480，可 `--num-ctx` 覆盖）。一次运行只用一个窗口值：
-   逐条改 `num_ctx` 会让引擎反复重载，把"测长上下文"变成"测重载速度"。
-2. **越界不记分**：`grade` 读引擎回报的 `in_tokens`，超过 `num_ctx` 的样本判 `SKIPPED`
-   并写明"输入 N tok 超过窗口 M，结果不可信"。这是「未知 ≠ 0 分」在长上下文上的形态——
-   被截断的检索失败如果被算成"模型不会"，分数就会指导人去换模型，而该改的是窗口配置。
-   聚合里 `skipped_truncated` 与 `verdicts.skipped` 都能看见它。
-3. **答案必须可精确匹配**：每个埋点是一句带独特数值/编号/日期的事实，问题是"值是多少"，
-   输出格式沿用 S30 的 JSON 纪律（`{q1:…, q2:…, q3:…}`），判分复用 `parse_json` + `field_em`
-   （S30 之后它会按数值比，`3.6` 与 `3.60` 不会被算错）。
-4. **位置是主角**：每条埋点标 `first/middle/last`，`by_position` 各带分母——
-   "中部检索最差"（lost in the middle）在单一总分里完全看不见，
-   而它恰好是长上下文唯一能指导你"文档怎么排"的结论。`by_bucket`（4k/8k/16k）同理。
+**核心取舍 1 —— 每个埋点配一个同句式、另一实体的干扰项，因为"全对"本身就是一种测量缺陷。**
+第一版数据没有干扰项，真机跑出来 **9/9 全对、`needle_rate 1.000`**
+（run 01M45MARB6…，qwen3.5:9b，`--num-ctx 20480`，16k 档 in≈16.7k tok）。
+那不是模型强，是**扫到任意一个数字就能得分**。加干扰项（`冷却塔 12.5 吨` 旁边放一句
+`冷冻水循环量按每小时 9.8 吨核定`）之后检索必须认对实体。代价是题面一歧义就变成
+"两个值都算对"，所以配套三条可跑的考卷自检，每条都有注入缺陷测试证明它会响：
+`digits_only_in_needles`（正文不许有数字）、`value_string_collisions`（值之间不许互为子串——
+`12.5` 里含着 `2.5`，`text.count("2.5")` 会数到 2，于是那条"全文只出现一次"的自检在说谎）、
+`ambiguous_questions`（问句只点名答案实体，埋点句与干扰句互不提及对方实体）。
+**顺带把"认错实体"变成一个数**：`needle_confused` / `confusion_rate`
+（分母只用**带干扰项且答错**的埋点，数据没带干扰项时写「—」而不是 0——"没证据"不等于"没混淆"）。
 
-**自测**
+**核心取舍 2 —— 截断判据不能用窗口当尺子，因为真机上 `in_tokens` 永远 ≤ `num_ctx`。**
+`--split 16k --num-ctx 4096`（run 01M45YR4ZW…，那次还是旧判据）里 Ollama 把 16.8k tok 的正文
+裁到 **`in_tokens=2050`**——比窗口还小，所以"`in_tokens ≥ num_ctx` 才记 skip"这条**永远不会响**，
+三条被切的样本全被判成 `partial`、`score 0.000`。而那一次的
+`per_needle_ok` 是 `{q1:False, q2:False, q3:True}`：**只有结尾那条埋点活下来**，
+正是"切掉开头"的形状——分数会指导人换模型，该改的其实是窗口。
+⇒ 判据改成 **引擎给的数 vs 正文自己的 token 下限**（`_min_prompt_tokens`，0.5 tok/汉字）：
+连下限都不到 ⇒ 一定被切过 ⇒ `SKIPPED` + 原因 + `shrink`。两侧实测余量：
+健康样本 16,740 / 下限 13,525 = **1.24 倍**（不会误踢），被切样本 2,050 / 13,525 = **0.15 倍**
+（差一个数量级，跑不掉）。"≥窗口"那一路保留作第二判据（有的引擎回报未截断的长度）。
+拿启发式估算**打分**是本项目禁止的，但用它**把样本踢出分母**是安全的：误判方向只会是
+"少测一条"，不会是"把没测说成不会"。
+
+**核心取舍 3 —— 位置与档位各是一个分桶，且每格带分母。**
+`by_position` 每格是 `{matched, confused, n, rate}`，`by_bucket` 每格是
+`{cases, all_correct, matched, needles, all_correct_rate, needle_rate}`。
+**没答的那一题也算进它所属位置的分母**：只统计"回答了的键"会让漏答悄悄缩小分母，
+于是中部塌陷看起来像中部没考。`max_ctx_util` 刻意把 skip 的那些也算进来——
+这个数的用途是"该不该调 `--num-ctx`"，而最接近越界的那条恰恰是被记成 skip 的那条。
+
+**落地时的三处与计划不同**
+- 计划里聚合项写作 `skipped_truncated`，落地为 **`n_truncated`**（grade 侧是
+  `truncated` / `shrink` / `min_prompt_tokens`）：与其他 `n_*` 同前缀，看板的列名不用特例。
+- 计划没有干扰项，也没有 `confusion_rate`：那是第一版真机 9/9 全对**逼出来的**，
+  不是原计划的一部分（`distractors=yes` 因此进了 revision——干扰项变了分数就不可比）。
+- 埋点的 `kind`（number/code）字段删掉了：`field_em` 按值的类型自动走两套口径，
+  留一个会说的字段而不让它决定行为，就是给将来的漂移留位置。
+
+**顺带挖出的两处真缺陷**（都不是任务本身，而是"分数能不能回答它是哪份数据考出来的"这条前提）
+- `onyx eval show` 只印 seed/app/git，**`dataset_id` / `dataset_revision` 明明落了库却没露出来**
+  （`f75149f`）：revision 一变就意味着"同一个 id 的两次分数不可比"，看不见就只能靠人记住当时用的哪份数据。
+  现在 `eval run` 与 `eval show` 各有一行「考卷 … · …」，`--json` 的 run 对象也补齐了这两个字段。
+- **`_ensure_persisted` 只在"库里没有这份数据集"时才写样本**（`3f732a7`），而 case id 是内容哈希：
+  加干扰项之后 9 条全换了 id 而 `dataset_id` 不变 ⇒ 那一轮 **9 条 grade 反查 `eval_case` 命中 0 条**、
+  `dataset.revision` 还停在加干扰项之前那一份、`run_dataset_ids()`（"这次跑的到底是哪份考卷"）返回空集。
+  修法：revision 不同就重写；旧样本只删**没被任何 grade 引用过**的那些——
+  全留着会让"这份考卷几条"数不清楚（现在库里 18 行 vs `n_cases=9`，那 9 行是历史 run 的考卷，
+  删了就等于撕断分数历史），照"id 不在当前集合"删则是同一种撕断。判据是引用完整性，不是"看起来旧"。
+
+**本机验证**
 ```bash
-uv run pytest tests/unit/test_longctx_zh_dataset.py tests/unit/test_long_context_grade.py -q
-uv run onyx eval run --task long_context --model qwen3.5:9b --seed 42 --num-ctx 20480   # 真机
-uv run onyx eval run --task long_context --model qwen3.5:9b --split 16k                  # 单档跑
+uv run onyx eval tasks      # 5 个任务：指标数 22 / 22 / 29 / 26 / 29；新任务没改契约测试一行就被覆盖
+uv run pytest tests/contract  # 131 passed（其中 test_task_contract.py 41 条 = 5 个任务 × 8 + 1 条清单自检）
+uv run onyx eval run --task long_context --model qwen3.5:9b --seed 42 --num-ctx 20480
+  ⇒ run 01M4637FQZXQAEPZ0X4R8VFGE4（git_rev 3f732a7，9/9 done，72.1s，89,079 in / 331 out）
+     score 1.000 [1.000–1.000]（n=9 case）· needle_rate 1.000（27/27 个埋点）· confusion_rate 「—」
+     n_truncated 0 · window 20480 · max_ctx_util 0.8201 · mean_in 9,898 · reported_in_tokens 9/9
+     by_bucket：4k（in 4,361–4,432）/ 8k（8,508–8,570）/ 16k（16,740–16,796）各 3 case 全对
+     by_position：first / middle / last 全 9/9 ⇒ **这台机器在 ≤16.8k tok 上没有中部塌陷**
+     ⇒ 反过来说：**16k 这一档对 qwen3.5:9b 没有区分度**。要拉开只能往 32k+ 走，
+       而 16GB 卡上 20480 已占 5.73G 显存，档位与窗口的上限是卡决定的，不是模型决定的
+  负控制 ⇒ run 01M46097GT68W175SCFPR85MCV（`git_rev f75149f`，`--split 16k --num-ctx 4096`）
+     3 条全部 SKIPPED、`score —`（不是 0.000），每条 grade 自带原因：
+     「引擎只回报 2050 tok，而正文按汉字下限至少 13525 tok ⇒ 开头被切掉了（窗口 4096 tok 装不下这篇）」
+uv run pytest                # 1555 passed, 1 skipped, 36 deselected · 覆盖率 90%
+uv run pytest -m e2e         # 12 passed（矩阵现在是 5 列，qwen3.5:9b 行 0.920/0.991/1.000/0.893/0.639）
+uv run ruff check . · uv run lint-imports（3 kept）· check_extension_boundary（新任务没碰 runner.py/metrics.py）
+# 重写样本那条修好之后，三个 run 的 grade 都能反查到样本（各 9/9）：
+#   01M4637FQZ…（当前版）· 01M460KB51…（同数据，修之前那个 run 是 0/9）· 01M45MARB6…（上一版，靠留存的旧行）
+前端无改动（tsc / vitest 106 / build 复用 S30 的结果）
 ```
-**DoD**：三条同源对新任务全绿；`by_position` 与 `by_bucket` 每格带分母；
-真机一次并留下实测 in_tokens 与窗口的比值（`ctx_util`）；越界样本走 skip 且有原因；矩阵 5 列。
+新代码的覆盖：`longctx_zh.py` 100% · `long_context.py` 99%（只剩两条 loop-exit 的部分分支）。
+新增测试：考卷自检 22 · 形态与归因 27 · mock 真跑 9 · 样本重写 2。
+
+**DoD**
+- ✅ 三条同源对新任务全绿，契约测试**一行都没改**（参数化覆盖 `specs()`，现在 5 个任务）
+- ✅ `by_position` 与 `by_bucket` 每格带分母，真机两个数都在（first/middle/last 各 n=9）
+- ✅ 被截断的样本走 skip 且有可行动的原因——而且是**真机**跑出来的形状逼出来的判据
+- ✅ 每一条分数都能回答"它是哪份数据考出来的"：`eval run/show` 印出 revision，
+  而库里的样本行跟着 revision 重写（真机查出这条时命中 0/9）
+- ✅ 矩阵 5 列（`instruction_following / intent_classification / long_context /
+  structured_extraction / tool_selection`）
+- 🟡 留一项给下一步：这一档没有区分度，`long_context` 拉不出模型间差异 ⇒ 需要 32k+ 档
+  或另一台更大窗口的机器才有第二个数据点
+
+**提交**：
+`feat(eval): S32 长上下文中文检索 —— 第一版真机 9/9 全对，于是加了干扰项（a25eab6）` ·
+`fix(eval): 截断判据不能拿窗口当尺子 —— 真机上引擎回报的 in_tokens 永远 ≤ num_ctx（6f78b14）` ·
+`fix(cli): eval run/show 把考卷来历打出来 —— revision 是"两次分数能不能比"的唯一凭据（f75149f）` ·
+`docs(eval): 截断判据两侧的余量按实测写清（245538c）` ·
+`fix(eval): 考卷换版必须重写库里的样本 —— 否则 9 条 grade 有一条都点不回去（3f732a7）` ·
+`docs(m11): S32 档案`
+
 
 ## S33 — embedding 任务（M11 收口）
 
@@ -2555,7 +2631,8 @@ uv run python scripts/check_extension_boundary.py  # 无新增扩展点实现
 | S30 | `onyx eval run --task structured_extraction --model qwen3.5:9b --seed 42` + `pytest tests/contract/test_task_contract.py` | 三个内置任务的**声明指标 == 产出指标**（空聚合与有样本都成立）；矩阵三列且新格带 `28/45` 分母；期望值过不了自己 schema 的条数为 0；负样本全对时主分数仍是「没考到」而不是满分 |
 | S31 | `onyx eval run --task instruction_following --model qwen3.5:9b --seed 42` + `pytest tests/unit/test_instructions_zh_dataset.py` | 39 条题的 `unsatisfiable()` 为空，而**收紧某题字数上限时它必须点名那道题**；三个口径同时出且互不相等（0.920 / 0.916 / 0.641）；`by_kind` 每种带分母且未考的类型不出现；空正文的 run 得 0 分而不是「没考到」 |
 | S34 | `uv run pytest -m e2e`（默认套件把它 deselect 了，必须显式跑） | 六页取数互相核对得上；每条 grade 的 trace_id 查得到真实 trace；真 uvicorn + 真 httpx 能读到 `hello → trace_start → trace_end`；把 broker 摘掉后**只剩 hello**（断链会被发现） |
-| 门禁 | `make coverage`（`coverage run -m pytest -q`） | 离线套件分支覆盖率 ≥ 80%（S17 落地时 88%，S21 后 89%，S23/S26 后仍 89%，M10 后 90%，S30 后仍 90%） |
+| S32 | `onyx eval run --task long_context --model qwen3.5:9b --seed 42 --num-ctx 20480` + 同参数改 `--split 16k --num-ctx 4096` | 前者 9/9 全对且 `by_position` 三个位置各 n=9、`max_ctx_util 0.8201`、`reported_in_tokens 9/9`；后者**必须整场 `score —` 而不是 0.000**（每条 grade 自带"引擎只回报 2050 tok，下限至少 13525 tok"这句话）；`digits_only_in_needles` / `value_string_collisions` / `ambiguous_questions` 三条考卷自检在注入缺陷时都要响 |
+| 门禁 | `make coverage`（`coverage run -m pytest -q`） | 离线套件分支覆盖率 ≥ 80%（S17 落地时 88%，S21 后 89%，S23/S26 后仍 89%，M10 后 90%，S30–S32 后仍 90%） |
 
 ## 附录 B — 架构自测（让"模块化"可验证，而非口号）
 
