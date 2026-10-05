@@ -67,6 +67,19 @@ def parse_json(text: Any, *, strict_object: bool = False) -> JsonCheck:
     return JsonCheck(False, None, last_error, raw[:500])
 
 
+def clean_json_object(text: Any) -> bool:
+    """输出的**形态**是否干净：整段就是一个对象，没有围栏也没有前后缀说明。
+
+    能解析不等于干净——`好的，结果如下：{...}` 会被 `parse_json` 救回来，
+    但那是没听话的形态，下游按 JSON 直读的代码会炸。
+    所以"解析成功率"与"格式合法率"是两个数（DESIGN §9.4），这里管后者。
+    """
+    stripped = str(text or "").strip()
+    if stripped.startswith("```"):
+        return False
+    return stripped.startswith("{") and stripped.endswith("}")
+
+
 def _candidates(text: str) -> Sequence[str]:
     yield text
     for open_char, close_char in (("{", "}"), ("[", "]")):

@@ -2684,6 +2684,10 @@ def eval_run(
     resume: str = typer.Option(None, "--resume", help="续跑指定 run_id，跳过已评过的 case"),
     max_wall_ms: float = typer.Option(None, "--max-wall-ms"),
     max_tokens: int = typer.Option(None, "--max-tokens", help="覆盖任务的生成预算"),
+    num_ctx: int = typer.Option(
+        None, "--num-ctx",
+        help="覆盖任务的上下文窗口（长上下文任务用它钉住「窗口到底多大」）",
+    ),
     gpu_lock_path: Path = typer.Option(
         None, "--gpu-lock", help="GPU 锁文件路径；默认用机器级路径，多实例才会互斥"
     ),
@@ -2731,7 +2735,16 @@ def eval_run(
         # 之后 `--dataset x` 会报"未知数据集"，而样本就在同一张库里
         loaded = load_dataset(dataset, task_id=task, db=runtime.db)
         overrides = {"max_tokens": max_tokens} if max_tokens else {}
-        instance = build_task(task, model=model, dataset=loaded, **overrides)
+        if num_ctx:
+            # 只有长上下文任务吃这个参数；其它任务不认识它，所以不无条件塞进去
+            # （TypeError 会被包成"这个任务没有 --num-ctx"，而不是让整条命令看起来坏了）
+            overrides["num_ctx"] = num_ctx
+        try:
+            instance = build_task(task, model=model, dataset=loaded, **overrides)
+        except TypeError as exc:
+            typer.echo(f"任务 {task!r} 不接受这些参数: {exc}", err=True)
+            runtime.close()
+            raise typer.Exit(2) from None
     except KeyError as exc:
         typer.echo(str(exc).strip("'"), err=True)
         runtime.close()
@@ -2818,6 +2831,9 @@ _REPORT_METRICS = (
     ("none_correct_rate", "内容"),
     # 指令遵循的三个口径必须一起打印：只报一个就会被引用成三种不同的故事
     ("micro_rate", "内容"), ("all_satisfied_rate", "内容"),
+    # 长上下文：主分数是"三个埋点全找到"，needle_rate 是逐埋点命中率——差值就是"只找到一个"的题；
+    # confusion_rate 说清掉的那部分是"认错实体"还是"没读到"，两者修法完全不同
+    ("needle_rate", "内容"), ("confusion_rate", "内容"),
     ("hit_at_1", "选择"), ("set_f1", "选择"),
     ("no_call_rate", "选择"), ("wrong_tool_rate", "选择"),
     ("false_call_rate", "选择"), ("refusal_rate", "选择"),

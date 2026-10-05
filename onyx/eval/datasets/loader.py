@@ -303,6 +303,12 @@ def _build_instructions_zh():
     return build_cases()
 
 
+def _build_longctx_zh():
+    from onyx.eval.datasets.builtin.longctx_zh import build_cases
+
+    return build_cases()
+
+
 #: 内置数据集登记表。加一个数据集只需要在这里加一行 + 一个生成器模块
 _BUILTIN: dict[str, dict[str, Any]] = {
     "intent_zh": {
@@ -331,6 +337,17 @@ _BUILTIN: dict[str, dict[str, Any]] = {
         "notes": "生成器：每条样本的约束由一句必然满足它的参考回答派生（所以题目一定有解），"
                  "提示语再由约束渲染出来（所以不会考没说过的话）；"
                  "见 onyx/eval/datasets/builtin/instructions_zh.py",
+    },
+    "longctx_zh": {
+        "build": _build_longctx_zh,
+        # 预算与埋点池共同决定期望值：改任何一个都会让"同一个 id 的两次分数"不可比。
+        # `distractors=yes` 是 2026-10-05 加的：第一版没有干扰项，真机 9/9 全对——
+        # 那说明这条 revision 必须留下痕迹，否则"加了干扰项之前/之后的分数"看起来同分可比。
+        "revision": "seed=20261005+budgets=6000,12000,24000+distractors=yes",
+        "notes": "生成器：组合式中文长文（4k/8k/16k 三档按汉字预算）+ 首/中/尾三个可精确匹配的埋点；"
+                 "填充文本刻意不含任何数字，每个埋点配一个同句式、另一实体的干扰项，"
+                 "所以「检索到了」「猜了个常见数字」「认错实体」三件事分得开；"
+                 "见 onyx/eval/datasets/builtin/longctx_zh.py",
     },
 }
 

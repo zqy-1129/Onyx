@@ -19,6 +19,7 @@ from onyx.eval.datasets.loader import Dataset, load_builtin
 from onyx.eval.task import EvalTask, TaskSpec, coerce_task_spec
 from onyx.eval.tasks.instruction_following import InstructionFollowing
 from onyx.eval.tasks.intent_classification import IntentClassification
+from onyx.eval.tasks.long_context import LongContext
 from onyx.eval.tasks.structured_extraction import StructuredExtraction
 from onyx.eval.tasks.tool_selection import ToolSelection
 
@@ -34,6 +35,7 @@ BUILTIN_TASKS: dict[str, TaskSpec] = {
     InstructionFollowing.id: TaskSpec(
         InstructionFollowing, lambda: load_builtin("instructions_zh")
     ),
+    LongContext.id: TaskSpec(LongContext, lambda: load_builtin("longctx_zh")),
 }
 
 #: 内置数据集的规范别名（两种写法必须落到同一个 id，理由见 `load_dataset`）
@@ -42,6 +44,7 @@ _BUILTIN_DATASETS = {
     "intent_zh": "intent_zh", "intent_zh-v1": "intent_zh",
     "structured_ie": "structured_ie", "structured_ie-v1": "structured_ie",
     "instructions_zh": "instructions_zh", "instructions_zh-v1": "instructions_zh",
+    "longctx_zh": "longctx_zh", "longctx_zh-v1": "longctx_zh",
 }
 
 

@@ -50,7 +50,7 @@ from onyx.eval.datasets.builtin.structured_ie import (
     schema_for,
 )
 from onyx.eval.datasets.loader import Dataset
-from onyx.eval.graders.json_schema import check_schema, field_em, parse_json
+from onyx.eval.graders.json_schema import check_schema, clean_json_object, field_em, parse_json
 from onyx.eval.metrics import (
     LOW_CONFIDENCE_N,
     mean_ci,
@@ -183,7 +183,7 @@ class StructuredExtraction:
             )
 
         check = parse_json(text, strict_object=True)
-        clean = _is_clean_json_object(text)
+        clean = clean_json_object(text)
         if not check.parsed or check.as_object is None:
             if _is_refusal(text):
                 return Grade(
@@ -355,18 +355,6 @@ class StructuredExtraction:
         fields = "、".join(f"{name}:{FIELD_TYPES[name]}" for name in FIELD_TYPES)
         required = "、".join(sorted(keys)) if keys else "（无，输出空对象即可）"
         return SYSTEM_PROMPT.format(fields=fields, required=required, values=VALUE_RULES)
-
-
-def _is_clean_json_object(text: str) -> bool:
-    """格式是否"干净"：整段就是一个对象，没有围栏也没有前后缀说明。
-
-    能解析不等于干净——`好的，结果如下：{...}` 会被 parse 救回来，
-    但那是没听话的形态，下游按 JSON 直读的代码会炸。
-    """
-    stripped = text.strip()
-    if stripped.startswith("```"):
-        return False
-    return stripped.startswith("{") and stripped.endswith("}")
 
 
 def _is_refusal(text: str) -> bool:
