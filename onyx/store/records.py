@@ -327,3 +327,30 @@ class GradeRecord:
     judge_model_id: str | None = None
     judge_usage: dict[str, Any] = field(default_factory=dict)
     extra: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class AlertTriggerRecord:
+    """一次告警命中在某个渠道上的投递结果。
+
+    存在的理由只有一个：回答"那天到底通知没通知"。所以它记的是**命中 + 尝试投递**，
+    被 cooldown 抑制的不写（那是没发生的事），渠道失败必须写并带原因。
+    """
+
+    id: str
+    created_at: str
+    code: str
+    severity: str
+    #: 生效规则的快照（阈值/窗口/codes/cooldown + 出处）。规则以后会被改，
+    #: 而"当时为什么触发"必须以当时那份判据解释，不能拿现在的规则去倒推
+    rule: dict[str, Any] = field(default_factory=dict)
+    n_in_window: int = 0
+    window_s: int = 0
+    first_anomaly_id: str | None = None
+    last_anomaly_id: str | None = None
+    #: 样本 trace_id（够下钻就行，不是全量清单）
+    trace_ids: tuple[str, ...] = ()
+    channel: str = ""
+    status: str = "sent"
+    detail: str = ""
+    is_test: bool = False

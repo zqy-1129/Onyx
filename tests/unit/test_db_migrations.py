@@ -15,7 +15,7 @@ def db(tmp_path) -> Database:
 
 #: 仓库里的迁移数量。新增迁移时这个数会变，测试随之更新——
 #: 它是"迁移有没有被意外删掉/改名"的一道哨兵
-EXPECTED_VERSION = 6
+EXPECTED_VERSION = 7
 
 
 def test_fresh_db_applies_migrations(db):
@@ -24,7 +24,7 @@ def test_fresh_db_applies_migrations(db):
     assert {"provider", "model", "trace", "usage", "usage_alt", "token_part", "tool_call",
             "anomaly", "tool_def", "tool_test", "tool_run",
             "dataset", "eval_case", "eval_task", "eval_run", "grade",
-            "retention_run"} <= tables
+            "retention_run", "alert_trigger"} <= tables
     columns = {r["name"] for r in db.query("PRAGMA table_info(usage)")}
     assert {"prefill_mode", "prefill_ms_per_token"} <= columns, "P11 的冷/热分列必须落库"
 
@@ -102,12 +102,12 @@ def test_migration_writes_a_rollback_snapshot_first(tmp_path):
             "INSERT INTO provider(id, kind, base_url, api_style, created_at) VALUES('p','mock','','native','')"
         )
 
-    (migrations / "0007_wider.sql").write_text(
+    (migrations / f"{EXPECTED_VERSION + 1:04d}_wider.sql").write_text(
         "CREATE TABLE IF NOT EXISTS extra_note(id TEXT PRIMARY KEY, text TEXT NOT NULL);",
         encoding="utf-8",
     )
     with Database(path, migrate=False) as db:
-        assert db.migrate(migrations) == [7]
+        assert db.migrate(migrations) == [EXPECTED_VERSION + 1]
 
     snapshot = tmp_path / "backups" / f"pre-migration-v{EXPECTED_VERSION}.sqlite"
     assert snapshot.exists(), "升级前必须留快照"
@@ -200,7 +200,8 @@ def test_dataset_provenance_is_backfilled_for_existing_runs(tmp_path):
             )
 
     with Database(path, migrate=False) as db:
-        assert db.migrate(MIGRATIONS_DIR) == [5, 6], "0005 回填 + 0006 留痕表都要应用上"
+        assert db.migrate(MIGRATIONS_DIR) == list(range(5, EXPECTED_VERSION + 1)), \
+            "0005 回填 + 之后的每张留痕表都要应用上"
         run = EvalRepo(db).get_run("run-old")
         assert run is not None
         assert run.dataset_id == "intent_zh-v1", "历史 run 的数据集必须被回填出来"

@@ -177,6 +177,34 @@ class TraceRepo:
             for r in rows
         ]
 
+    def anomalies_in_window(
+        self,
+        *,
+        since: str,
+        codes: Sequence[str] | None = None,
+        limit: int = 2000,
+    ) -> list[AnomalyRecord]:
+        """`since` 之后的异常，按时间升序。告警判定用它算"窗口内出现几次"。
+
+        判据读库而不是读进程内计数：服务重启不该让同一条异常立刻再通知一遍，
+        而"刚才那五分钟里出现过几条"这件事只有库能回答。
+        `limit` 命中时调用方拿到的是**下限**而不是精确数，必须自己标出来（见 alerts.rules）。
+        """
+        sql = "SELECT * FROM anomaly WHERE created_at>=?"
+        params: list[object] = [since]
+        if codes:
+            sql += f" AND code IN ({','.join('?' * len(codes))})"
+            params.extend(codes)
+        sql += " ORDER BY created_at ASC, id ASC LIMIT ?"
+        params.append(limit)
+        return [
+            AnomalyRecord(
+                id=r["id"], code=r["code"], severity=r["severity"], trace_id=r["trace_id"],
+                detail=loads_dict(r["detail_json"]), created_at=r["created_at"],
+            )
+            for r in self.db.query(sql, tuple(params))
+        ]
+
     def anomaly_counts(self, *, since: str | None = None) -> dict[str, int]:
         sql = "SELECT code, COUNT(*) AS n FROM anomaly"
         params: Sequence[object] = ()
