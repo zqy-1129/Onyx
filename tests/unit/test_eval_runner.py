@@ -127,6 +127,19 @@ def test_dataset_is_persisted_once_not_on_every_run(env):
     assert repo.count_cases("tiny") == 6, "样本被重复写入"
 
 
+def test_a_finished_run_reports_which_exam_it_took(env):
+    """跑完的 report 必须带着考卷来历，不只是库里那份。
+
+    `RunReport` 声明这两个字段就是为了"每个结果都能回答这是哪份数据考出来的"，
+    而只有 skip 路径填了值：进程内的调用方（服务侧、脚本）拿到的是空串，
+    于是"这两次分数可比吗"退化成"得再去库里查一遍"。
+    """
+    runner, _ = _runner(env, _scripts("转账"))
+    done = runner.run(RunConfig(model=MODEL))
+    assert done.status == "done"
+    assert done.dataset_id == "tiny" and done.dataset_revision == "r1"
+
+
 def test_k_sampling_produces_k_traces_per_case(env):
     """引擎不支持 n，所以 k 次采样是 k 次独立请求、k 条独立 trace。"""
     _, sink, _, _ = env

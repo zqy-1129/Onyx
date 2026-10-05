@@ -308,6 +308,10 @@ class EvalRunner:
             aggregate=aggregate, grades=tuple(grades),
             cost=cost, n_cases=n_cases, n_done=n_done, n_error=n_error,
             n_skipped=skipped_count, started_at=started_at, finished_at=utc_now_iso(),
+            # 跑完的 run 也要带上考卷来历：字段声明的就是"每个结果都必须能回答
+            # "这是哪份数据考出来的""，只有 skip 路径带上的话，
+            # 进程内直接用 report 的调用方（服务侧、脚本）拿到的是空串
+            dataset_id=self._dataset_id, dataset_revision=self._dataset_revision,
         )
 
     def _unload_other_models(self, keep: str) -> list[str]:
