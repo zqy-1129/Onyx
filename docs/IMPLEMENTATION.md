@@ -1988,6 +1988,124 @@ CLI：41 条命令（models 2 → 4）
 
 ---
 
+# M10 观测触达（G4）—— 方案（S27–S29，未开始）
+
+判据（ROADMAP G4）：**人为造一条 `CONTEXT_OVERFLOW` 能在 1 分钟内收到通知，并在界面看到"为什么触发"**；
+`onyx alerts ls` 有触发历史；Fleet 顶部有"当前有 N 条 error 级异常"；多引擎观测形态**定案**。
+
+**三条前置事实**（都在代码里核实过，方案建立在它们之上，不是建立在设想上）
+1. 23 个异常码已经带 `severity`（info/warn/error）+ `meaning` + `action`（`obs/anomalies.py:SPECS`），
+   所以"什么算该通知"不需要新定义，只需要**筛选与阈值**。文案也不许在前端再写一份。
+2. `anomaly` 表已有 `idx_anomaly_code ON anomaly(code, created_at DESC)`，
+   `/api/fleet` 已经在用 `TraceRepo.anomaly_counts(since=)`——**读侧的窗口查询有现成形状可复用**。
+3. 事件出口已有的网络例外只有两条（`sinks.otlp -> httpx`、`executors.http -> httpx`），
+   契约原文要求"每次例外都要在这里写明是谁、为什么"。webhook 是第三个，必须显式登记而不是绕过。
+
+**核心设计决策：判定在"读侧轮询"，不在请求路径里的 visitor 内**（这条决定 S27 的全部形状）
+- 判据必须以**库里已有的 anomaly 行**为准，而不是进程内的计数：进程重启后
+  "最近 5 分钟出现 4 次 CONTEXT_OVERFLOW"仍然算得出来。这是 S26 那条教训的直接应用
+  ——状态以持久事实为源，内存只是缓存（`eval/service.py` 的僵尸回收走的是同一个逻辑）。
+- 在被观测的那次请求里发外部 HTTP，等于让**观测者影响被测**：webhook 慢 800ms 就会进 TTFT，
+  webhook 挂了就会在 trace 里留一条与模型无关的 error。而 `obs/visitors` 的隔离机制
+  恰恰会把这种失败吞成一行 warning（S1 的 SSE 静默失效就是这么来的）。
+- `poll_s` 默认 5s ⇒ 1 分钟的 DoD 有余量；轮询线程随 `serve` 的 lifespan 起停，
+  复用 `eval_service` 已经跑通的模式（启动、`shutdown(timeout)`、失败可见）。
+- **CLI 侧不后台跑**：`onyx chat` / `eval run` 这类一次性进程不通知——否则同一条异常会被
+  N 个进程各发一次。界面上的实话是"通知来自 serve"，`doctor` 里检查有没有一个在跑的 serve。
+
+## S27 — 告警内核 + 本地文件出口 + 触发历史（M10 第一步）
+
+**产出文件（计划）**
+```
+onyx/store/migrations/0007_alerts.sql   # alert_trigger：code/severity/rule/window_n/首末 anomaly_id/
+                                        # channel/status/detail/created_at
+onyx/store/records.py                   # AlertTriggerRecord
+onyx/store/repos/alert_repo.py          # insert_trigger / list_triggers / last_triggered_at(code, channel)
+onyx/obs/alerts/rules.py                # 配置 → Rule；窗口计数与阈值、cooldown 判定（纯函数，可单测）
+onyx/obs/alerts/channels.py             # AlertChannel 协议 + FileChannel（追加一行 JSONL）
+onyx/obs/alerts/service.py              # 轮询线程：watermark → 命中 → 落库 → 逐渠道投递 → 落投递结果
+onyx/config.py                          # [alerts] 段 + _SCHEMA 键（severities/codes/exclude_codes/
+                                        # window_s/min_count/cooldown_s/poll_s/file/enabled）
+onyx/api/deps.py · onyx/api/app.py      # AppState.alert_service + lifespan 起停
+onyx/api/routes/alerts.py               # GET /api/alerts（触发历史）· GET /api/alerts/rules（生效规则与出处）
+onyx/cli.py                             # onyx alerts ls · onyx alerts test --channel file
+onyx/web/src/pages/Fleet.tsx            # 顶部一行 + 触发历史面板
+tests/unit/test_alert_rules.py · test_alert_service.py · test_api_alerts.py · test_cli_alerts.py
+```
+
+**接口**
+- `Rule(codes, severities, exclude_codes, window_s, min_count, cooldown_s)`；
+  `evaluate(rows, now, last_triggered) -> list[Hit]` 是**纯函数**：输入 anomaly 行与上次触发时间，
+  输出命中与原因。窗口、阈值、cooldown 三条判定都能在离线单测里穷举，不需要真等 5 秒。
+- `AlertChannel.deliver(alert) -> ChannelResult(ok, detail)`。渠道不抛异常给调用方，
+  但**必须返回失败原因**并落成 `status=failed` 的行——"我没收到通知"必须能被区分成
+  "没命中规则" / "被 cooldown 抑制" / "渠道失败" / "渠道没配"。
+- `GET /api/alerts?since=&code=&status=&limit=`；`GET /api/alerts/rules` 回**生效值 + 出处**
+  （flag/env/文件/默认），与 `onyx config show` 同一套口径。
+
+**关键取舍**
+- **`webhook_url` 优先取环境变量 `ONYX_ALERT_WEBHOOK_URL`**，写进文件要给出理由才允许：
+  webhook URL 通常带 secret（`?key=…`），而配置文件会跟着备份、截图与 git 状态漂走——
+  与 `[serve].token` 完全同一条理由，沿用 S21 的姿态。`config show` 与任何日志都不许打印全 URL。
+- **cooldown 抑制不写行**。只写"命中并尝试投递"的行。否则 `alert_trigger` 会被心跳式的
+  重复异常淹没，而它存在的意义是回答"那天到底通知没通知"。
+- 一条异常**不因规则重叠而重复投递**：命中集合按 `(code, 窗口)` 去重后再分渠道。
+- FileChannel 默认 `.data/alerts/alerts-YYYYMMDD.jsonl`，追加写、`flush` 后即返回；
+  它是"零依赖一定成功"的那条出口，所以 S27 只做它，webhook 留到 S28 单独验。
+
+**自测**
+```bash
+uv run onyx db init && uv run python -c "...version()"   # schema_version=7
+# 人为造异常：用 mock 打一条超长输入（或直接插 anomaly 行），5s 内看到文件里多一行
+uv run onyx alerts test --channel file        # 明确标注是测试行，不混进真实历史
+uv run onyx alerts ls --limit 20              # status/channel/detail 可读；测试行标着 test
+uv run pytest tests/unit/test_alert_rules.py -q   # 窗口/阈值/cooldown/去重 各自一条
+```
+**DoD**：G4 的"1 分钟内收到通知"由**文件出口**达成且能在 `alert_trigger` 里回溯；
+`[alerts]` 里写错键时 `doctor` 报红（沿用 S20 的"写了不生效"检查）。
+**提交点**：`feat(obs): 告警规则与本地文件出口 —— 判定读侧轮询（S27 第一步）` /
+`feat(store): alert_trigger 触发历史表与 repo（S27 第二步）` /
+`feat(api,web): 触发历史端点与 Fleet 顶部一行（S27 第三步）`
+
+## S28 — 通用 webhook 出口（M10 第二步）
+
+**产出文件（计划）**：`onyx/obs/alerts/webhook.py`（httpx，**惰性导入**）、
+`pyproject.toml` 的 import-linter 例外一行、`onyx/doctor` 加"出口可达性"检查、
+`tests/unit/test_alert_webhook.py`（本地起一个 `http.server` 收 POST，不依赖外网）。
+
+**关键取舍**
+- 契约例外**必须写成一条 `ignore_imports`** 并附理由（惰性导入：没配 URL 时根本不 import httpx，
+  `onyx obs` 其余部分在零三方依赖下也必须能 import）。用 stdlib `urllib.request` 绕过检查是
+  更省事的做法，但那会让"新增一个顺手发请求的模块"变得不可见——门禁的意义正在这。
+- 超时默认 5s、重试上限 2 次（退避），**不无限重试**：本地网络断几小时是常态，
+  无限重试的队列会把"哪些异常没通知"变成不可查。失败落 `status=failed` + 原因。
+- 载荷只带**结论与定位信息**（code/severity/n/首末 anomaly_id/trace_id/时间/rule 出处），
+  不带 trace 正文——正文里可能有用户输入，而 webhook 是往机器外面送。这条与
+  "默认不导出工具参数与 base64 图片"是同一条纪律。
+- 非 2xx 也算失败并带上状态码；`Content-Type` 固定 `application/json`。
+
+**DoD**：断网/错误 URL 时 `alert_trigger` 里有 `failed` 行且 Fleet 面板看得见；
+`onyx alerts test --channel webhook` 在本机假服务器上真收一条 POST。
+**提交点**：`feat(obs): 通用 webhook 告警出口 —— 第三个显式网络例外（S28）`
+
+## S29 — 触达可见性 + 多引擎观测形态定案（M10 收口）
+
+**产出文件（计划）**：`onyx/api/routes/fleet.py`（顶部一行要的数字与出处）、
+`onyx/web/src/pages/Fleet.tsx`（error 级异常一行 + 为什么触发的下钻）、
+`onyx/cli.py`（`doctor` 新增两项：告警出口状态、是否有 serve 在跑）、
+`docs/DESIGN.md` + `docs/DEPLOY.md`（或 DESIGN 内一节）：**一进程一引擎**定案与多实例起法。
+
+**多引擎形态定案（这条是决策，不是待办）**：写死**一进程一 provider**，
+文档给出多实例的起法与"汇总视图怎么读"（同一台机器多个 `--port` + 各自 `.data`？
+还是共享一个库？——共享库时 `provider` 表本来就支持多行，`--read-only` 看板只读一个端口，
+所以汇总口径必须说清"这份数据来自哪个实例"）。理由：GPU 是机器级一块，
+锁也是机器级的，一个进程绑多个 provider 会把"谁在占 GPU"变成多持有者协调问题，
+而收益只是省一个端口。**数据模型领先于使用路径**这件事要在文档里承认，而不是靠再加一层抽象掩盖。
+
+**DoD**：G4 四条判据全部消失 ⇒ M10 收口；STATUS/ROADMAP/README 按实测数字更新。
+
+---
+
 ## 附录 A — 每步自测速查
 
 | 步 | 命令 | 绿的条件 |
