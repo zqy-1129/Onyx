@@ -2,14 +2,15 @@
 
 核对时间 **2026-10-05**，HEAD = M9 四步（S23 界面发起评测、S24 数据集闭环、S25 Tool Bench、
 S26 模型治理出口与续跑）+ M10 三步（S27 告警内核与文件出口、S28 通用 webhook、S29 界面可见性与多引擎定案）
-+ M12 第一步（S34 六页 e2e + SSE 上线消费）之后 ⇒ **M0–M10 全部达成，M12 已开始**。
++ M12 第一步（S34 六页 e2e + SSE 上线消费）+ M11 第一步（S30 结构化抽取与任务契约测试）之后
+⇒ **M0–M10 全部达成，M11 与 M12 都已开始**。
 本文所有数字都是当场跑出来的（命令附在每节末尾），不是从旧文档抄的；
 `README.md` 的进度表、`docs/IMPLEMENTATION.md` 的分步档案是历史沿革，
 **这里回答的是"现在有什么、能干什么、还欠什么"**。
 
 一句话：**不发一句命令就能完成"导入数据 → 拉模型 → 跑评测 → 续跑中断 → 看矩阵 → 下钻 trace →
 审计工具库"，而且出事会在 1 分钟内主动通知你**（本地文件 + 通用 webhook 两个出口，触发历史落库可查）。
-欠的是 S7 剩下的 `report usage` / `token explain` 两个入口、M11 的评测资产，以及一批"带原因推迟"的项。
+欠的是 S7 剩下的 `report usage` / `token explain` 两个入口、M11 剩下的三个任务，以及一批"带原因推迟"的项。
 
 ---
 
@@ -70,8 +71,16 @@ WAL + 批量 sink（队列满丢样本但 `dropped` 计数可见）、
   这张表与它的保留规则存在了很久却没有一条路径写过它，所以"运行历史"面板会永远是空的
 
 ### L5 评测 `onyx/eval/`
-- 2 个内建任务：`intent_classification`（236 条中文意图集）、`tool_selection`（97 条工具调用集）
-- 7 个评分器模块 + 类型感知参数比对（数值容差 / 日期归一 / 集合等价 / 严格档与宽松档分开报）
+- 3 个内建任务：`intent_classification`（236 条中文意图集）、`tool_selection`（97 条工具调用集）、
+  `structured_extraction`（**S30**，45 条中文结构化抽取：模板 36 + 人工难例 4 + 「无可抽取信息」负样本 5）
+- **任务契约测试（S30）**：`tests/contract/test_task_contract.py` 把"声明的指标 == 产出的指标、
+  区间跟着它那个数、主分数不许是稳定性指标、引擎故障只留「没考到」不留 0 分"
+  对 `specs()` 里**每一个**任务参数化跑（内置与插件同一套断言，新增任务不必改这个文件就会被覆盖）
+- 结构化抽取判定的三层各自成指标：`json_valid_rate`（听不听话）/ `schema_valid_rate`（结构对不对）/
+  `field_em` 与 `score`（内容准不准）；负样本走 `none_correct_rate` **不进主分数**——
+  混进均值等于奖励"什么都不抽"
+- 7 个评分器模块 + 类型感知参数比对（数值容差 / 日期归一 / 集合等价 / 严格档与宽松档分开报）。
+  S30 修正了 `field_em`：数值字段按**数值**比，`500` 与 `500.0` 是同一笔钱
 - 指标层：macro_f1 / accuracy / balanced_accuracy / P-R-F1 / 混淆对 /
   pass^k 与 pass@k / stability_gap / bootstrap CI（**按 case 重采样**，95% 区间带出处）
 - 配对比较：净改善 / 净劣化 / 不变 + McNemar 翻转表 + 配对 bootstrap + 劣化清单（每条带两个 trace_id）
@@ -145,23 +154,38 @@ WAL + 批量 sink（队列满丢样本但 `dropped` 计数可见）、
 ## 2. 质量门与规模
 
 ```
-uv run pytest            # 1348 passed, 1 skipped, 36 deselected（默认档就是离线套件，CI 用它量覆盖率。M10 的告警面按文件数：store 15 / rules 20 / service 20 / webhook 15 / API 7 / CLI 8，另加落在既有文件里的 11 条）
+uv run pytest            # 1425 passed, 1 skipped, 36 deselected（默认档就是离线套件，CI 用它量覆盖率。S30 新增 77 条：任务契约 25 / 考卷自检 19 / 形态表 28 / mock 真跑 5，另删掉被契约测试取代的 2 条旧断言）
 uv run pytest -m e2e     # 12 passed（S34：六页取数同源 10 条 + SSE 真 HTTP 消费与"断链自检"2 条。默认档把它 deselect 了，CI 里是独立一步）
 uv run pytest -m live     # 20 passed（真打 qwen3.5:9b，与评测共用机器级 GPU 锁）
 uv run pytest -m probe     # 4 passed（P 系列实验的可重跑版本）
 uv run ruff check .         # All checks passed（`ruff format` 不是门禁）
-uv run lint-imports          # 3 contracts kept（网络例外 3 条：executors.http / sinks.otlp / alerts.webhook，每条写明是谁与为什么）
-uv run coverage run -m pytest -q && uv run coverage report   # 90% ≥ 80%（分支覆盖，离线套件，12,610 句；M10 新代码 98%）
-uv run python scripts/check_extension_boundary.py   # 接入实现未触碰受保护内核文件
+uv run lint-imports          # 3 contracts kept（网络例外 2 条：executors.http + sinks.otlp/alerts.webhook 合并在契约 2，每条写明是谁与为什么）
+uv run coverage run -m pytest -q && uv run coverage report   # 90% ≥ 80%（分支覆盖，离线套件，12,799 句；S30 的新代码：任务 99% / 数据生成器 92%）
+uv run python scripts/check_extension_boundary.py   # 接入实现未触碰受保护内核文件（S30 因此把 RunReport 那条修复单独成一个提交）
 uv run onyx doctor            # 9 项体检（带网络 10 项）：配置 / Python / 可写 / 磁盘 / 迁移 / blob / 档位 / 告警 / 插件
 uv run onyx config show       # 每一项生效值标出来自 flag/环境/文件/默认哪一层（token 与 webhook URL 只报"已设置"）
 uv build && uv tool install --from dist/*.whl …  # 干净环境装起来：version / db init / chat(mock) / doctor 全通
-前端：tsc --noEmit / vitest 104 / vite build（235.49KB js）+ 浏览器 take_snapshot
+前端：tsc --noEmit / vitest 106 / vite build（235.89KB js）+ 浏览器 take_snapshot
 API：openapi 32 paths / 34 operations（含 `GET /api/stream` SSE）
 CI：.github/workflows/ci.yml 跑上面这些（本机已验证命令本身可跑通；仓库尚无远端 ⇒ 还没真跑过一次）
 ```
 
 真机跑过的证据（可复查，都在 git 里）：
+S30 的新任务在 qwen3.5:9b 上跑了三轮，**分数差异全部能归因到提交**（`git_rev` 逐条记录）：
+`2181720` ⇒ `score 0.129 [0.032–0.258]`、`date` 字段级 EM **0.000（15 条全错）**；
+查下去是**考卷自己有问题**——提示词写着"字段值必须来自原句，不要改写"，而期望值要 ISO 日期与纯数值，
+模型照抄「3 月 4 号」于是被判不会抽取。同轮还有 `500` vs `500.0` 被算成抽错（数值按字符串比）、
+以及 `event` 是五值封闭词表却没告诉模型（现场输出 `"event": "丢了钱包"`）。
+修完 ⇒ `68d4f30`：**score 0.893 [0.786–1.000]（n=28 case）· field_em 0.973 · exact_object_rate 0.667 ·
+json_valid 1.000 · schema_valid 0.733 · off_vocabulary 0.000 · 负样本 5/5 全对 · 45 请求 70.8s / 11,037 in / 1,400 out**。
+`score` 与 `exact_object_rate` 差出来的 12 条全是"多抽一个空占位字段"（`"org": ""`），
+那就是"内容对但下游不能直接用"的真实比例。浏览器侧（真 serve:8787 + vite:5173）：
+矩阵长出第三列（`macro_f1 0.991 / score 0.893 / must_call_acc 0.639`，可比性警告点名三份数据），
+运行列表显示 `score 0.893 …`（**改 HEADLINE 顺序之前这里显示的是 `pass_hat_k 0.667`**——
+稳定性指标顶掉了任务自己的主分数），grade 表的「期望/预测」从整列 `[object Object]` 变成
+`person=李娜 · place=杭州 · …`，判定筛选项改成读这次运行自己的分布
+（硬编码清单里根本没有 `partial`，而 45 条里 27 条是 partial）。
+`onyx eval report --format html` 里那张 SVG 雷达图的阈值是"任务数 ≥3"，第三个任务落地后它真的画了出来。
 M10 把"记录"变成了"触达"，两条出口都在真机上验过，不是 MockTransport：
 `ONYX_ALERT_WEBHOOK_URL=… onyx serve` 起来后往库里插一条 `CONTEXT_OVERFLOW`（error 级）⇒
 一个轮询周期内本地假接收端**真收到 POST 200**，`alert_trigger` 落下两行 `sent`，
@@ -223,8 +247,9 @@ S23 在浏览器里真跑过：`--provider mock` 的 serve 上点「开始评测
 | `onyx serve --reload` | 附录 A 的自测命令 | 小：开发体验，非功能缺口（vite 的 HMR 已覆盖前端） |
 
 ### B. 明确推迟、带原因的（不是遗漏）
-- `structured_extraction`、`instruction_following` 两个任务：M4 出口只要求"两个 task 真机跑通"，
-  先做深不如先做对（`docs/IMPLEMENTATION.md` S14 一节记了理由）。
+- `instruction_following`（S31）与长上下文中文集（S32）、embedding（S33）：M4 出口只要求"两个 task
+  真机跑通"，先做深不如先做对（`docs/IMPLEMENTATION.md` S14 一节记了理由）。
+  `structured_extraction` 已在 **S30** 落地（45 条、三层正交判定、真机 0.893 [0.786–1.000]）。
 - `ollama_builtin` 执行器：必须先有 P21 的实测结论（模板里内建工具到底怎么渲染），
   否则做了也是猜的。`onyx tools contract` 那一列会显示"未实现，计划在 S16+"。
 - `onyx.graders` 扩展点：见上表（没有消费点就先不建）。
@@ -232,6 +257,13 @@ S23 在浏览器里真跑过：`--provider mock` 的 serve 上点「开始评测
   `plugins_example` + `.data` 里一张 `provider` 表就够用；等真出现"同一台机器常驻 3 个引擎"再做配置层。
 
 ### C. 已知边界（会被误读成 bug 的那些）
+- `structured_extraction` 真机上 `date` 是 3/12 错，逐条看过都是**模型的错**，不是判据的错：
+  两条把「二月二十八日」写成锚定日本身（`2026-03-01`），一条把「下周三」算成 `2026-03-08`。
+  另有一处**已经露头但还没算进分数的考卷含糊**：难例"赵敏**昨天**下了一单，**后天**再退"
+  模型答的是 `2026-03-03`（它取了后天），而期望值是昨天——本轮这条因为多抽了一个 `"event"`
+  字段先落在 `schema_valid_rate` 那一层，日期判据没参与。规则"两个相对时间取第一个"
+  目前只写在数据注释里，提示词没说。要么把它写进提示词，要么拆句，
+  **不许悄悄改期望值让分数变好看**。
 - 打分口径只有 gen-based（API-only 拿不到受约束 logprob），评测输出会固定写"不可与公开 leaderboard 直接比较"。
 - 兼容通道（vLLM / LM Studio / `/v1`）**没有分段时序** ⇒ TTFT/TPS 一律「—」；
   `structured_output` / `stream_usage` 长期是 `?`（未实测）而不是 `✗`——探针套件目前依赖 Ollama 原生端点。
@@ -260,9 +292,12 @@ S23 在浏览器里真跑过：`--provider mock` 的 serve 上点「开始评测
 2. ~~`-m e2e` 用例~~（**S34 已交付数据通路那一半**：六页取数互相核对 + SSE 在真 HTTP 连接上被读到
    + "摘掉 broker 就会红"的自检 + CI 独立一步并钉进门禁清单）。
    剩下的部分是**真浏览器驱动**（Playwright 起 vite + serve），它仍欠着——见上表那一行。
-3. **M11 评测资产**（G5）：`structured_extraction`、`instruction_following`、长上下文中文集、
-   embedding 任务（视觉要先解决 U8/U9 的未决实测）。每个新任务要求"三个同源"断言全绿。
-   M12 剩下的 S35（覆盖率基线 + 契约矩阵真 stdio 列）与 S36（`onyx perf` 基线）可与 M11 并行。
+3. ~~M11 第一步~~（**S30 已交付**：`structured_extraction` 45 条 + 所有任务共用的契约测试，
+   真机 `score 0.893 [0.786–1.000]（n=28 case）`，矩阵 3 列、报告雷达图出现）。
+   剩下 **S31–S33**：`instruction_following`（约束必须可机械检查）、长上下文中文集（4k/8k/16k，
+   先量清每个模型实际 `num_ctx`）、embedding 任务（`Cap.EMBED` 终于有消费者）。
+   视觉仍等 U8/U9 的未决实测。M12 剩下的 S35（覆盖率基线 + 契约矩阵真 stdio 列）与
+   S36（`onyx perf` 基线）可与 M11 并行。
 4. **`token explain` + `report usage`**：都属于"每天都在用但入口缺失"。
 5. C 组三条一致性（`RECONCILED` 不发、`base_url` 默认值、兼容通道探针覆盖）适合凑成一次"口径一致性"清理。
 

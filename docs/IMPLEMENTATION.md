@@ -2178,7 +2178,7 @@ uv run pytest                # 1346 passed（S29 新增 11 条 Python：repos 2 
 
 ---
 
-# M11 评测资产（G5）—— 方案（S30–S33，未开始）
+# M11 评测资产（G5）—— S30 已达成，S31–S33 待做
 
 判据（ROADMAP G5）：每个新任务都要求**三条同源断言全绿**（声明的指标 == 产出的指标、
 CI 的分母同源、分数能下钻到真实 trace）；真机跑一次带分母与 CI；
@@ -2195,38 +2195,89 @@ S23–S29 的八处真实缺陷全部只能靠手工点出来，而那些路径�
 现在把它变成**所有任务共用的一条契约测试**（内置 + 插件一起参数化跑）。
 否则每加一个任务就多一份"看板建列时才知道有哪些指标"的风险。
 
-## S30 — `structured_extraction`：结构化抽取 + 通用任务契约测试（M11 第一步）
+## S30 — `structured_extraction`：结构化抽取 + 通用任务契约测试（M11 第一步）✅
 
-**产出文件（计划）**
+**产出文件**
 ```
-onyx/eval/datasets/builtin/structured_ie.py   # 生成器（不是 JSONL）：中文句子里抽人物/金额/日期/地点/事件
-                                             # 三条设计：含"无可抽字段"的负样本、多实体难例单独打 tag、ord 稳定
-onyx/eval/tasks/structured_extraction.py      # 任务本体：三层正交判定（可解析 / schema 合规 / 字段级 EM）
-onyx/eval/tasks/__init__.py                   # BUILTIN_TASKS + _BUILTIN_DATASETS 别名
-onyx/eval/datasets/loader.py                  # _BUILTIN 条目（revision 由生成参数决定）
-tests/contract/test_task_contract.py          # 三个同源，参数化覆盖 specs() 的每一个任务
-tests/unit/test_structured_ie_dataset.py      # 生成器可复现 + schema 自洽 + 子集非空
-tests/unit/test_structured_extraction_grade.py # 形态表：干净 / 字段错 / 多输出 / 截断 / 拒答 / 空正文
-tests/unit/test_structured_extraction_run.py  # mock 引擎真跑一条：分母、CI、每条 grade 带 trace_id
+onyx/eval/datasets/builtin/structured_ie.py    # 生成器：45 条（模板 36 + 人工难例 4 + 负样本 5）
+onyx/eval/datasets/builtin/structured_ie.jsonl # 生成器的镜像；测试钉住两者必须一致
+onyx/eval/datasets/loader.py                   # _BUILTIN 条目；revision = seed=20261003+anchor=2026-03-01
+onyx/eval/tasks/structured_extraction.py       # 三层正交判定 + 取值口径写进提示词
+onyx/eval/tasks/__init__.py                    # BUILTIN_TASKS + 数据集别名（第三个任务）
+onyx/eval/graders/json_schema.py               # field_em：数值字段按数值比
+onyx/eval/task.py · onyx/cli.py               # HEADLINE 顺序 / 报告指标分组
+onyx/web/src/pages/EvalRuns.tsx               # grade 表的取值渲染 + 判定筛选项
+tests/contract/test_task_contract.py           # 25 条：参数化覆盖 specs() 的每一个任务
+tests/unit/test_structured_ie_dataset.py       # 19 条：考卷自检（可复现 / schema 自洽 / 锚定日 / 子集）
+tests/unit/test_structured_extraction_grade.py # 28 条：形态表 + 聚合分母
+tests/unit/test_structured_extraction_run.py   #  5 条：mock 引擎真跑，分母/CI/trace 下钻
+tests/unit/test_graders.py · eval.test.ts      # 数值比较 + 前端两个纯函数
 ```
 
 **为什么是"三层正交"而不是一个 JSON 分**：`parse_json` → `check_schema` → `field_em`
 分别回答**格式听不听话 / 结构对不对 / 内容准不准**。本地小模型上这三件事的修法完全不同
 （第一种改提示词与停止词，第二种改字段数与嵌套深度，第三种才是能力）。
 混成一个数就把"提示词没写清"误读成"模型不行"——这正是 DESIGN §9.4 反复在防的那类误读。
-判定与形态表复用 `onyx/eval/graders/json_schema.py`（`parse_json(strict_object=True)`、
-`check_schema`、`field_em`），**不新写第四套评分器**。
+判定与形态表复用 `onyx/eval/graders/json_schema.py`，**不新写第四套评分器**。
+
+**两个"正确率"分母不同**：`score` 只在"结构合规且有字段可抽"的样本里算，
+`exact_object_rate` 在所有可归因样本里算（格式坏、结构坏、负样本造字段都算不合规）。
+真机上这两个数是 **0.893 / 0.667**——差出来的 12 条全是"多抽了一个空占位字段"
+（`"org": ""`、`"event": ""`），那才是下游真正会炸的东西。
 
 **`requires` 刻意不含 `Cap.STRUCTURED_OUTPUT`**：这个任务测的就是"没有受理解码器时模型能不能自己吐合规 JSON"。
 要求它等于把要测的东西当成前提——那样分数永远 100%，而探针里 `structured_output` 大多是 `?`（未实测）。
 
-**自测**
+**真机跑出来的四处缺陷（都不是单测能发现的）**
+1. **提示词与判据互相矛盾**：旧提示词写"字段值必须来自原句，不要改写"，而期望值是 ISO 日期与纯数值。
+   于是 `date` 的字段级 EM 是 **0.000（15 条全错）**：模型照原句抄了「3 月 4 号」。
+   修复后提示词给出归一化口径（日期 YYYY-MM-DD + 锚定日换算、金额去单位去千分位），`date` 升到 0.750。
+2. **`field_em` 按字符串比数值**：`500` 与 `500.0` 是同一笔钱，却算抽错。
+   旧跑分 `amount` 只有 **0.211（19 条）**，大部分掉的正是写成整数的值；改成数值比之后 1.000。
+3. **封闭词表没给模型**：`event` 只有五个合法值，提示词却一个都没说，于是抽错时测的是猜词
+   （现场是 `"event": "丢了钱包"`）。现在按 `VALUE_VOCAB` 与数据同源给出，并新增
+   `off_vocabulary_rate` 把"造词"与"选错类别"分开计（真机这一位是 0.000）。
+   整体分数的变化：**score 0.129 → 0.893、field_em 0.715 → 0.973、exact_object 0.200 → 0.667**。
+4. **界面把新任务读歪**：`grade` 表的「期望/预测」是 `String(obj)` ⇒ 整列 `[object Object]`；
+   判定筛选项是硬编码词表 ⇒ `partial`（45 条里的 27 条）筛不出来；
+   而主分数候选把稳定性指标 `pass_hat_k` 排在任务自己的 `score` 之前 ⇒ 列表页显示的是"稳不稳"。
+
+契约测试同时顺出两处**早就存在**的漂移：两个内置任务少声明了 9–10 个真的会产出的指标
+（分母与 verdict 分布），以及 `RunReport` 只有 skip 路径才填 dataset 来历（单独一条 `fix(eval)` 提交，
+因为 `onyx/eval/runner.py` 是扩展边界门禁的保护文件，"接新任务不改内核"这条不能破例）。
+
+**本机验证**
 ```bash
-uv run onyx eval run --task structured_extraction --model <本地模型> --seed 42   # 真机一次
-uv run onyx eval tasks            # metric_names 与 aggregate 的键一致（契约测试同款）
-uv run pytest tests/contract/test_task_contract.py -q
+uv run onyx eval tasks        # 3 个任务，指标数 22 / 25 / 29（声明即产出）
+uv run onyx eval run --task structured_extraction --model qwen3.5:9b --seed 42
+  ⇒ run 01M45E4YK3KQPVSD7KHK9ZRBJP（git_rev 68d4f30，45/45 done，70.8s，11,037 in / 1,400 out）
+     score 0.893 [0.786–1.000]（n=28 case）· field_em 0.973 · exact_object 0.667 · none_correct 1.000
+     json_valid 1.000 · schema_valid 0.733 · off_vocabulary 0.000 · 判定 correct 30 / wrong 12 / partial 3
+uv run onyx eval show 01M45E4YK3KQPVSD7KHK9ZRBJP    # 每条 grade 有 trace；负样本那两行是 {} / {}
+uv run pytest                # 1425 passed, 1 skipped, 36 deselected · 覆盖率 90%
+uv run pytest -m e2e         # 12 passed
+uv run ruff check . · uv run lint-imports（3 kept）· scripts/check_extension_boundary.py（通过）
+前端 tsc --noEmit · vitest 106（+2 条纯函数）· vite build 235.89 kB
+浏览器（真 serve:8787 + vite:5173，ollama 引擎）：
+  #/eval/matrix 三列：macro_f1 0.991 / score 0.893 / must_call_acc 0.639，
+                     可比性警告点名三份数据，薄格仍强制显示 8/236
+  #/eval 主分数列：score 0.893 [0.786–1.000] ⚠低样本（修复前这里显示 pass_hat_k 0.667）
+  grade 表：期望/预测显示 person=李娜 · place=杭州 · …；判定筛选 correct (30)/wrong (12)/partial (3)
+  三条同任务的历史运行都留着，git_rev 分别是 2181720 / 71a8243 / 68d4f30 —— 分数差异能归因到提交
 ```
-**DoD**：新任务三条同源断言全绿；矩阵多出一列且每格带分母；`--limit` 截断时子集仍非空。
+**DoD**
+- ✅ 三条同源：`tests/contract/test_task_contract.py` 对 3 个内置任务（+ 插件示例被同一参数化覆盖）全绿
+- ✅ 矩阵多出一列且每格带分母：新格 `n_judged 28 / n_total 45`（coverage 0.62），CI 的 n 与主分数同为 28
+- ✅ `--limit` 截断时子集仍非空（契约测试与数据集测试各钉一条）
+- ✅ 雷达图出现：`onyx eval report --format html` 里那张 SVG 的阈值是"任务数 ≥3"，
+  第三个任务落地后它真的画出来了（3 轴 = 三个任务，3 条模型线 = gpt-oss / mock / qwen3.5）
+- 🟡 矩阵 5–6 列：现在 3 列，还差 S31–S33
+
+**提交**：
+`docs(m11): S30–S33 方案` · `fix(eval): 跑完的 RunReport 也带上考卷来历` ·
+`feat(eval): structured_extraction 中文结构化抽取 + 所有任务共用的契约测试（S30）` ·
+`fix(eval): 抽取任务把取值口径写进提示词，数值字段按数值比` ·
+`fix(web): grade 表把字段集合渲染成 k=v，判定筛选项改成读这次运行自己的分布`
 
 ## S31 — `instruction_following`：多条约束的可判定遵循（M11 第二步）
 
@@ -2367,8 +2418,9 @@ uv run python scripts/check_extension_boundary.py  # 无新增扩展点实现
 | S27 | `onyx db init` → `onyx alerts test` → `onyx alerts ls`；serve 里插一条 error 级异常 | schema v7 且迁移前自动留快照；测试行标 `is_test=1` 且不参与 cooldown；`alerts ls` 空表也打印生效判据与出处；异常落库后一个轮询周期内文件出口自己多一行 |
 | S28 | 本地假接收端 + `ONYX_ALERT_WEBHOOK_URL=… onyx serve` | 真收到 POST 200；库里 detail 是去掉 query 的 URL；停掉接收端后 webhook 行 `failed` 而文件行照样 `sent`；cooldown 内历史不增长 |
 | S29 | 浏览器看 `#/` 顶部一行与「告警触发」面板 + `onyx doctor` | chip 的级别来自后端（error ≠ warn 的图标不同）；顶部一行同时说"几条异常"和"通知系统好不好"；样本链能落到真实 trace；doctor 的「告警」项在写不下去/全失败时变红 |
+| S30 | `onyx eval run --task structured_extraction --model qwen3.5:9b --seed 42` + `pytest tests/contract/test_task_contract.py` | 三个内置任务的**声明指标 == 产出指标**（空聚合与有样本都成立）；矩阵三列且新格带 `28/45` 分母；期望值过不了自己 schema 的条数为 0；负样本全对时主分数仍是「没考到」而不是满分 |
 | S34 | `uv run pytest -m e2e`（默认套件把它 deselect 了，必须显式跑） | 六页取数互相核对得上；每条 grade 的 trace_id 查得到真实 trace；真 uvicorn + 真 httpx 能读到 `hello → trace_start → trace_end`；把 broker 摘掉后**只剩 hello**（断链会被发现） |
-| 门禁 | `make coverage`（`coverage run -m pytest -q`） | 离线套件分支覆盖率 ≥ 80%（S17 落地时 88%，S21 后 89%，S23/S26 后仍 89%，M10 后 90%） |
+| 门禁 | `make coverage`（`coverage run -m pytest -q`） | 离线套件分支覆盖率 ≥ 80%（S17 落地时 88%，S21 后 89%，S23/S26 后仍 89%，M10 后 90%，S30 后仍 90%） |
 
 ## 附录 B — 架构自测（让"模块化"可验证，而非口号）
 
