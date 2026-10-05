@@ -158,6 +158,33 @@ def test_engine_failure_stays_out_of_the_capability_denominator():
 
 
 # ── 越界：不记分 ───────────────────────────────────────────────────
+def test_engine_number_below_the_document_floor_is_read_as_truncation():
+    """真机形状：`--num-ctx 4096` 跑 16k 档，引擎回报 2050 tok——**比窗口还小**。
+
+    "in_tokens ≥ 窗口"这条判据在这种情况下永远不响，于是三条 16k 样本被判成 partial、
+    `score 0.000`，而那一次跑出的 `per_needle_ok` 是 `{q1:F, q2:F, q3:T}`：
+    只有结尾的埋点活下来，正是"开头被切掉"的形状。判据必须拿正文自己的下限去比。
+    """
+    raw = _cases()[0]
+    raw["input"] = {"text": "记录" * 8400}  # 16,800 汉字 ⇒ 下限 8,400 tok
+    dataset = Dataset(id="lc-long-v1", cases=(raw,), upstream="test", revision="r1")
+    task = LongContext(dataset, model=MODEL, num_ctx=4096)
+
+    grade = _grade(task, "lc-a", _dump(ANSWERS), in_tokens=2050)
+    assert grade.verdict is Verdict.SKIPPED and grade.passed is None
+    assert grade.metrics["truncated"] is True
+    assert grade.metrics["min_prompt_tokens"] == 8400
+    assert grade.metrics["shrink"] == pytest.approx(2050 / 8400, abs=1e-4)
+    assert "2050" in grade.error and "8400" in grade.error and "num-ctx" in grade.error
+    assert task.aggregate([grade])["score"] is None, "被切的样本不许进分子也不许进分母"
+    assert task.aggregate([grade])["n_truncated"] == 1
+
+    # 同一篇正文，窗口够大时数字就正常：判据不是"越长越 skip"
+    healthy = _grade(LongContext(dataset, model=MODEL, num_ctx=20480), "lc-a", _dump(ANSWERS),
+                     in_tokens=16755)
+    assert healthy.verdict is Verdict.CORRECT and not healthy.metrics.get("truncated")
+
+
 def test_input_over_the_window_is_skipped_with_an_actionable_reason():
     grade = _grade(_task(num_ctx=2048), "lc-a", _dump(ANSWERS), in_tokens=3000)
     assert grade.verdict is Verdict.SKIPPED and grade.passed is None

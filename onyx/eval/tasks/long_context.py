@@ -12,11 +12,15 @@
    20480（显存 9.32G → 5.73G）⇒ Ollama 确实按请求采纳窗口，"窗口多大"不必猜。
    看 card 会高估一个数量级，而 `obs/visitors/gpu.py` 用的正是实际载入那一份。
    一次运行只用一个窗口值：逐条改 `num_ctx` 会让引擎反复重载，把长上下文测试变成重载速度测试。
-2. **越界不记分**：grade 读**引擎回报**的 in_tokens，≥ 窗口就判 `SKIPPED` 并写明原因。
-   这是「未知 ≠ 0 分」在长上下文上的形态——被静默截断的检索失败如果算成"模型不会"，
+2. **被截断的样本不记分**，而且**"in_tokens ≥ 窗口"这条判据是空的**。
+   2026-10-05 真机：`--num-ctx 4096` 跑 16k 档（正文≈16.8k tok），Ollama 把正文裁到只剩
+   `in_tokens=2050` —— 比窗口还小，所以只看"超没超窗口"永远不会跳，三条全被判成 partial、
+   `score 0.000`。而 `per_needle_ok` 是 `{q1:F, q2:F, q3:T}`：只有结尾那条埋点活下来，
+   正是"切掉开头"的形状。所以判据改成**引擎给的数 vs 正文自己的 token 下限**
+   （`_min_prompt_tokens`，只由汉字推出）：连下限都不到 ⇒ 一定被切过 ⇒ 记 `SKIPPED` 并写原因。
+   这是「未知 ≠ 0 分」在长上下文上的形态——静默截断如果被算成"模型不会"，
    分数会指导人去换模型，而该改的是窗口配置。
-   引擎没回报 in_tokens 时**不做越界判断**（拿启发式估算冒充引擎数字，
-   等于凭空造出一个"被截断"的结论），只在 `reported_in_tokens` 里露出这个缺口。
+   引擎没回报 in_tokens 时**不做截断判断**，只在 `reported_in_tokens` 里露出这个缺口。
 3. **位置与档位各是一个分桶**。总分 0.78 既看不出"中部塌陷"（lost in the middle），
    也看不出"过了 8k 就开始掉"，而只有这两条能指导你改文档排布或换窗口。
 4. **答错的埋点要分清"认错实体"还是"没读到"**。第一版数据没有干扰项，真机跑出来 9/9 全对
@@ -132,11 +136,15 @@ class LongContext:
         keys = list(case.expect.get("keys") or ())
         positions = dict(case.expect.get("positions") or {})
         text = sample.text or ""
+        prompt = str(case.input.get("text") or "")
         in_tokens = _engine_in_tokens(sample)
+        floor = _min_prompt_tokens(prompt)
         base: dict[str, Any] = {
             "expected_keys": keys, "positions": positions, "in_tokens": in_tokens,
             "bucket": str(case.meta.get("bucket") or "unknown"),
             "ctx_util": round(in_tokens / self.num_ctx, 4) if in_tokens else None,
+            # 正文自己的 token 下限：判"有没有被切"用它，而不是拿窗口当尺子（见 item 2）
+            "min_prompt_tokens": floor,
         }
 
         if sample.status is not Status.OK:
@@ -144,8 +152,24 @@ class LongContext:
                 case_id=case.id, score=0.0, verdict=Verdict.ERROR, passed=None,
                 error=sample.error or f"status={sample.status}", metrics=base,
             )
+        if in_tokens is not None and floor and in_tokens < floor:
+            # 引擎给的数连正文的 token 下限都不到 ⇒ 它裁掉了开头。
+            # 2026-10-05 真机：--num-ctx 4096 跑 16k 档（正文≈16.8k tok），引擎回报
+            # in_tokens=2050（<窗口，所以"≥窗口"那条判据永远不会响），三条都判成 partial、
+            # score 0.000 —— 而 per_needle_ok 是 {q1:F, q2:F, q3:T}：只有**结尾**那条埋点活下来，
+            # 正是"切掉开头"的形状。这就是这条判据存在的全部理由。
+            return Grade(
+                case_id=case.id, score=0.0, verdict=Verdict.SKIPPED, passed=None,
+                error=(
+                    f"引擎只回报 {in_tokens} tok，而正文按汉字下限至少 {floor} tok ⇒ "
+                    f"开头被切掉了（窗口 {self.num_ctx} tok 装不下这篇），"
+                    "检索结果不可信 ⇒ 提高 --num-ctx 或改跑更小的档位（记 skip，不记 0 分）"
+                ),
+                metrics={**base, "truncated": True, "shrink": round(in_tokens / floor, 4),
+                         "needle_total": len(keys), "needle_matched": 0, "per_needle_ok": {}},
+            )
         if in_tokens is not None and in_tokens >= self.num_ctx:
-            # 引擎把开头切掉了：这时判"错"是让模型替配置背锅
+            # 引擎把整篇都算进来了却还是超窗（有些引擎回报未截断的长度）：同样不能记分
             return Grade(
                 case_id=case.id, score=0.0, verdict=Verdict.SKIPPED, passed=None,
                 error=(
@@ -352,6 +376,24 @@ def _confused_keys(
         probe = field_em({key: distractors[key]}, {key: actual.get(key)})
         out[key] = int(probe["matched"]) == 1
     return out
+
+
+#: 一个汉字至少值半个 token。实测 qwen3.5:9b 是 0.68 tok/字（16k 档：24,754 字 ⇒ 引擎回报
+#: 16,755 tok），cl100k 系约 1.5。取**下限**是刻意的：只有当引擎给的数连下限都不到时
+#: 才敢说"它切了正文"，误判方向就是"少踢一条"而不是"把正常样本踢出分母"。
+MIN_TOKENS_PER_HANZI = 0.5
+
+
+def _min_prompt_tokens(prompt: str) -> int:
+    """正文的 token 下限（只由汉字推出）。0 表示推不出来 ⇒ 不做截断判断。
+
+    这不是"用估算冒充测量"：估算在这里的用途是**把样本踢出分母**（记 skip），
+    而不是给模型打分——它只会让人看不见这一条，不会把"没测"说成"不会"。
+    """
+    from onyx.llm.measurement.heuristic import split_cjk
+
+    cjk, _other = split_cjk(prompt)
+    return int(cjk * MIN_TOKENS_PER_HANZI)
 
 
 def _engine_in_tokens(sample: Generation) -> int | None:

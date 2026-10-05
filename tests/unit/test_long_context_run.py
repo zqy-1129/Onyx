@@ -1,10 +1,14 @@
 """长上下文任务在 mock 引擎上真跑（S32 第三条同源）。
 
-契约测试管声明与产出同源，这里管跑起来之后的三件事：
+契约测试管声明与产出同源，这里管跑起来之后的四件事：
 - 每条分数都能下钻到真实 trace（长上下文的 trace 特别值钱：它带着 in_tokens 与窗口）；
 - 窗口是**请求里带出去的**，并且 `window_tokens` 与 `ctx_util` 在聚合里自洽；
-- 引擎回报的 in_tokens 越界时走 skip，不进分母也不进分子——
-  一个"16k 全错"的 run 与一个"16k 没测成"的 run 必须在数字上长得不一样。
+- 引擎回报的 in_tokens **低于正文的汉字下限**时走 skip，不进分母也不进分子——
+  一个"16k 全错"的 run 与一个"16k 没测成"的 run 必须在数字上长得不一样
+  （真机上这就是那条判据的由来：`--num-ctx 4096` 时引擎回报 2050 tok，比窗口还小，
+   只看"超没超窗口"就永远不会跳，于是 0 分挂在了配置头上）；
+- mock 引擎回报的数按汉字数折算（`_reported`）：写死一个小数字会让健康样本全被判成截断，
+  那不是任务对了，是装置错了。
 """
 
 from __future__ import annotations
@@ -49,11 +53,24 @@ def _runner(env, scripts: list[MockScript], task: LongContext) -> EvalRunner:
     return EvalRunner(gateway, EvalRepo(env[0]), task, dataset=task.dataset, clock=FakeClock())
 
 
-def _perfect(task: LongContext, n: int, *, in_tokens: int = 1500) -> list[MockScript]:
+#: 真机实测比例（qwen3.5:9b，2026-10-05：16k 档 24,754 汉字 ⇒ 引擎回报 16,755 tok）
+TOK_PER_HANZI = 0.68
+
+
+def _reported(case) -> int:
+    """mock 引擎该回报的 in_tokens：按正文汉字数折算，而不是随手写一个 1500。
+
+    刻意让它大于任务的"汉字下限"（0.5 tok/字）：低于下限会被判成正文被裁 ⇒ skip。
+    写死一个假数字会让每条健康样本都走进截断分支，那才是真的没测到东西。
+    """
+    return int(int(case.meta["hanzi"]) * TOK_PER_HANZI)
+
+
+def _perfect(task: LongContext, n: int, *, in_tokens: int | None = None) -> list[MockScript]:
     return [
         MockScript(text=json.dumps({item["id"]: item["value"] for item in case.meta["needles"]},
                                    ensure_ascii=False),
-                   done_reason="stop", in_tokens=in_tokens, out_tokens=18)
+                   done_reason="stop", in_tokens=in_tokens or _reported(case), out_tokens=18)
         for case in task.load(limit=n)
     ]
 
@@ -61,6 +78,7 @@ def _perfect(task: LongContext, n: int, *, in_tokens: int = 1500) -> list[MockSc
 def test_a_real_run_carries_the_window_and_the_denominators(env):
     _, sink, _, _ = env
     task, n = _task(num_ctx=20480), 6
+    cases = list(task.load(limit=n))
     report = _runner(env, _perfect(task, n), task).run(RunConfig(model=MODEL, seed=42, limit=n))
     sink.flush(5.0)
 
@@ -68,23 +86,26 @@ def test_a_real_run_carries_the_window_and_the_denominators(env):
     assert report.n_cases == n and report.n_done == n and report.n_error == 0
 
     aggregate = report.aggregate
+    expected = [_reported(case) for case in cases]
     assert aggregate["n_total"] == aggregate["n_judged"] == n
     assert aggregate["score"] == 1.0 and aggregate["needle_rate"] == 1.0
     assert aggregate["needle_total"] == 3 * n
     assert aggregate["window_tokens"] == 20480
     assert aggregate["reported_in_tokens"] == n, "每条都要拿到引擎回报的 in_tokens"
-    assert aggregate["mean_in_tokens"] == 1500
-    assert aggregate["max_ctx_util"] == pytest.approx(1500 / 20480, abs=1e-4)
+    assert aggregate["mean_in_tokens"] == round(sum(expected) / len(expected))
+    assert aggregate["max_ctx_util"] == pytest.approx(max(expected) / 20480, abs=1e-3)
     assert aggregate["n_truncated"] == 0
     assert aggregate["verdicts"] == {Verdict.CORRECT.value: n}
     assert aggregate["low_confidence"] is True
 
 
-def test_a_tiny_window_turns_the_run_into_skips_not_zeroes(env):
-    """窗口调小 ⇒ 全部越界 ⇒ 分数必须是「没测到」而不是 0 分。
+def test_a_window_too_small_to_hold_the_document_is_reported_as_not_measured(env):
+    """窗口装不下正文 ⇒ 分数必须是「没测到」而不是 0 分。
 
-    这条是 S32 全部的立足点：`--num-ctx 1024` 跑 6 条时，
-    如果分数显示 0.000，人就会去换模型，而真正该改的是窗口。
+    这条是 S32 的立足点，而它的**触发方式**是真机教我的：`--num-ctx 4096` 跑 16k 档时
+    Ollama 把正文裁到 in_tokens=2050（小于窗口），"≥窗口"那条判据永远不会响，
+    于是三条被判成 partial、score 0.000 —— 让人以为该换模型，其实该调窗口。
+    这里用 1,500 tok 重现那个形状：引擎给的数低于正文的汉字下限 ⇒ 一定被切过。
     """
     _, sink, _, _ = env
     task, n = _task(num_ctx=1024), 6
@@ -99,26 +120,32 @@ def test_a_tiny_window_turns_the_run_into_skips_not_zeroes(env):
     assert aggregate["score"] is None and aggregate["needle_rate"] is None
     assert aggregate["by_position"] == {} and aggregate["by_bucket"] == {}
     assert aggregate["verdicts"][Verdict.SKIPPED.value] == n
-    # 窗口占用率仍把越界那些算进来：它就是"该调 --num-ctx"的证据
+    # 窗口占用率仍把这些算进来：它就是"该调 --num-ctx"的证据
     assert aggregate["max_ctx_util"] == pytest.approx(1500 / 1024, abs=1e-3)
     assert report.n_skipped == n
     assert all("num-ctx" in (grade.error or "") for grade in report.grades)
+    # 每条grade都要能自证"我是被切的，不是不会"：下限数字必须留在指标里
+    for grade in report.grades:
+        assert grade.metrics["truncated"] is True
+        assert grade.metrics["min_prompt_tokens"] > grade.metrics["in_tokens"]
 
 
 def test_every_grade_points_at_a_real_trace_with_the_window(env):
     _, sink, _, _ = env
     task, n = _task(), 4
+    cases = list(task.load(limit=n))
     report = _runner(env, _perfect(task, n), task).run(RunConfig(model=MODEL, limit=n))
     sink.flush(5.0)
 
     repo = TraceRepo(env[0])
     assert len(report.grades) == n
+    by_id = {case.id: case for case in cases}
     for grade in report.grades:
         trace = repo.get(grade.trace_id)
         assert trace is not None, f"{grade.case_id} 的分数点不进真实请求"
         assert trace.eval_run_id == report.run_id
         # 长上下文里 trace 的独特价值：窗口占用率与 in_tokens 都能从分数走到证据
-        assert grade.metrics["in_tokens"] == 1500
+        assert grade.metrics["in_tokens"] == _reported(by_id[grade.case_id])
         assert grade.metrics["bucket"] in {"4k", "8k", "16k"}
 
 
@@ -134,7 +161,7 @@ def test_by_position_survives_a_mixed_run(env):
         MockScript(text=json.dumps({item["id"]: item["value"] for item in case.meta["needles"]}
                                    if index % 2 else {"q3": case.meta["needles"][2]["value"]},
                                    ensure_ascii=False),
-                   done_reason="stop", in_tokens=1500, out_tokens=18)
+                   done_reason="stop", in_tokens=_reported(case), out_tokens=18)
         for index, case in enumerate(cases)
     ]
     report = _runner(env, scripts, task).run(RunConfig(model=MODEL, limit=6))
@@ -153,10 +180,10 @@ def test_by_position_survives_a_mixed_run(env):
 
 
 def test_position_asymmetry_is_visible_while_the_total_score_is_not(env):
-    """一条"只找得到开头与结尾"的模型：总分什么都没说，`by_position` 把塌陷画出来。
+    """一条"只找得到开头与结尾"的模型：`needle_rate 0.667` 听着还行，塌陷只在分桶里看得见。
 
-    这就是这任务存在的理由——`score` 与 `needle_rate` 都是 0.667，
-    而 first/middle/last 是 1.0 / 0.0 / 1.0。
+    这就是这任务存在的理由——逐埋点命中率 0.667 与 first/middle/last 的 1.0 / 0.0 / 1.0
+    说的是两个不同的故事，而只有后者能指导你改文档排布。
     """
     _, sink, _, _ = env
     task = _task()
@@ -164,7 +191,7 @@ def test_position_asymmetry_is_visible_while_the_total_score_is_not(env):
     scripts = [
         MockScript(text=json.dumps({item["id"]: item["value"] for item in case.meta["needles"]
                                     if item["position"] != "middle"}, ensure_ascii=False),
-                   done_reason="stop", in_tokens=1500, out_tokens=18)
+                   done_reason="stop", in_tokens=_reported(case), out_tokens=18)
         for case in cases
     ]
     report = _runner(env, scripts, task).run(RunConfig(model=MODEL, limit=3))
@@ -192,7 +219,7 @@ def test_answering_the_real_distractors_reads_as_confusion(env):
     scripts = [
         MockScript(text=json.dumps(
             {item["id"]: item["distractor_value"] for item in case.meta["needles"]},
-            ensure_ascii=False), done_reason="stop", in_tokens=1500, out_tokens=18)
+            ensure_ascii=False), done_reason="stop", in_tokens=_reported(case), out_tokens=18)
         for case in cases
     ]
     report = _runner(env, scripts, task).run(RunConfig(model=MODEL, limit=3))
