@@ -99,16 +99,30 @@ CI 跑 ruff + lint-imports + 离线 + 边界 + 覆盖率 + 前端 + 安装冒烟
 并在页面上显示"谁在占"（`/api/gpu` 已有数据）。S23 按这条做了：`AppState` 把同一把锁的
 路径与 stale 阈值注入提交服务，测试 `test_submitted_runs_share_the_apps_gpu_lock` 钉住"锁路径不许分叉"。
 
-### G4 观测的产品化闭环（只有记录，没有触达）
-证据：`grep webhook\|notify` → 0。23 种异常码全部只落库；`obs/visitors` 的设计目标是"新异常规则、成本模型、**告警**"，
+### G4 观测的产品化闭环（只有记录，没有触达）✅ 已达成（M10 / S27–S29）
+证据（改动前）：`grep webhook\|notify` → 0。23 种异常码全部只落库；`obs/visitors` 的设计目标是"新异常规则、成本模型、**告警**"，
 但没有任何一条路径会在出问题时通知我。此外：
 - 一个 serve 进程只绑一个 provider（`state.runtime.provider`）⇒ 同机多引擎要开多份服务，
   而 provider 表其实已经支持多行——**数据模型领先于使用路径**；
 - 成本 visitor 只算 token，不算钱（本地无单价概念，但混合 offload/时间成本是可以算的"代价"）。
 
-**出口判据**：`onyx.yaml` 里能配"什么异常、连续几次、发到哪"（先做两个出口：本地通知文件 + 一个通用 webhook），
-`onyx alerts ls` 看得到触发历史；Fleet 页顶部有"当前有 N 条 error 级异常"的一行；
-多 provider 观测（一个进程可绑多个 provider，或明确写死"一进程一引擎"并在文档里说明怎么起多个）。
+**出口判据**（逐条核对）：
+- ✅ `onyx.toml` 的 `[alerts]` 能配"什么级别/哪些码、窗口内几次、cooldown 多久、发到哪"（S27）。
+  两个出口都在：本地通知文件 `<数据目录>/alerts/alerts-YYYYMMDD.jsonl` + 通用 webhook（S28，
+  URL 优先环境变量 `ONYX_ALERT_WEBHOOK_URL`，`config show` 与库里都只出去 query 的 URL）
+- ✅ `onyx alerts ls` 看得到触发历史（`alert_trigger` 表，schema v7）。
+  它记"命中 + 尝试投递"的合取，被 cooldown 挡的不写行；空表也打印当前生效判据与出处
+- ✅ Fleet 页顶部有"近 1 小时有 N 条 error 级异常"那一行，并且**同时**说通知系统自己的状态
+  （没装配 / 没出口 / 轮询出错 / 在跑，四种情况四句话）；页面还有「告警触发」面板，样本可下钻到真实 trace
+- ✅ 多 provider 观测**定案**：写死一进程一引擎，多实例各配自己的 `ONYX_DATA_DIR`；
+  理由与代价记在 `DESIGN §8.6`（含"共用一个 `.data` 未实测"这句实话）
+- ✅ 判定读库轮询而不是在请求路径里发消息：观测者不许影响被测（S27 的核心决策）
+- ⬜ 成本 visitor 仍然只算 token 不算钱——**这一条本次没做**，它属于"代价模型"而不是"触达"，
+  留在 M11/M12 之后再说（本地没有单价，但 offload 比例与 GPU 分钟数是可以算的代价）
+
+实测（可复查）：本地假接收端 + `ONYX_ALERT_WEBHOOK_URL=… onyx serve` ⇒ 插一条 `CONTEXT_OVERFLOW`
+后一个轮询周期内真收到 POST，库里两行 `sent`；停掉接收端 ⇒ webhook 行 `failed` 带 ConnectError
+而文件行照样 `sent`；随后 cooldown 内历史不再增长。
 
 ### G5 评测资产（护城河，但要小心变成清单收集）
 现状：2 个任务（意图 236 条、工具调用 97 条）、BFCL 导入器、配对回归与矩阵。
@@ -145,7 +159,7 @@ CI 上覆盖率有基线数字（不追高，只防跌）；契约矩阵增加"�
 | **M7 跑得住** | G1 全部：`rotate`、`db backup/verify-backup`、`doctor` 补磁盘 + tokenizer 档位、迁移前自动备份、`.data` 体积报告 | **S17–S19 ✅** | 保留策略可 `--dry-run` 且落库审计 ✅ · 备份可验证恢复 ✅ · `doctor` 在人为破坏后报具体项 ✅（真机：删一个 blob ⇒ 具名 + 退出码 1）· 磁盘与档位两项体检 ✅ · `.data` 曲线 ✅ |
 | **M8 配置与发行** | G2：`onyx.toml`（provider/锁/保留/白名单）+ 优先级与"写了不生效"检查；`--host` 非回环强制 token；CHANGELOG + 版本策略 + GitHub Actions；`uv tool install` 冒烟 | **S20–S22 ✅** | 配置项与 flag 冲突时有明确解释 ✅ · 非回环无 token 起不来 ✅ · 新机器一条命令装好并 `doctor` 全绿 ✅（本机干净环境验过）· CI 能挡住 lint-imports/边界脚本违规 ✅（workflow 就位；仓库尚无远端 ⇒ 待首次真跑）· LICENSE/Docker/pipx 挂在"是否对外发行"这个未决问题上 |
 | **M9 操作闭环** ✅ | G3：界面发起评测 ✅、数据集导入 ✅、工具注册/审计页（Tool Bench）✅、`models pull/rm` ✅、被中断运行可续跑 ✅ | **S23–S26 ✅** | 不发一句命令就能完成"导入数据 → 选模型 → 跑评测 → 看矩阵 → 下钻 trace"（✅ 浏览器实测走通）并审计工具库（✅ 含契约矩阵三态）；被中断的 run 状态正确（✅ 含重启后的僵尸回收）且**在界面上可续跑**（✅ 实测中断在 12 条的 run 续到 236，id 与成本连续）；触发型端点全部过机器级锁（✅） |
-| **M10 观测触达** | G4：告警规则 + 两个出口（本地文件 / 通用 webhook）+ 触发历史页；多引擎观测形态定案（要么一进程多 provider，要么文档化"多实例 + 汇总视图"） | S27–S29 | 人为造一条 `CONTEXT_OVERFLOW` 能在 1 分钟内收到通知并能在界面看到"为什么触发" |
+| **M10 观测触达** ✅ | G4：告警规则 + 两个出口（本地文件 / 通用 webhook）+ 触发历史与界面可见性 + 多引擎形态定案 | **S27–S29 ✅** | 人为造一条 `CONTEXT_OVERFLOW` 在 1 分钟内收到通知 ✅（真机：本地假接收端真收到 POST，文件出口同刻落一行）· 界面看得见"为什么触发" ✅（`alert_trigger` 存命中当时的判据快照 + Fleet 顶部一行）· 一进程一引擎定案 ✅（DESIGN §8.6，含"共用 `.data` 未实测"的实话） |
 | **M11 评测资产** | G5：`structured_extraction`、`instruction_following`、长上下文中文集、embedding 任务（先解决 U8/U9 未决实测再上视觉） | S30–S33 | 每个新任务三条同源断言全绿；真机跑一次带分母与 CI；矩阵从 2 列长到 5–6 列且雷达图出现 |
 | **M12 防倒退** | G6：6 页 e2e、覆盖率基线、契约矩阵真 stdio 变体、性能基线、i18n 抽取（仅在确定要分发时做） | S34–S36 | CI 上 e2e 跑通且能抓到一次人为注入的 SSE 断链；`onyx perf` 有可比基线 |
 
