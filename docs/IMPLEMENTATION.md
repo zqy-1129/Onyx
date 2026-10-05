@@ -2178,6 +2178,78 @@ uv run pytest                # 1346 passed（S29 新增 11 条 Python：repos 2 
 
 ---
 
+# M11 评测资产（G5）—— 方案（S30–S33，未开始）
+
+判据（ROADMAP G5）：每个新任务都要求**三条同源断言全绿**（声明的指标 == 产出的指标、
+CI 的分母同源、分数能下钻到真实 trace）；真机跑一次带分母与 CI；
+矩阵从 2 列长到 5–6 列且雷达图出现。**不加"任务数量"指标**——一个能解释的 97 条
+比一个说不清的 3000 条有用。
+
+排期说明：M12 的 **S34（六页 e2e）先做了**，因为 STATUS 判它最值钱——
+S23–S29 的八处真实缺陷全部只能靠手工点出来，而那些路径此前零回归保护。
+现在 M11 补的是产品宽度，M12 剩下的 S35/S36 可以与之并行。
+
+**这一步该做的不是"多两个任务"，而是把"新任务的验收形状"固化下来**：
+`tests/contract/test_plugin_discovery.py` 里那句
+`assert set(aggregate) == set(task.metric_names)` 曾只对外部插件示例成立，
+现在把它变成**所有任务共用的一条契约测试**（内置 + 插件一起参数化跑）。
+否则每加一个任务就多一份"看板建列时才知道有哪些指标"的风险。
+
+## S30 — `structured_extraction`：结构化抽取 + 通用任务契约测试（M11 第一步）
+
+**产出文件（计划）**
+```
+onyx/eval/datasets/builtin/structured_ie.py   # 生成器（不是 JSONL）：中文句子里抽人物/金额/日期/地点/事件
+                                             # 三条设计：含"无可抽字段"的负样本、多实体难例单独打 tag、ord 稳定
+onyx/eval/tasks/structured_extraction.py      # 任务本体：三层正交判定（可解析 / schema 合规 / 字段级 EM）
+onyx/eval/tasks/__init__.py                   # BUILTIN_TASKS + _BUILTIN_DATASETS 别名
+onyx/eval/datasets/loader.py                  # _BUILTIN 条目（revision 由生成参数决定）
+tests/contract/test_task_contract.py          # 三个同源，参数化覆盖 specs() 的每一个任务
+tests/unit/test_structured_ie_dataset.py      # 生成器可复现 + schema 自洽 + 子集非空
+tests/unit/test_structured_extraction_grade.py # 形态表：干净 / 字段错 / 多输出 / 截断 / 拒答 / 空正文
+tests/unit/test_structured_extraction_run.py  # mock 引擎真跑一条：分母、CI、每条 grade 带 trace_id
+```
+
+**为什么是"三层正交"而不是一个 JSON 分**：`parse_json` → `check_schema` → `field_em`
+分别回答**格式听不听话 / 结构对不对 / 内容准不准**。本地小模型上这三件事的修法完全不同
+（第一种改提示词与停止词，第二种改字段数与嵌套深度，第三种才是能力）。
+混成一个数就把"提示词没写清"误读成"模型不行"——这正是 DESIGN §9.4 反复在防的那类误读。
+判定与形态表复用 `onyx/eval/graders/json_schema.py`（`parse_json(strict_object=True)`、
+`check_schema`、`field_em`），**不新写第四套评分器**。
+
+**`requires` 刻意不含 `Cap.STRUCTURED_OUTPUT`**：这个任务测的就是"没有受理解码器时模型能不能自己吐合规 JSON"。
+要求它等于把要测的东西当成前提——那样分数永远 100%，而探针里 `structured_output` 大多是 `?`（未实测）。
+
+**自测**
+```bash
+uv run onyx eval run --task structured_extraction --model <本地模型> --seed 42   # 真机一次
+uv run onyx eval tasks            # metric_names 与 aggregate 的键一致（契约测试同款）
+uv run pytest tests/contract/test_task_contract.py -q
+```
+**DoD**：新任务三条同源断言全绿；矩阵多出一列且每格带分母；`--limit` 截断时子集仍非空。
+
+## S31 — `instruction_following`：多条约束的可判定遵循（M11 第二步）
+
+一条样本带 N 条**可机械检查**的约束（长度、必须包含/禁止包含、大小写、条目数、语言、
+"只输出 JSON"），分数是"满足的约束数 / 总约束数"，同时保留"全满足率"。
+判据必须是代码可判的——凡需要人读才知道是否遵循的，不进这个任务（那是评审不是测量）。
+
+## S32 — 长上下文中文集（M11 第三步）
+
+本机 16GB 能测出的最有价值的维度：4k / 8k / 16k 三档，每档是"在长文里埋 2–3 个可回答的事实"，
+测的是**检索式抽取**而不是摘要（摘要无法机械判分）。
+`CONTEXT_NEAR_LIMIT` / `CONTEXT_OVERFLOW` 已有异常码，长上下文跑起来正好让这两个码参与真实观测。
+前提：先量清楚每个模型实际载入的 `num_ctx`（`/api/models` 已有），
+否则"16k 全错"可能是被截断而不是能力问题——这种分数比没有分数更坏。
+
+## S33 — embedding 任务（M11 收口）
+
+能力位 `Cap.EMBED` 早就有，但没有消费它的任务。先做"中文同义/反义对"的排序质量（recall@k、
+MRR），它比"相似度阈值分类"更可解释。**视觉要等 U8/U9 的未决实测**（图片 token 怎么计、
+`cached_tokens` 到底存不存在），否则视觉分数会建在猜出来的 token 数上。
+
+---
+
 # M12 防倒退（G6）—— 方案与档案（S34–S36）
 
 判据（ROADMAP G6）：**6 页各一条 e2e，CI 上跑通且能抓到一次人为注入的 SSE 断链**；
