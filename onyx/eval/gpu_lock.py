@@ -60,6 +60,9 @@ CLAIM_RETRIES = 3
 #: 在目标被别的句柄打开（没带 FILE_SHARE_DELETE）时会直接返回 ACCESS_DENIED。
 #: 一次就放弃等于"有人在看进度"就能把一整轮评测判死。
 WRITE_RETRIES = 4
+#: 删不掉锁文件时的兜底心跳。任何落在它上面的持有者都会被判过期并立即被接管 ——
+#: 语义就是"这个持有者已经走了"，而不是伪造一个时间点。
+RELEASED_HEARTBEAT = "2000-01-01T00:00:00+00:00"
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,6 +130,10 @@ class GpuLock:
         #: 但"静默忽略"更不该——见 heartbeat
         self.heartbeat_errors = 0
         self.last_heartbeat_error = ""
+        #: 最后一次成功心跳的进度，删不掉文件时用它改写"我已释放"
+        self._last_progress: tuple[int, int] = (0, 0)
+        self.release_failed = False
+        self.last_release_error = ""
 
     # ── 状态 ──────────────────────────────────────────────────────
     @property
@@ -183,6 +190,7 @@ class GpuLock:
                 heartbeat_at=utc_now_iso(), done=done, total=total,
                 host=self.host, extra=extra,
             ))
+            self._last_progress = (done, total)
         except OSError as exc:
             self.heartbeat_errors += 1
             self.last_heartbeat_error = f"{type(exc).__name__}: {exc}"[:200]
@@ -193,9 +201,38 @@ class GpuLock:
         self._held = False
         info = self.peek()
         # 只删自己的锁：如果它已被别人（在我们被判死之后）接管，删掉就等于释放别人的锁
-        if info is not None and info.pid == os.getpid() and info.owner == self.owner:
-            with contextlib.suppress(OSError):
+        if info is None or (info.pid == os.getpid() and info.owner == self.owner):
+            self._remove_or_mark_released()
+
+    def _remove_or_mark_released(self) -> None:
+        """删掉锁文件；删不动时把心跳推到过去。
+
+        Windows 上 `unlink` 会因"文件正被别的句柄打开"失败 —— 而看板的 `/api/gpu`
+        与任务进度每秒都在 `read_text` 这个文件（Python 的开法不带 FILE_SHARE_DELETE）。
+        留下一个心跳新鲜的锁文件，代价是后面所有人白等 `stale_after_s`（默认 600 秒），
+        而且现象只是"一直排队"，看起来像死锁。所以：先重试，删不动就改写它 ——
+        把心跳写成过去**不是撒谎**，"我已经不在持有了"正是事实。
+        """
+        for attempt in range(WRITE_RETRIES):
+            try:
                 self.path.unlink()
+                return
+            except FileNotFoundError:
+                return  # 别人已经清掉了，目的已达到
+            except OSError:
+                if attempt < WRITE_RETRIES - 1:
+                    time.sleep(0.005 * (attempt + 1))
+        done, total = self._last_progress
+        try:
+            self._write(LockInfo(
+                owner=self.owner, pid=os.getpid(), started_at=self._started_at,
+                heartbeat_at=RELEASED_HEARTBEAT, done=done, total=total,
+                host=self.host, extra={"released_at": utc_now_iso()},
+            ))
+        except OSError as exc:
+            # 两条路都走不通：这只能寄望心跳过期回收了，但必须留下痕迹而不是静默
+            self.release_failed = True
+            self.last_release_error = f"{type(exc).__name__}: {exc}"[:200]
 
     def __enter__(self) -> GpuLock:
         self.acquire()

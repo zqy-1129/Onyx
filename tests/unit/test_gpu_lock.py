@@ -449,3 +449,83 @@ def test_heartbeat_failures_reach_the_run_record(lock_path, monkeypatch):
     assert report.cost["gpu_heartbeat_errors"] >= 1
     assert "PermissionError" in report.cost["gpu_heartbeat_error"]
     assert lock.held is False, "跑完还是要放锁"
+
+
+# ── 释放（Windows 上 unlink 会被读者挡住）─────────────────────────
+def test_transient_unlink_denial_still_removes_the_lock(lock_path, monkeypatch):
+    """看板的 `/api/gpu` 每秒 `read_text` 一次这个文件，Windows 的 unlink 会短暂被拒。
+
+    删不动又不能改写的话，锁会以"心跳新鲜"的姿态留在原地，
+    后面所有人白等 `stale_after_s`（默认 600 秒）——现象只是"一直排队"。
+    """
+    holder = _lock(lock_path, "holder")
+    holder.acquire()
+    holder.heartbeat(3, 10)
+    real_unlink = os.unlink
+    state = {"n": 0}
+
+    def flaky(path):
+        state["n"] += 1
+        if state["n"] == 1:
+            raise PermissionError(5, "另一个程序正在使用此文件")
+        return real_unlink(path)
+
+    monkeypatch.setattr(os, "unlink", flaky)
+    holder.release()
+    monkeypatch.undo()
+
+    assert state["n"] >= 2, "第一次被拒后必须重试"
+    assert read_lock(lock_path) is None, "重试成功后锁文件要真的没了"
+    assert holder.release_failed is False
+
+
+def test_persistent_unlink_denial_marks_the_lock_released(lock_path):
+    """删不掉就改写心跳：让下一个等待者立刻能接管，而不是等 600 秒。"""
+    holder = _lock(lock_path, "holder")
+    holder.acquire()
+    holder.heartbeat(4, 10)
+
+    real_unlink = os.unlink
+    os.unlink = lambda path: (_ for _ in ()).throw(PermissionError(5, "拒绝访问"))
+    try:
+        holder.release()
+    finally:
+        os.unlink = real_unlink
+
+    info = read_lock(lock_path)
+    assert info is not None, "删不掉时保留文件，但内容必须改成「已释放」"
+    assert holder.release_failed is False
+    assert info.extra.get("released_at"), "要写得出不撒谎的「我已经走了」"
+    assert holder.is_busy() is False, "心跳被推到过去 ⇒ 不能还算忙的"
+
+    # 下一个持有者不必等 stale 窗口就能接管
+    _lock(lock_path, "next", stale_after_s=60).acquire(timeout=0.5)
+    assert read_lock(lock_path).owner == "next"
+
+
+def test_release_reports_when_neither_path_works(lock_path):
+    """两条路都走不通时必须留下痕迹：静默失败等于让下一个人莫名其妙地等。"""
+    holder = _lock(lock_path, "holder")
+    holder.acquire()
+    holder.heartbeat(1, 5)
+
+    real_unlink, real_replace = os.unlink, os.replace
+
+    def deny_unlink(path):
+        raise PermissionError(5, "拒绝访问")
+
+    def deny_replace(src, dst):
+        if str(src).endswith(".tmp"):
+            raise PermissionError(5, "拒绝访问")
+        return real_replace(src, dst)
+
+    os.unlink = deny_unlink
+    os.replace = deny_replace
+    try:
+        holder.release()
+    finally:
+        os.unlink, os.replace = real_unlink, real_replace
+
+    assert holder.release_failed is True
+    assert "PermissionError" in holder.last_release_error
+    assert holder.held is False, "放锁的状态机不能因为写盘失败就以为还持着"
