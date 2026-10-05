@@ -2868,6 +2868,9 @@ def _print_run_report(console, report, task, *, k: int, seed: int | None, split:
         + (f" · [yellow]{report.status}[/yellow]" if report.status != "done" else "")
     )
     console.print(f"[bold]{header}[/bold]")
+    # 考卷来历跟着分数打印：换过 revision 的两次运行不可比，而这件事必须在结果旁边看得见
+    if report.dataset_id:
+        console.print(f"[dim]考卷 {report.dataset_id} · {report.dataset_revision or '—'}[/dim]")
     if aggregate.get("resumed"):
         console.print(
             f"[dim]续跑自 {aggregate.get('already_graded_before')} 条已有 grade，"
@@ -3026,6 +3029,8 @@ def eval_show(
             typer.echo(_json.dumps({
                 "run": {
                     "id": run.id, "task_id": run.task_id, "model_id": run.model_id,
+                    # 考卷来历：revision 变了就等于"两次分数不可比"，show 里必须看得见
+                    "dataset_id": run.dataset_id, "dataset_revision": run.dataset_revision,
                     "status": run.status, "started_at": run.started_at,
                     "finished_at": run.finished_at, "seed": run.seed,
                     "app_version": run.app_version, "git_rev": run.git_rev,
@@ -3052,6 +3057,9 @@ def eval_show(
             f"app={run.app_version or '—'} git={run.git_rev or '—'} "
             f"params={run.params_snapshot or '—'}[/dim]"
         )
+        # 考卷来历单独一行：revision 变了就意味着"同一个 id 的两次分数不可比"，
+        # 这一行看不见时，比较就成了靠人记住当时用的是哪份数据
+        console.print(f"[dim]考卷 {run.dataset_id or '—'} · {run.dataset_revision or '—'}[/dim]")
         console.print(f"主分数: {_headline_score(run.aggregate)}")
         table = Table(title=f"grade（前 {len(grades)} 条）", pad_edge=False)
         for column in ("case", "seq", "判定", "分", "格式", "期望", "预测", "trace"):

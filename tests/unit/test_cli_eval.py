@@ -358,6 +358,25 @@ def test_show_json_includes_params_snapshot_and_costs():
     assert all(g["trace_id"] for g in payload["grades"])
 
 
+def test_show_and_run_print_the_exam_provenance():
+    """考卷来历跟着分数出现：revision 一变就意味着"两次分数不可比"，看不见只能靠人记住。
+
+    `eval show` 早前只打印 seed/app/git，dataset_id 与 dataset_revision 明明落了库却没露出来，
+    于是"这份分数用的是哪份数据"在 CLI 上是个查不到但存在的事实。
+    """
+    _import_builtin()
+    ran = _run(*MOCK_RUN)
+    assert ran.exit_code == 0, ran.output
+    assert "考卷 intent_zh-v1" in ran.output, ran.output
+
+    run_id = json.loads(_run(*MOCK_RUN, "--json").output)["run_id"]
+    shown = _run("eval", "show", run_id)
+    assert "考卷 intent_zh-v1" in shown.output, shown.output
+    payload = json.loads(_run("eval", "show", run_id, "--json").output)
+    assert payload["run"]["dataset_id"] == "intent_zh-v1"
+    assert payload["run"]["dataset_revision"] == "seed=20261003"
+
+
 def test_show_filters_by_verdict():
     _import_builtin()
     run_id = json.loads(_run(*MOCK_RUN, "--json").output)["run_id"]
