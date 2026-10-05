@@ -62,7 +62,8 @@ def test_ls_lists_rows_newest_first_and_hides_test_rows(isolated_data_dir):
     db.close()
 
     out = _run("alerts", "ls").output
-    assert "✓ sent" in out and "✗ failed" in out
+    assert "✓" in out and "✗" in out
+    assert "webhook" in out and "file" in out
     assert "ConnectError" in out, "失败原因要直接可见，否则人只会看到「没通知」"
     assert "r3" not in out  # 测试行默认不混进来
     assert "告警触发（3）" in _run("alerts", "ls", "--include-test").output

@@ -14,6 +14,7 @@ import logging
 import threading
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 
 from onyx.core.clock import utc_now_iso
@@ -85,6 +86,16 @@ class AlertService:
         if self._thread is not None:
             self._thread.join(timeout)
             self._thread = None
+        # 出口自己拥有的东西（httpx 连接池）由关停负责回收。
+        # 这里不让异常冒出去：关不上连接池不该让 serve 的死过程变成一场崩。
+        for channel in self.channels:
+            close = getattr(channel, "close", None)
+            if not callable(close):
+                continue
+            try:
+                close()
+            except Exception as exc:  # noqa: BLE001 - 回收失败只记一行
+                log.warning("告警出口 %s 关闭失败：%s", channel.name, exc)
 
     def _loop(self) -> None:
         while not self._stop.is_set():
@@ -213,16 +224,27 @@ def _shift(iso: str, seconds: float) -> str:
     return (base + timedelta(seconds=seconds)).isoformat()
 
 
-def build_channels(*, file_path: object = None) -> list[AlertChannel]:
-    """按配置装配出口。**没配就不装**，而不是装一个"什么都不发"的渠道——
+def build_channels(cfg: Any, data_dir: Path) -> list[AlertChannel]:
+    """按配置装配出口。**没配的渠道不装**，而不是装一个"什么都不发"的渠道——
     后者会让 `alerts ls` 显示"有出口"，而它从来没成功投递过任何东西。
 
-    唯一的装配点是 `onyx.config.alert_channels`；这里只留一个给测试用的窄壳，
-    不要再在第二处拼参数（两处各拼一遍的话，"serve 发了而 CLI 说没出口"查不动）。
+    文件出口先装、webhook 后装：本地那条是"一定能落"的兜底，这个顺序保证
+    webhook 挂了也不影响本地留下那一行。
+
+    装配放在这里而不是 `onyx/config.py`：config 被 `settings` 引进 tools 层，
+    import-linter 会顺着链把 `webhook -> httpx` 也算成"tools 碰了网络"。
+    这条链的报告正是那道门禁值钱的地方。
     """
+    from onyx.config import alert_channels_enabled, alert_file_path, alert_webhook_url
     from onyx.obs.alerts.channels import FileChannel
 
-    out: list[AlertChannel] = []
-    if file_path is not None:
-        out.append(FileChannel(file_path))
+    if not alert_channels_enabled(cfg):
+        return []
+    out: list[AlertChannel] = [FileChannel(alert_file_path(cfg, data_dir))]
+    url = alert_webhook_url(cfg)
+    if url:
+        # 惰性导入：没配 URL 时连模块都不 import，`onyx.obs` 整体仍在零三方依赖下可导入
+        from onyx.obs.alerts.webhook import WebhookChannel
+
+        out.append(WebhookChannel(url))
     return out

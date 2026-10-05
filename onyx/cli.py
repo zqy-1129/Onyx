@@ -1111,13 +1111,14 @@ def alerts_ls(
     from rich.console import Console
     from rich.table import Table
 
-    from onyx.config import alert_channels, alert_rule
+    from onyx.config import alert_rule
+    from onyx.obs.alerts.service import build_channels
     from onyx.store.repos import AlertRepo
 
     settings = _settings()
     cfg = _config()
     rule = alert_rule(cfg)
-    channels = alert_channels(cfg, settings.data_dir)
+    channels = build_channels(cfg, settings.data_dir)
     database = Database(_db_path(settings, db))
     try:
         rows = AlertRepo(database).list_triggers(
@@ -1134,22 +1135,19 @@ def alerts_ls(
                           "要么命中了但在 cooldown 里（被挡的不写行，这是刻意的）")
             return
         table = Table(title=f"告警触发（{len(rows)}）", pad_edge=False)
-        for column in ("时间", "码", "级别", "次数", "渠道", "状态", "测试", "说明"):
-            table.add_column(column)
+        # 80 列终端塞不下 8 个字段，而截断掉的那部分恰恰是失败原因。
+        # 所以列收到 5 个：级别不占列（它由码决定，且消息正文里带着），说明折行。
+        for column in ("时间", "码", "次数", "渠道", "结果"):
+            table.add_column(column, overflow="fold" if column == "结果" else "ellipsis")
         for rec in rows:
             table.add_row(
-                rec.created_at[:19], rec.code, rec.severity,
+                f"{rec.created_at[5:10]} {rec.created_at[11:19]}",
+                rec.code,
                 f"{rec.n_in_window}/{rec.window_s}s",
-                rec.channel,
-                "✓ sent" if rec.status == "sent" else f"✗ {rec.status}",
-                "✓" if rec.is_test else "",
-                rec.detail[:60],
+                rec.channel + ("（测试）" if rec.is_test else ""),
+                ("✓ " if rec.status == "sent" else "✗ ") + rec.detail,
             )
         console.print(table)
-        for rec in rows:
-            if rec.status != "sent":
-                # 表格里的"说明"会被终端宽度截断，而失败原因恰恰是全文才有用的那部分
-                console.print(f"[red]✗ {rec.channel} · {rec.code}：{rec.detail}[/red]")
     finally:
         database.close()
 
@@ -1165,8 +1163,8 @@ def alerts_test(
     这条命令**不起后台线程**，只手工投一条标了 is_test 的消息：
     它落库时不参与 cooldown，也不会让人误以为真出过事。
     """
-    from onyx.config import alert_channels, alert_rule
-    from onyx.obs.alerts.service import AlertService
+    from onyx.config import alert_rule
+    from onyx.obs.alerts.service import AlertService, build_channels
 
     settings = _settings()
     cfg = _config()
@@ -1174,7 +1172,7 @@ def alerts_test(
     if not rule.enabled:
         typer.echo("[alerts].enabled = false —— 出口不会装，通知也不会发", err=True)
         raise typer.Exit(2)
-    channels = alert_channels(cfg, settings.data_dir)
+    channels = build_channels(cfg, settings.data_dir)
     if not channels:
         typer.echo("没有可用出口（检查 [alerts].file 与数据目录是否可写）", err=True)
         raise typer.Exit(2)
@@ -1667,8 +1665,9 @@ def serve(
 
     from onyx.api.app import create_app
     from onyx.api.auth import is_loopback
-    from onyx.config import ENV_TOKEN, alert_channels, alert_rule
+    from onyx.config import ENV_TOKEN, alert_rule
     from onyx.eval.gpu_lock import DEFAULT_GPU_STALE_AFTER_S
+    from onyx.obs.alerts.service import build_channels
 
     cfg = _config()
     host = pick(host, cfg.serve.host, DEFAULT_HOST)
@@ -1706,7 +1705,7 @@ def serve(
                          gpu_stale_after_s=pick(cfg.gpu.stale_after_s, DEFAULT_GPU_STALE_AFTER_S),
                          event_sinks=sinks,
                          alert_rule=alert_rule(cfg),
-                         alert_channels=tuple(alert_channels(cfg, _settings().data_dir)),
+                         alert_channels=tuple(build_channels(cfg, _settings().data_dir)),
                          token=secret, read_only=bool(readonly))
     typer.echo(
         f"Onyx API: http://{host}:{port}/api/docs"

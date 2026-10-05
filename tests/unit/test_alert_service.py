@@ -306,11 +306,21 @@ def test_file_channel_falls_back_to_today_when_the_timestamp_is_broken(tmp_path)
     assert len(written) == 1 and written[0].name != target.name
 
 
-def test_build_channels_installs_nothing_when_nothing_is_configured(tmp_path):
+def test_build_channels_installs_nothing_when_disabled(tmp_path):
+    """`enabled = false` 就是真的不装出口，而不是"装了但什么都不发"。"""
+    from dataclasses import replace
+
+    from onyx.config import load_config
     from onyx.obs.alerts.service import build_channels
 
-    assert build_channels() == []
-    assert [c.name for c in build_channels(file_path=tmp_path / "a.jsonl")] == ["file"]
+    cfg_path = tmp_path / "onyx.toml"
+    cfg_path.write_text("[alerts]\nfile = 'alerts/a.jsonl'\n", encoding="utf-8")
+    cfg = load_config(cfg_path)
+    assert [c.name for c in build_channels(cfg, tmp_path)] == ["file"]
+
+    off = replace(cfg, alerts=replace(cfg.alerts, enabled=False))
+    assert build_channels(off, tmp_path) == [], "关掉之后连文件都不该写"
+    assert not (tmp_path / "alerts").exists()
 
 
 def test_tick_with_an_unreadable_now_does_not_crash(env, caplog):

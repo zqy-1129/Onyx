@@ -30,6 +30,8 @@ ENV_CONFIG_PATH = "ONYX_CONFIG"
 ENV_DATA_DIR = "ONYX_DATA_DIR"
 #: token 优先走环境变量而不是配置文件：写进文件的 token 会跟着备份、截图和 git status 漂走。
 ENV_TOKEN = "ONYX_SERVE_TOKEN"
+#: 同一个理由适用于 webhook：它的 query 里通常就挂着 secret。
+ENV_ALERT_WEBHOOK = "ONYX_ALERT_WEBHOOK_URL"
 
 
 class ConfigError(ValueError):
@@ -95,6 +97,9 @@ class AlertConfig:
     poll_s: float | None = None
     #: 本地文件出口的路径。没写就是 `<数据目录>/alerts/alerts.jsonl`（按天分片）
     file: str | None = None
+    #: webhook 出口。优先环境变量 `ONYX_ALERT_WEBHOOK_URL`：URL 的 query 里通常就挂着 secret，
+    #: 写进文件它就会跟着备份与截图一起漂走（与 serve.token 同一条理由）。
+    webhook_url: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,7 +141,7 @@ _SCHEMA: dict[str | None, dict[str, tuple[type, ...]]] = {
         "enabled": (bool,),
         "severities": (list,), "codes": (list,), "exclude_codes": (list,),
         "window_s": (int,), "min_count": (int,), "cooldown_s": (int,), "poll_s": (int, float),
-        "file": (str,),
+        "file": (str,), "webhook_url": (str,),
     },
     "sinks": {"events": (list,)},
 }
@@ -303,6 +308,7 @@ def load_config(path: Path | str | None = None) -> Config:
             cooldown_s=_integer(read("alerts", "cooldown_s")),
             poll_s=_seconds(read("alerts", "poll_s")),
             file=_text(read("alerts", "file")),
+            webhook_url=_text(read("alerts", "webhook_url")),
         ),
         sinks=_str_list(read("sinks", "events")),
         sources=(chosen,),
@@ -409,6 +415,21 @@ def effective(cfg: Config) -> list[Setting]:
     add("alerts.cooldown_s", a.cooldown_s, None, DEFAULT_ALERT_COOLDOWN_S)
     add("alerts.poll_s", a.poll_s, None, DEFAULT_ALERT_POLL_S)
     add("alerts.file", a.file, None, "<数据目录>/alerts/alerts.jsonl")
+    # webhook URL 与 serve.token 同一条规矩：值不落终端。它会进 shell 历史、CI 日志和截图，
+    # 而这类 URL 的 query 里通常就挂着 secret
+    url = pick(os.environ.get(ENV_ALERT_WEBHOOK) or None, a.webhook_url)
+    url_source = next(
+        (source for source, value in (
+            ("env", os.environ.get(ENV_ALERT_WEBHOOK) or None),
+            ("file", a.webhook_url),
+        ) if value),
+        "default",
+    )
+    rows.append(Setting(
+        "alerts.webhook_url",
+        f"已设置（{len(url)} 字符，值不打印）" if url else "未设（只发本地文件出口）",
+        url_source,
+    ))
     return rows
 
 
@@ -430,9 +451,10 @@ def alert_rule(cfg: Config):
     )
 
     a = cfg.alerts
+    env_url = os.environ.get(ENV_ALERT_WEBHOOK) or None
     from_file = any(value is not None for value in (
         a.enabled, a.severities, a.codes, a.exclude_codes, a.window_s, a.min_count,
-        a.cooldown_s, a.poll_s, a.file,
+        a.cooldown_s, a.poll_s, a.file, a.webhook_url,
     ))
     return AlertRule(
         severities=DEFAULT_ALERT_SEVERITIES if a.severities is None else a.severities,
@@ -443,24 +465,29 @@ def alert_rule(cfg: Config):
         cooldown_s=DEFAULT_ALERT_COOLDOWN_S if a.cooldown_s is None else a.cooldown_s,
         poll_s=DEFAULT_ALERT_POLL_S if a.poll_s is None else a.poll_s,
         enabled=True if a.enabled is None else a.enabled,
-        source="file" if from_file else "default",
+        source="file" if from_file else ("env" if env_url else "default"),
     )
 
 
 def alert_file_path(cfg: Config, data_dir: Path):
-    """文件出口的落点。没配就用数据目录里那个——本地"一定能落"的那条出口。"""
+    """文件出口的落点。没配就用数据目录里那个——本地"一定能落"的那条出口。
+
+    只解析路径，不装配渠道：装配在 `obs/alerts/service.build_channels_for` 里做。
+    `onyx.config` 被 `onyx.settings` 引进 tools 层，而 import-linter 会顺着链把
+    `webhook -> httpx` 也算成"tools 碰了网络"——门禁的这条链正是它值钱的地方。
+    """
     from onyx.obs.alerts.channels import default_alert_path
 
     return Path(cfg.alerts.file) if cfg.alerts.file else default_alert_path(data_dir)
 
 
-def alert_channels(cfg: Config, data_dir: Path) -> list:
-    """装配出口。没配的渠道**不装**，而不是装一个"什么都不发"的渠道：
-    后者会让 `alerts ls` 显示"有出口"，而它从来没成功投递过任何东西。
-    """
-    from onyx.obs.alerts.channels import FileChannel
+def alert_webhook_url(cfg: Config) -> str | None:
+    """env > 文件。两处都没给就是"没有 webhook 出口"，不是"有个坏的 webhook"。"""
+    return pick(os.environ.get(ENV_ALERT_WEBHOOK) or None, cfg.alerts.webhook_url)
 
-    channels: list = []
-    if alert_rule(cfg).enabled:
-        channels.append(FileChannel(alert_file_path(cfg, data_dir)))
-    return channels
+
+def alert_channels_enabled(cfg: Config) -> bool:
+    """这个进程到底该不该装出口。`enabled = false` 时装配层返回空列表，
+    而不是"装了但都关掉"——后者在 `alerts ls` 里看着像有出口。
+    """
+    return alert_rule(cfg).enabled

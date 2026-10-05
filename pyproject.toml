@@ -91,16 +91,24 @@ forbidden_modules = [
 ]
 
 [[tool.importlinter.contracts]]
-name = "network IO confined to llm, executors.http and sinks.otlp"
+name = "network IO confined to llm, executors.http, sinks.otlp and alerts.webhook"
 type = "forbidden"
 source_modules = ["onyx.store", "onyx.core", "onyx.obs", "onyx.eval"]
 forbidden_modules = ["httpx", "requests", "urllib3"]
-# 唯一的例外：OTLP 导出 sink。它**必须**是显式登记的一条，理由与 `executors.http` 相同——
+# 第一条例外：OTLP 导出 sink。它**必须**是显式登记的一条，理由与 `executors.http` 相同——
 # 惰性导入（`sinks/registry.py` 的 _LAZY_SINKS），只有 `--sink otlp` 才会 import 到 httpx，
 # 而 `onyx.store` 的其余部分在零三方依赖下也必须能 import。
 # 契约的意义正在这里：新增一个"顺手发个请求"的模块会立刻让 lint 失败，
 # 而每次例外都要在这里写明是谁、为什么。
-ignore_imports = ["onyx.store.sinks.otlp -> httpx"]
+#
+# 第二条例外：告警的 webhook 出口（S28）。同样是惰性导入——只有 `[alerts].webhook_url`
+# 或 `ONYX_ALERT_WEBHOOK_URL` 真被配置时，`config.alert_channels()` 才 import 它。
+# 之所以用 httpx 而不是 stdlib `urllib.request`：后者能悄悄通过这道门，
+# 而"新增一个会发请求的模块必须在这里显式登记"正是这道门存在的理由。
+ignore_imports = [
+  "onyx.store.sinks.otlp -> httpx",
+  "onyx.obs.alerts.webhook -> httpx",
+]
 
 # tools 层默认也不许碰网络：只有 executors.http 这一个模块可以，
 # 且必须显式登记在下面。新增一个"顺手发个请求"的模块会立刻让 lint 失败。
