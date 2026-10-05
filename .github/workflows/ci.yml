@@ -57,6 +57,11 @@ jobs:
           uv run coverage run -m pytest -q
           uv run coverage report
 
+      # e2e（S34）单独一步：默认套件把 `-m e2e` deselect 掉了，所以它不会顺带被跑到。
+      # 它只绑 127.0.0.1、用 mock 引擎，不碰网络也不碰 GPU —— 所以它属于"CI 保证不回归"那一侧。
+      - name: 端到端（六页取数同源 + SSE 在真 HTTP 连接上被读到 + 断链自检）
+        run: uv run pytest -m e2e
+
       # `-m live`（20 条）与 `-m probe`（4 条）**不在 CI 跑**：它们真打引擎、真占 GPU，
       # 也真依赖那块 16GB 显存上的模型清单。这是刻意的分工——CI 保证不回归，
       # 引擎语义靠真机（结论沉淀在 docs/PROBES.md，每条带引擎版本与证据）。

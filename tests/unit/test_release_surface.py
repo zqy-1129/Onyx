@@ -66,6 +66,7 @@ def workflow_text() -> str:
     "check_extension_boundary.py",
     "coverage run -m pytest",
     "coverage report",
+    "pytest -m e2e",
     "tsc --noEmit",
     "vitest run",
     "vite build",
@@ -79,6 +80,18 @@ def test_ci_runs_every_documented_gate(workflow_text: str, command: str):
     少一步等于少一道门，而 CI 变绿时没人会去数步数。
     """
     assert command in workflow_text, f"CI 里少了这一步：{command}"
+
+
+def test_ci_runs_e2e_as_its_own_step_not_by_accident(workflow_text: str):
+    """`-m e2e` 必须显式跑：默认 addopts 把它 deselect 掉了。
+
+    少了这一步，六页取数与 SSE 的回归保护就只存在于"有人在本地记得跑过"这件事上。
+    """
+    assert "pytest -m e2e" in workflow_text
+    assert "deselect" in workflow_text, "要写明它为什么不会随离线套件顺带跑到（addopts 默认排除）"
+    before = workflow_text.split("pytest -m e2e")[0][-500:]
+    assert "mock" in before and "127.0.0.1" in before, \
+        "e2e 那一步要写明它只用 mock 引擎且只绑回环，否则读 CI 的人会以为这里在打真引擎"
 
 
 def test_ci_does_not_claim_to_run_engine_dependent_tiers(workflow_text: str):
