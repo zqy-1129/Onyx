@@ -165,8 +165,85 @@ def test_doctor_lists_both_new_checks(data_dir, monkeypatch):
     result = runner.invoke(app, ["doctor", "--skip-network"])
 
     assert result.exit_code == 0, result.output
-    for item in ("磁盘余量", "token 计量档位", "blob 引用完整", "扩展点插件全部可加载"):
+    for item in ("磁盘余量", "token 计量档位", "blob 引用完整", "扩展点插件全部可加载", "告警"):
         assert item in result.output
+
+
+# ── S29：告警这项体检 ──────────────────────────────────────────────
+def _alerts_check(tmp_path, monkeypatch, body: str, db):
+    """用真实配置文件喂进体检（不是构造 Config 对象）：装配口径也要被测到。"""
+    from onyx.cli import _check_alerts
+    from onyx.config import load_config
+    from onyx.settings import load_settings
+
+    monkeypatch.delenv("ONYX_ALERT_WEBHOOK_URL", raising=False)
+    cfg_path = tmp_path / "onyx.toml"
+    cfg_path.write_text(body, encoding="utf-8")
+    monkeypatch.setenv("ONYX_DATA_DIR", str(tmp_path))
+    settings = load_settings()
+    return _check_alerts(load_config(cfg_path), settings, db)
+
+
+def test_alert_check_is_green_and_reads_out_its_posture(tmp_path, monkeypatch, db):
+    from onyx.store.records import AlertTriggerRecord
+    from onyx.store.repos import AlertRepo
+
+    AlertRepo(db).insert_trigger(AlertTriggerRecord(
+        id="t1", created_at="2026-10-05T03:00:00+00:00", code="CONTEXT_OVERFLOW",
+        severity="error", rule={}, n_in_window=1, window_s=300, channel="file",
+        status="sent", detail="写入 1 行"))
+    check = _alerts_check(tmp_path, monkeypatch, "[alerts]\nwindow_s = 120\n", db)
+    assert check.ok is True
+    assert "120s 内满 1 次" in check.detail and "出口 file" in check.detail
+    # 投递留痕要能在体检里看见，否则"通知有没有发过"还要再开一条命令
+    assert "今天投递 1 次" in check.detail
+
+
+def test_alert_check_says_disabled_instead_of_looking_broken(tmp_path, monkeypatch, db):
+    check = _alerts_check(tmp_path, monkeypatch, "[alerts]\nenabled = false\n", db)
+    assert check.ok is True and "未启用" in check.detail
+    assert "serve" in check.hint, "要说清通知由谁发，否则人会在 CLI 进程等通知"
+
+
+def test_alert_check_goes_red_when_every_recent_delivery_failed(tmp_path, monkeypatch, db):
+    from onyx.store.records import AlertTriggerRecord
+    from onyx.store.repos import AlertRepo
+
+    repo = AlertRepo(db)
+    for i in range(5):
+        repo.insert_trigger(AlertTriggerRecord(
+            id=f"f{i}", created_at="2026-10-05T03:00:00+00:00", code="CONTEXT_OVERFLOW",
+            severity="error", rule={}, n_in_window=1, window_s=300, channel="webhook",
+            status="failed", detail="ConnectError: 拒绝连接"))
+    check = _alerts_check(tmp_path, monkeypatch, "[alerts]\ncooldown_s = 0\n", db)
+    assert check.ok is False
+    assert "全失败" in check.hint and "alerts test" in check.hint
+    assert "ConnectError" in check.hint, "红的那一项要带着原因，否则又要人去查"
+
+
+def test_alert_check_partial_failure_is_only_a_note(tmp_path, monkeypatch, db):
+    """一次偶发失败（接收端重启）不该把体检染红，但必须在 detail 里看得见。"""
+    from onyx.store.records import AlertTriggerRecord
+    from onyx.store.repos import AlertRepo
+
+    repo = AlertRepo(db)
+    repo.insert_trigger(AlertTriggerRecord(
+        id="f1", created_at="2026-10-05T03:00:00+00:00", code="X", severity="error",
+        rule={}, n_in_window=1, window_s=300, channel="webhook", status="failed", detail="超时"))
+    repo.insert_trigger(AlertTriggerRecord(
+        id="s1", created_at="2026-10-05T03:10:00+00:00", code="X", severity="error",
+        rule={}, n_in_window=1, window_s=300, channel="file", status="sent", detail="写入"))
+    check = _alerts_check(tmp_path, monkeypatch, "[alerts]\n", db)
+    assert check.ok is True and "最近 2 次里 1 次失败" in check.detail
+
+
+def test_alert_check_goes_red_when_the_file_channel_cannot_write(tmp_path, monkeypatch, db):
+    """文件出口写不下去等于没有出口：这必须是红项，而不是"配置看起来正常"。"""
+    blocker = tmp_path / "blocked"
+    blocker.write_text("我是个文件，不是目录", encoding="utf-8")
+    body = f'[alerts]\nfile = "{(blocker / "alerts.jsonl").as_posix()}"\n'
+    check = _alerts_check(tmp_path, monkeypatch, body, db)
+    assert check.ok is False and "写不下去" in check.detail
 
 
 def test_doctor_exits_nonzero_when_a_check_fails(data_dir, monkeypatch):

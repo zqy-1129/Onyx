@@ -682,6 +682,58 @@ def _check_disk(settings: Settings) -> CheckResult:
     )
 
 
+def _check_alerts(cfg, settings: Settings, database: Database) -> CheckResult:
+    """告警配了什么、最近投出去没有。
+
+    只看**配置与留痕**，不去猜"有没有 serve 在跑"：通知由 serve 的后台线程发，
+    而探别人的端口会把一次体检变成一次网络攻击面探测。detail 里把这句话写出来。
+    """
+    from onyx.config import alert_rule
+    from onyx.core.clock import utc_now_iso
+    from onyx.obs.alerts.service import build_channels
+    from onyx.store.repos import AlertRepo
+
+    rule = alert_rule(cfg)
+    channels = build_channels(cfg, settings.data_dir)
+    names = "、".join(c.name for c in channels) or "（无）"
+    judged = (f"判据：{'/'.join(rule.severities)} 级 · {rule.window_s}s 内满 {rule.min_count} 次"
+              f" · cooldown {rule.cooldown_s}s · 出口 {names}")
+
+    if not rule.enabled:
+        return CheckResult("告警", True, "未启用（[alerts].enabled = false）· 通知不会发",
+                           "想收通知就把它打开；通知只由 `onyx serve` 的后台线程发出")
+
+    recent = AlertRepo(database).list_triggers(limit=5)
+    failed = [r for r in recent if r.status == "failed"]
+    since = utc_now_iso()[:10] + "T00:00:00+00:00"
+    counts = AlertRepo(database).counts_by_status(since=since)
+    failed_today = sum(n for key, n in counts.items() if key.startswith("failed:"))
+    trail = (f" · 今天投递 {sum(counts.values())} 次（失败 {failed_today}）"
+             if counts else " · 今天没有投递记录")
+
+    # 文件出口装上了却写不下去（目录被占、盘满）等于没有出口，这必须是红项而不是"配好了"
+    for channel in channels:
+        probe = getattr(channel, "path", None)
+        if channel.name != "file" or probe is None:
+            continue
+        try:
+            probe.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return CheckResult(
+                "告警", False, f"{judged} · 文件出口写不下去：{type(exc).__name__}: {exc}",
+                "检查 [alerts].file 的路径与磁盘余量（onyx doctor 的磁盘那一项）")
+
+    detail = judged + trail + (f" · 最近 {len(recent)} 次里 {len(failed)} 次失败" if failed else "")
+    serves = "通知只由 `onyx serve` 的后台线程发出；这条检查不探端口，只看配置与留痕"
+    # 全失败才算红：一次偶发失败（接收端重启）说明不了出口坏了，但必须在 detail 里看得见
+    all_failed = bool(failed) and len(failed) == len(recent)
+    return CheckResult(
+        "告警", not all_failed, detail,
+        (f"最近 {len(recent)} 次投递全失败：{failed[0].detail[:80]} · "
+         f"先 onyx alerts test 复现，再确认接收端。" if all_failed else "") + serves,
+    )
+
+
 def _check_token_tiers(database: Database) -> CheckResult:
     """每个模型**实际落在哪一档**，而不是阶梯上一共有几档。
 
@@ -799,6 +851,7 @@ def doctor(
                 "若是 rotate 之前丢的，跑 onyx db verify-backup 看最近备份能不能补回来",
             ))
             checks.append(_check_token_tiers(database))
+            checks.append(_check_alerts(_config(), settings, database))
 
     bad_plugins = _extension_failures()
     checks.append(CheckResult(
