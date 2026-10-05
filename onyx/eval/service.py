@@ -24,7 +24,7 @@ import queue
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from onyx.core.clock import utc_now_iso
@@ -82,6 +82,9 @@ class SubmitRequest:
     dataset: str | None = None
     max_tokens: int | None = None
     max_wall_ms: float | None = None
+    #: 续跑：把样本接在某个已中断的 run 上，写回**那个** run。
+    #: 与 `RunConfig.resume_run_id` 同义 —— 已评过的 case 不重复计费（GPU 时间是本地最贵的资源）
+    resume_run_id: str | None = None
     #: 拿不到 GPU 锁时最多等多久；0 = 不排队直接失败，None = 一直等（与 CLI 同语义）
     lock_timeout: float | None = None
     unload_others: bool = False
@@ -182,8 +185,14 @@ class EvalService:
         校验放在提交时而不是 worker 里：模型名打错要当场说，
         而不是等 GPU 排完队、每条样本都失败一遍再告诉你。
         """
+        request = self._inherit_resume_dataset(request)
         self._validate(request)
-        job = _Job(run_id=new_trace_id(), request=request, queued_at=utc_now_iso())
+        # 续跑必须沿用**那个 run 的 id**：runner 会把新样本写回原 run，
+        # 而界面正拿着 id 轮询进度与按取消。另生成一个 id 就等于把进度条接到一条没人写的 run 上
+        job = _Job(
+            run_id=request.resume_run_id or new_trace_id(),
+            request=request, queued_at=utc_now_iso(),
+        )
         with self._mutex:
             if self._stopping.is_set():
                 raise EvalQueueFull("这个服务正在关停，不再接受新的评测")
@@ -204,6 +213,20 @@ class EvalService:
         self._queue.put(job)
         return job.view(position)
 
+    def _inherit_resume_dataset(self, request: SubmitRequest) -> SubmitRequest:
+        """续跑没写数据集时，接的是**原来那份考卷**，不是任务当前的默认集。
+
+        界面会从 run 行预填，但 CLI/API 省略 `--dataset` 完全可能：那样分数就接在
+        一份换了的数据集上，回归对比直接作废。这里补全而不是报错——
+        "省略"的本意就是"照旧"。
+        """
+        if not request.resume_run_id or request.dataset:
+            return request
+        row = self.repo.get_run(request.resume_run_id)
+        if row is None or not row.dataset_id:
+            return request
+        return replace(request, dataset=row.dataset_id)
+
     def _validate(self, request: SubmitRequest) -> None:
         if not request.task:
             raise EvalError("必须指定任务", detail={"available": sorted(specs())})
@@ -219,6 +242,50 @@ class EvalService:
             raise EvalError("split 不能是空字符串")
         self._validate_dataset(request.dataset)
         self._validate_model(request.model)
+        self._validate_resume(request)
+
+    def _validate_resume(self, request: SubmitRequest) -> None:
+        """续跑的目标必须真的能续。
+
+        三种"不能续"要分开说，因为修法不同：不存在（id 打错）、已跑完（没必要重开）、
+        正被别人跑着（会重复计费，而且两个持有者比没有锁更危险）。
+        """
+        target = request.resume_run_id
+        if target is None:
+            return
+        row = self.repo.get_run(target)
+        if row is None:
+            raise EvalError(
+                f"找不到要续跑的 run {target!r}",
+                detail={"hint": "用 onyx eval ls 或看板运行列表里的 id"},
+            )
+        if row.task_id != request.task or row.model_id != request.model:
+            raise EvalError(
+                f"续跑要求任务与模型与原 run 一致：那条 run 是 {row.task_id} @ {row.model_id}",
+                detail={"task": row.task_id, "model": row.model_id},
+            )
+        if row.status == "done":
+            raise EvalError(
+                f"run {target} 已经跑完了，续它只会重扫一遍已评过的 case",
+                detail={"n_done": row.n_done, "n_cases": row.n_cases},
+            )
+        live = self.snapshot(target)
+        if row.status == "running" and live is not None and live.state in LIVE_STATES:
+            raise EvalError(
+                f"run {target} 正在这个服务里跑，不用续；要重跑先取消它",
+                detail={"state": live.state},
+            )
+        if row.status == "running":
+            raise EvalError(
+                f"run {target} 的状态还是 running，说明有别的进程在写它，续跑会重复计费",
+                detail={"hint": "先确认那个进程已经停了；停掉后重启服务会把僵尸行标成 error"},
+            )
+        if request.dataset and request.dataset != (row.dataset_id or request.dataset):
+            raise EvalError(
+                f"续跑用的数据集必须与原 run 一致（那条是 {row.dataset_id!r}）："
+                "换考卷还接在同一份分数历史里，回归对比就废了",
+                detail={"original": row.dataset_id or ""},
+            )
 
     def _validate_dataset(self, dataset_id: str | None) -> None:
         """只接受 `load_dataset(..., db=)` 真能载入的写法。
@@ -360,6 +427,7 @@ class EvalService:
             report = runner.run(RunConfig(
                 model=request.model, k=request.k, seed=request.seed, limit=request.limit,
                 split=request.split, run_id=job.run_id, trigger="api",
+                resume_run_id=request.resume_run_id,
                 max_wall_ms=request.max_wall_ms, notes=request.notes,
                 should_stop=job.cancelled.is_set, lock_timeout=request.lock_timeout,
                 unload_others=request.unload_others,

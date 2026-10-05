@@ -439,6 +439,17 @@ export interface ComparisonView {
   cases: PairedCase[]
 }
 
+/** 控制面动作的统一回执（pull / rm / unload） */
+export interface AdminResultView {
+  ok: boolean
+  action: string
+  name?: string
+  digest?: string
+  models_synced?: number
+  note?: string
+  detail?: Record<string, unknown>
+}
+
 /** Tool Bench（S25）：注册表 / 审计 / 开销 / 契约矩阵 / 运行历史 */
 export interface ToolDefView {
   name: string

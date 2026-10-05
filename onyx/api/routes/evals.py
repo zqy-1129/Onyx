@@ -82,6 +82,8 @@ class RunRequest(BaseModel):
     dataset: str | None = None
     max_tokens: int | None = None
     max_wall_ms: float | None = None
+    #: 续跑一个被中断的 run（写回同一个 id，已评过的 case 不重复计费）
+    resume_run_id: str | None = None
     #: 拿不到 GPU 锁时最多等多久。0 = 不排队直接失败（对应 CLI 的 --no-queue）
     lock_timeout: float | None = None
     unload_others: bool = False
@@ -447,6 +449,7 @@ def submit_run(body: RunRequest, state: AppState = Depends(get_state)) -> Submit
         task=body.task, model=body.model, k=body.k, limit=body.limit, split=body.split,
         seed=body.seed, dataset=body.dataset, max_tokens=body.max_tokens,
         max_wall_ms=body.max_wall_ms, lock_timeout=body.lock_timeout,
+        resume_run_id=body.resume_run_id,
         unload_others=body.unload_others, notes=body.notes,
     ))
     return SubmitView(

@@ -66,6 +66,7 @@ function qs(params: Record<string, string | number | boolean | null | undefined>
 }
 
 import type {
+  AdminResultView,
   ChatResponse,
   ComparisonView,
   DatasetImportBody,
@@ -140,9 +141,16 @@ export const api = {
   toolRuns: (params: { tool_id?: string | null; limit?: number } = {}) =>
     request<ToolRunView[]>(`/api/tools/runs${qs(params)}`),
   unload: (name: string) =>
-    request<{ ok: boolean }>(`/api/admin/models/unload${qs({ name, confirm: 1 })}`, {
+    request<AdminResultView>(`/api/admin/models/unload${qs({ name, confirm: 1 })}`, {
       method: 'POST',
     }),
+  /** 拉取是一次长请求：几 GB 的下载会占住这条连接几分钟，中间层可能先掐断。
+   *  界面上必须写这句，否则超时看起来像"Onyx 拉取失败"。大下载请走 onyx models pull。 */
+  pullModel: (name: string) =>
+    request<AdminResultView>(`/api/admin/models/pull${qs({ name, confirm: 1 })}`, { method: 'POST' }),
+  /** 只删权重：历史 trace 与分数一行都不动（那次测量已经发生了） */
+  removeModel: (name: string) =>
+    request<AdminResultView>(`/api/admin/models/rm${qs({ name, confirm: 1 })}`, { method: 'POST' }),
   /** GPU 锁状态是**只读**的：看板轮询它不能把锁抢了 */
   gpu: () => request<GpuStatusView>('/api/gpu'),
   evalDatasets: () => request<DatasetView[]>('/api/datasets'),
@@ -163,6 +171,8 @@ export const api = {
     max_tokens?: number | null
     unload_others?: boolean
     notes?: string
+    /** 续跑：新样本写回这条 run，已评过的 case 不重复计费 */
+    resume_run_id?: string | null
   }) => request<SubmitView>('/api/runs', { method: 'POST', body: JSON.stringify(body) }),
   runProgress: (runId: string) => request<ProgressView>(`/api/runs/${encodeURIComponent(runId)}/progress`),
   cancelRun: (runId: string) =>

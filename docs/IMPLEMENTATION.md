@@ -1895,6 +1895,99 @@ API：openapi 28 paths / 30 operations
 
 ---
 
+## S26 — 模型治理出口 + 被中断运行的续跑入口（M9 收口）✅
+
+**产出文件**
+```
+onyx/api/routes/playground.py       # _admin_provider（Cap.ADMIN 闸门，501）+ POST /api/admin/models/pull · /rm
+onyx/cli.py                         # models pull / rm；sync/ls 补 --provider
+onyx/eval/service.py                # SubmitRequest.resume_run_id + _validate_resume + _inherit_resume_dataset + 沿用原 run 的 id
+onyx/api/routes/evals.py            # RunRequest.resume_run_id 透传
+onyx/eval/gpu_lock.py               # 删不掉锁文件时的兜底：RELEASED_HEARTBEAT / release_failed
+onyx/eval/runner.py                 # n_cases 是考卷大小，收尾不许缩成已评条数
+onyx/web/src/pages/ModelGovernance.tsx   # 新面板（拉取 / 卸载 / 删除，勾选才可用）
+onyx/web/src/pages/Models.tsx            # 面板挂进模型页
+onyx/web/src/pages/EvalLaunch.tsx        # ResumeTarget + formForResume + 同一条提交通路
+onyx/web/src/pages/EvalRuns.tsx          # RESUMABLE / resumeTargetOf / 「续跑这条」
+onyx/web/src/api/{client,types}.ts
+tests/unit/test_api_admin_models.py（8）
+tests/unit/test_cli_models.py（10）
+tests/unit/test_eval_service.py（+7 条续跑 + 1 条数据集继承）
+tests/unit/test_api_eval_submit.py（+3 条续跑）
+tests/unit/test_gpu_lock.py（+3 条释放路径）
+onyx/web/src/__tests__/governance.test.ts（7）· evalLaunch.test.ts（+8 → 21）
+```
+
+**控制面缺的不是能力，是出口**。`AdminProvider`（pull/unload/delete）在 S3/S6 就实现了，
+`Cap.ADMIN` 也一直在能力矩阵里，unload 甚至被 Playground 用着——但界面上一个入口都没有，
+于是"把 qwen3:8b 加进这台机器"必须开终端，而那条路径绕开 Onyx：不刷清单、看板看不到，
+人就以为拉取失败了。三个动作共用一个 `_admin_provider` 闸门：**通道不实现控制面就 501**，
+并把"为什么不做个假的"写进错误里——OpenAI 兼容层没有统一的卸载/拉取/删除端点，
+编一个会让"显存已经让出来了"这种关键判断建立在谎话上。CLI 侧 `models pull|rm` 同源，
+顺手给 `sync`/`ls` 补上 `--provider`：pull/rm 能指到别的通道而 sync/ls 不能，就会出现「拉得下来、同步不上」。
+
+**三条措辞各自成立，不共用一句"成功"**：拉取是一次长请求（几 GB 会占住这条 HTTP 连接，
+中间层通常在这之前就把连接掐了，那种失败看起来像"Onyx 拉取失败"，所以界面上写清大下载走 CLI）；
+卸载要说下一次请求是冷启动（TTFT 会明显变高）；删除只释放权重，**历史 trace 与分数一行都不动**——
+那次测量已经发生了，这句话必须显示出来，否则人会以为连带分数也没了。
+`models ls` 与模型页读的是引擎的实时清单，所以删掉之后它不再出现；库里那一行留作出处。
+
+**续跑不新开一条通路**。入口挂在运行页：`RESUMABLE = ['cancelled', 'error']`——
+`done` 不列（续它只会重扫已评过的 case，纯烧 GPU），`running` 不列（那是别人在写的行，
+接上去就是两个持有者）。点了之后预填表单、走**同一个** `POST /api/runs`（带 `resume_run_id`），
+因为两条路径迟早有一边在撒谎。后端四条拒绝各说自己的修法：id 不存在 / 任务或模型变了 /
+已经跑完 / 状态还是 running（有别的进程在写）。`run_id` 沿用原来那条而不是新生成——
+否则界面正拿着一个没人往里写的 id 轮询进度。
+数据集这里补了一个只有想清楚"省略是什么意思"才会做的细节：**没写 dataset 时继承原 run 那份**，
+而不是任务当前的默认集。界面会预填，但 CLI/API 调用方不填才是常态，而"省略"的本意就是"照旧"；
+按默认集载入会把新分数接在另一批样本上，回归对比读起来仍然自洽，却是错的。
+
+**两处只有真的点下去才会露出来的缺陷**
+1. **锁删不掉，后面所有人白等**。`release()` 里 `contextlib.suppress(OSError)` 吞掉的 unlink，
+   在 Windows 上会因为"文件正被别的句柄读"（看板每秒 `read_text`，而 Python 的开法不带
+   FILE_SHARE_DELETE）稳定失败。吞掉的后果不是报错，而是留下一个**心跳新鲜**的锁文件：
+   下一个任务老实等满 `stale_after_s`（默认 600 秒），现象只是"一直排队"，看起来像死锁。
+   症状先出现在我自己测续跑时——卡了 19.5s，持有者是我自己的 owner 串。
+   现在：重试；删不动就把心跳写成 `RELEASED_HEARTBEAT`（2000-01-01），任何读到它的持有者
+   立刻被判过期——**"我已经不在持有了"正是事实，不是撒谎**；两条路都不通才 `release_failed=True` 留痕。
+2. **`n_cases` 被收尾改写成 grade 条数**。中断在 26 条的 run 于是写成 `26/26`，
+   与跑完那一行完全同形，而"这条还欠 210 条"恰恰是它唯一需要说清的事；
+   界面里 `n_done < n_cases` 才亮的 ⚠ badge 因此永远不亮。现在 `n_cases` 是考卷大小，
+   收尾取 `max(原计划, 已评)`——续跑那段只新跑 4 条也不许把考卷改成 4。
+
+**本机验证**
+```bash
+uv run onyx serve --port 8787 --provider mock
+uv run pytest   # 1251 passed, 1 skipped（S26 新增 35 条）
+uv run coverage run -m pytest -q && uv run coverage report   # 89%（12,003 句）
+前端：tsc --noEmit · vitest 93 · vite build（232.64KB js）
+API：openapi 30 paths / 32 operations（新增 pull · rm）
+CLI：41 条命令（models 2 → 4）
+浏览器 #/eval/run（零 console 错误）：
+  真中断一条：submit 后立刻取消 → 该行 ✓ 显示 `12/236` 且带 ⚠ 未跑完 badge（修复前是 12/12）
+  点「续跑这条」→ 面板出现「续跑」badge 与"正在续跑 1EGG17ZJYVP7"→ ✓ done 236/236
+    run id 没变，`cost.requests=236`（旧 12 + 新 224，重复计费为 0），
+    `aggregate.resumed=true / already_graded_before=12`
+浏览器 #/models：
+  未勾选确认时「拉取/卸载/删除权重」三个按钮都实测 disabled
+  勾选后：拉取 → `已拉取 mock/demo-pulled（digest —）· 清单已同步 1 个模型`（没有 digest 就印「—」，不印空）
+          卸载 → `显存让出来了，下一次请求会是冷启动（TTFT 会明显变高）`
+          删除 → 后端那句 `权重已释放；历史 trace 与分数保留`
+```
+
+**没做以及为什么**：拉取进度不接进 `GET /api/stream`。多一条事件流就多一处会撒谎的地方，
+而这件事的长任务本来就该走 `onyx models pull`（它带进度）；501 那条路径只有单测能钉——
+本机在跑的 ollama 与 mock 都实现了 `AdminProvider`，没有一个"没有控制面的通道"在现场可点。
+
+**验收 DoD**：G3 剩下两条（`models pull/rm` 与界面同源、被中断的 run 在界面上可续跑）消失 ⇒ **M9 收口**。
+
+**提交**：
+`fix(eval): GPU 锁删不掉时把心跳推到过去，而不是留一条新鲜的假持有`
+`fix(eval): n_cases 是考卷大小，收尾不许缩成已评条数`
+`feat(eval,web): 模型治理出口 + 被中断运行的续跑入口（S26）`
+
+---
+
 ## 附录 A — 每步自测速查
 
 | 步 | 命令 | 绿的条件 |
@@ -1924,7 +2017,8 @@ API：openapi 28 paths / 30 operations
 | S23 | 浏览器点「开始评测」＋另起进程占住 GPU 锁 | 提交立刻返回 run_id；进度逐条推进；等锁时看得见持有者与 ETA；取消后库里没有那条 run |
 | S24 | 浏览器导入 JSONL → 立刻用它发起评测 | run 记录里 `dataset_id`/`dataset_revision` 跟着结果走；覆盖旧 id 要显式确认；坏行报行号 |
 | S25 | 浏览器点 Tool Bench 的「跑一次」+ `onyx tools run` 后看看板 | 矩阵三态不互相冒充（n/a 与"没这列"都不是 ✓）；模板开销没传时占比是「—」；`tools run` 真的落 `tool_run` 一行 |
-| 门禁 | `make coverage`（`coverage run -m pytest -q`） | 离线套件分支覆盖率 ≥ 80%（S17 落地时 88%，S21 后 89%，S23 后仍 89%） |
+| S26 | 浏览器把一条评测跑到一半取消，再点「续跑这条」；模型页勾选后点拉取/卸载/删除 | 中断行显示 `12/236` 而不是 `12/12`；续跑写回**同一个** run 且请求数只增剩余那部分；未勾选时三个治理按钮都不可点；删除那句说清分数保留 |
+| 门禁 | `make coverage`（`coverage run -m pytest -q`） | 离线套件分支覆盖率 ≥ 80%（S17 落地时 88%，S21 后 89%，S23/S26 后仍 89%） |
 
 ## 附录 B — 架构自测（让"模块化"可验证，而非口号）
 

@@ -449,6 +449,11 @@ class ToolExecutor(Protocol):
   （进 `cost.gpu_heartbeat_errors`）不打断评测：心跳是给排队者算 ETA 的优化，不是正确性前提，
   为拿不到句柄把整轮 GPU 时间判死代价不对等。但计数必须可见——心跳长期写不出去意味着
   锁可能已被别人判过期接管，那时数字要被质疑。
+- 释放（`unlink`）在同一种句柄下会以 `ACCESS_DENIED` 失败，而**它的后果比心跳更阴**：
+  静默吞掉（原先就是 `contextlib.suppress`）等于留下一条心跳新鲜的锁，下一个持有者老实等满
+  `stale_after_s`（默认 600 秒），现象只是"一直排队"，看起来像死锁。所以先重试，
+  删不动就把心跳写成 `RELEASED_HEARTBEAT`（2000-01-01）让任何读到它的持有者立刻被判过期——
+  **"我已不在持有了"正是事实，不是撒谎**；两条路都不通才置 `release_failed` 并留下原因。
 - 参与方：`eval run`（`--no-queue` 立刻失败、`--lock-timeout` 限时排队、`--gpu-lock` 覆盖路径）、
   `onyx serve` 的 Playground（忙时 HTTP 429 带持有者与 ETA）、
   **serve 的评测提交队列**（S23：`eval/service.py` 进程内单飞 + 与 serve 用**同一条**锁路径与

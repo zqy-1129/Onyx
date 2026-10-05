@@ -6,6 +6,7 @@ import { DataTable, type Column } from '../components/DataTable'
 import { CapSymbol, ErrorState, Panel, Skeleton } from '../components/primitives'
 import { fmtFloat, fmtGb, fmtInt, fmtPct, residencyOf, UNKNOWN } from '../format'
 import { useApi } from '../hooks/useApi'
+import { ModelGovernancePanel } from './ModelGovernance'
 
 const CAP_COLUMNS: Array<{ key: string; cap: string; label: string }> = [
   { key: 'tools', cap: 'tools', label: 'tools' },
@@ -112,6 +113,11 @@ export function ModelsPage() {
       >
         <DataTable columns={columns} rows={state.data} rowKey={(r) => r.id} maxHeight="calc(100vh - 220px)" />
       </Panel>
+      <ModelGovernancePanel
+        models={state.data}
+        providerId={state.data[0]?.provider_id ?? ''}
+        onChanged={state.refresh}
+      />
       {unprobed.length ? (
         <Panel title="待实测">
           <p className="small muted">

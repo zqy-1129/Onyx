@@ -28,6 +28,21 @@ export type RunBody = {
   dataset?: string | null
   unload_others?: boolean
   notes?: string
+  /** 续跑：新样本写回这条 run（已评过的 case 不重复计费） */
+  resume_run_id?: string | null
+}
+
+/** 从运行页传进来的"续跑目标"。用表单预填 + 同一条提交通路，
+ *  而不是给续跑另写一条 POST —— 两条路径迟早有一边在撒谎 */
+export type ResumeTarget = {
+  run_id: string
+  task: string
+  model: string
+  k: number
+  limit: number | null
+  split: string
+  seed: number | null
+  dataset: string | null
 }
 
 export type Form = {
@@ -40,6 +55,7 @@ export type Form = {
   seed: string
   notes: string
   unloadOthers: boolean
+  resumeRunId: string
 }
 
 export function isLive(state: string): boolean {
@@ -75,6 +91,23 @@ export function buildBody(form: Form): RunBody {
     dataset: form.dataset === '' ? null : form.dataset,
     unload_others: form.unloadOthers,
     notes: form.notes,
+    resume_run_id: form.resumeRunId === '' ? null : form.resumeRunId,
+  }
+}
+
+/** 续跑目标 → 预填的表单值。limit/split/k 都跟着原 run，否则"续"出来的分数与原来不是同一份考卷 */
+export function formForResume(base: Form, target: ResumeTarget): Form {
+  return {
+    ...base,
+    task: target.task,
+    model: target.model,
+    k: String(target.k ?? 1),
+    limit: target.limit === null ? '' : String(target.limit),
+    split: target.split === 'default' ? '' : target.split,
+    seed: target.seed === null ? '' : String(target.seed),
+    dataset: target.dataset ?? '',
+    resumeRunId: target.run_id,
+    notes: base.notes || `续跑 ${target.run_id.slice(0, 8)}`,
   }
 }
 
@@ -110,9 +143,12 @@ export function keepSplit(
 export function EvalLaunchPanel({
   onRefresh,
   onFinished,
+  resume,
 }: {
   onRefresh: () => void
   onFinished: (runId: string) => void
+  /** 运行页点「续跑」时传进来的目标；变了就走一次同一条提交通路 */
+  resume?: ResumeTarget | null
 }) {
   const tasks = useApi<TaskView[]>(() => api.evalTasks(), { intervalMs: 60_000 })
   const models = useApi<ModelView[]>(() => api.models(), { intervalMs: 60_000 })
@@ -123,7 +159,7 @@ export function EvalLaunchPanel({
 
   const [form, setForm] = useState<Form>({
     task: '', model: '', dataset: '', split: '', k: '1', limit: '', seed: '', notes: '',
-    unloadOthers: false,
+    unloadOthers: false, resumeRunId: '',
   })
   const [submitted, setSubmitted] = useState<SubmitView | null>(null)
   const [progress, setProgress] = useState<ProgressView | null>(null)
@@ -143,6 +179,34 @@ export function EvalLaunchPanel({
     if (!form.task && firstTask) setForm((f) => ({ ...f, task: firstTask, split: '' }))
     if (!form.model && firstModel) setForm((f) => ({ ...f, model: firstModel }))
   }, [taskList, models.data, form.task, form.model])
+
+  /** 提交本身。form 由调用方给（setState 是异步的，续跑那条路径拿不到刚 setForm 的值） */
+  const launch = useCallback(async (values: Form) => {
+    setError(null)
+    setNote('')
+    setSubmitted(null)
+    setProgress(null)
+    try {
+      const view = await api.startRun(buildBody(values))
+      setSubmitted(view)
+      onRefresh()
+    } catch (err) {
+      setError(err)
+    }
+  }, [onRefresh])
+
+  const start = () => launch(form)
+
+  // 续跑：预填表单 + 走同一条提交通路。setForm 之后立刻 launch(form) 会拿到旧值，
+  // 所以这里显式把新表单值传进去
+  useEffect(() => {
+    if (!resume) return
+    const next = formForResume(form, resume)
+    setForm(next)
+    void launch(next)
+    // 依赖只看 resume：form 每次输入都会变，带上它会造成无限重提交
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [resume])
 
   const stopPolling = useCallback(() => {
     if (timer.current !== null) {
@@ -182,20 +246,6 @@ export function EvalLaunchPanel({
       stopPolling()
     }
   }, [runId, onRefresh, onFinished, stopPolling])
-
-  const start = async () => {
-    setError(null)
-    setNote('')
-    setSubmitted(null)
-    setProgress(null)
-    try {
-      const view = await api.startRun(buildBody(form))
-      setSubmitted(view)
-      onRefresh()
-    } catch (err) {
-      setError(err)
-    }
-  }
 
   const cancel = async () => {
     if (!runId) return
@@ -325,10 +375,24 @@ export function EvalLaunchPanel({
             disabled={!form.task || !form.model || live}
             title={live ? '已经在跑一条了：本地一块 GPU，并发只会污染数字' : undefined}
           >
-            {live ? '排队/运行中…' : '开始评测'}
+            {live ? '排队/运行中…' : form.resumeRunId ? '续跑' : '开始评测'}
           </button>
         </div>
       </div>
+
+      {form.resumeRunId ? (
+        <div className="note small">
+          正在续跑 <button className="linklike mono" onClick={() => onFinished(form.resumeRunId)}
+            title="新样本会写回这条 run，已评过的 case 不重复计费">
+            {shortId(form.resumeRunId, 12)}
+          </button>
+          {' '}　改任务/模型/数据集会被后端拒绝（续跑必须接在同一份考卷上）
+          <button className="linklike small" style={{ marginLeft: 8 }}
+            onClick={() => setForm({ ...form, resumeRunId: '', notes: '' })}>
+            不续跑了
+          </button>
+        </div>
+      ) : null}
 
       {error ? <ErrorState error={error} /> : null}
 

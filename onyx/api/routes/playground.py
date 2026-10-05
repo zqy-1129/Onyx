@@ -151,6 +151,26 @@ def demo_tools() -> dict[str, Any]:
     }
 
 
+def _admin_provider(state: AppState, action: str):
+    """控制面三件事（unload / pull / rm）都要先确认这个通道真的暴露控制面。
+
+    OpenAI 兼容层没有统一的这些端点，`AdminProvider` 也就不实现它 ——
+    直接 `provider.unload(...)` 会抛 AttributeError，界面上就变成一条 500。
+    报 501 并说清"为什么不做个假的"比那样有用。
+    """
+    from onyx.core.types import Cap
+
+    provider = state.runtime.provider
+    if Cap.ADMIN not in provider.capabilities():
+        raise HTTPException(
+            status_code=501,
+            detail=f"{provider.id}（{provider.kind} 通道）不暴露控制面，{action} 做不了。"
+                   "兼容层没有统一的卸载/拉取/删除端点，编一个会让「显存已经让出来了」这种"
+                   "判断建立在谎话上；请换 --provider ollama，或直接在引擎侧操作。",
+        )
+    return provider
+
+
 @router.post("/admin/models/unload")
 def unload_model(
     name: str = Query(...),
@@ -159,7 +179,65 @@ def unload_model(
 ) -> dict[str, Any]:
     if confirm != 1:
         raise HTTPException(status_code=400, detail="卸载需要 confirm=1")
-    result = state.runtime.provider.unload(name)
+    provider = _admin_provider(state, "卸载")
+    result = provider.unload(name)
     if not result.ok:
         raise HTTPException(status_code=502, detail=result.error or "卸载失败")
     return {"ok": True, "action": result.action, "detail": result.detail}
+
+
+@router.post("/admin/models/pull")
+def pull_model(
+    name: str = Query(..., description="模型名，例如 qwen3:8b"),
+    confirm: int = Query(0, description="必须为 1；这会把 GB 级权重写进引擎的模型目录"),
+    state: AppState = Depends(get_state),
+) -> dict[str, Any]:
+    """拉取一个模型进本地，并把清单同步回来。
+
+    **这是一次长请求**：几 GB 的下载会占住这条 HTTP 几分钟，而中间层（代理/网关）
+    通常在这之前就把连接掐了 —— 那种失败看起来像"Onyx 拉取失败"，实际是超时。
+    所以界面上这句话要写出来，大下载请走 `onyx models pull`（它还带进度提示）。
+    """
+    from onyx.runtime import sync_models
+
+    if confirm != 1:
+        raise HTTPException(status_code=400, detail="拉取会写入 GB 级权重，需要 confirm=1")
+    provider = _admin_provider(state, "拉取")
+    result = provider.pull(name)
+    if not result.ok:
+        raise HTTPException(status_code=502, detail=result.error or "拉取失败")
+    # 拉完必须刷清单：模型不落库的话界面上"拉成功了但列表里没有"，会被当成 bug
+    synced = sync_models(state.runtime)
+    state.runtime.flush()
+    return {
+        "ok": True, "action": "pull", "name": name,
+        "digest": str(result.detail.get("digest") or ""),
+        "models_synced": synced,
+    }
+
+
+@router.post("/admin/models/rm")
+def remove_model(
+    name: str = Query(...),
+    confirm: int = Query(0, description="必须为 1；删除权重不可逆"),
+    state: AppState = Depends(get_state),
+) -> dict[str, Any]:
+    """删掉本地模型权重。**只删权重**：历史 trace 与分数一行都不动。
+
+    那次测量已经发生了，删权重不会让它变成没发生 —— 这正是"分数永久、证据有限期"里
+    "永久"那一半的意义。
+    """
+    from onyx.runtime import sync_models
+
+    if confirm != 1:
+        raise HTTPException(status_code=400, detail="删除权重不可逆，需要 confirm=1")
+    provider = _admin_provider(state, "删除")
+    result = provider.delete(name)
+    if not result.ok:
+        raise HTTPException(status_code=502, detail=result.error or "删除失败")
+    synced = sync_models(state.runtime)
+    state.runtime.flush()
+    return {
+        "ok": True, "action": "delete", "name": name, "models_synced": synced,
+        "note": "权重已释放；历史 trace 与分数保留",
+    }

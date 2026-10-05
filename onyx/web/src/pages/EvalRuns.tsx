@@ -11,7 +11,7 @@ import { EmptyState, ErrorState, Panel, Skeleton, StatusBadge } from '../compone
 import { fmtClock, fmtInt, fmtScore, fmtCi, shortId, UNKNOWN } from '../format'
 import { useApi } from '../hooks/useApi'
 import { navigate } from '../router'
-import { EvalLaunchPanel } from './EvalLaunch'
+import { EvalLaunchPanel, type ResumeTarget } from './EvalLaunch'
 import { THIN_COVERAGE } from './EvalMatrix'
 
 /** 主分数：按与后端 HEADLINE_METRICS 相同的优先级挑第一个出现过的键。
@@ -115,10 +115,29 @@ const columns: Array<Column<RunView>> = [
   { key: 'time', header: '开始', mono: true, render: (r) => fmtClock(r.started_at), sortValue: (r) => r.started_at },
 ]
 
+/** 能被续跑的状态。`done` 不列：续它只会重扫一遍已评过的 case（纯浪费 GPU）；
+ *  `running` 也不列：那是别人正在写的行，接上去就是两个持有者。 */
+export const RESUMABLE = ['cancelled', 'error']
+
+export function resumeTargetOf(run: RunView | null): ResumeTarget | null {
+  if (!run || !RESUMABLE.includes(run.status)) return null
+  return {
+    run_id: run.id,
+    task: run.task_id,
+    model: run.model_id,
+    k: Number(run.config.k ?? 1),
+    limit: run.config.limit === undefined || run.config.limit === null ? null : Number(run.config.limit),
+    split: String(run.config.split ?? 'default'),
+    seed: run.seed === null ? null : run.seed,
+    dataset: run.dataset_id,
+  }
+}
+
 export function EvalRunsPage({ selectedRunId }: { selectedRunId?: string }) {
   const runs = useApi<RunView[]>(() => api.evalRuns({ limit: 50 }), { intervalMs: 20_000 })
   const gpu = useApi<GpuStatusView>(() => api.gpu(), { intervalMs: 5_000 })
   const [picked, setPicked] = useState<string | null>(selectedRunId ?? null)
+  const [resume, setResume] = useState<ResumeTarget | null>(null)
   // 路由优先：矩阵与 diff 页都靠 /eval/run/<id> 下钻，进来就必须选中那一行。
   // 只把 selectedRunId 当初始值的话，从别的页面跳进来时会停在上一次选中的运行上。
   useEffect(() => {
@@ -131,6 +150,8 @@ export function EvalRunsPage({ selectedRunId }: { selectedRunId?: string }) {
   const pickRun = useCallback((id: string) => setPicked(id), [])
 
   const list = runs.data ?? []
+  const activeRun = list.find((r) => r.id === active) ?? null
+  const resumable = resumeTargetOf(activeRun)
 
   return (
     <>
@@ -143,11 +164,24 @@ export function EvalRunsPage({ selectedRunId }: { selectedRunId?: string }) {
           </span>
         </div>
       ) : null}
-      <EvalLaunchPanel onRefresh={runs.refresh} onFinished={pickRun} />
+      <EvalLaunchPanel onRefresh={runs.refresh} onFinished={pickRun} resume={resume} />
       <Panel
         title="运行"
         note="每行是一次 eval run；点行看它的 grade"
-        actions={<button className="btn" onClick={runs.refresh}>刷新</button>}
+        actions={(
+          <>
+            {resumable ? (
+              <button
+                className="btn"
+                title="新样本写回同一条 run：已评过的 case 不重复计费（GPU 时间是本地最贵的资源）"
+                onClick={() => setResume({ ...resumable })}
+              >
+                续跑这条
+              </button>
+            ) : null}
+            <button className="btn" onClick={runs.refresh}>刷新</button>
+          </>
+        )}
         flush
       >
         {runs.error ? <ErrorState error={runs.error} /> : null}

@@ -6,14 +6,16 @@
  */
 import { describe, expect, it } from 'vitest'
 import {
-  buildBody, isLive, keepSplit, progressRatio, splitChoices, toNumber, waitNote, type Form,
+  buildBody, formForResume, isLive, keepSplit, progressRatio, splitChoices, toNumber, waitNote,
+  type Form, type ResumeTarget,
 } from '../pages/EvalLaunch'
-import type { ProgressView } from '../api/types'
+import { resumeTargetOf, RESUMABLE } from '../pages/EvalRuns'
+import type { ProgressView, RunView } from '../api/types'
 
 function form(over: Partial<Form> = {}): Form {
   return {
     task: 'intent_classification', model: 'qwen3.5:9b', dataset: '', split: '', k: '1',
-    limit: '', seed: '', notes: '', unloadOthers: false, ...over,
+    limit: '', seed: '', notes: '', unloadOthers: false, resumeRunId: '', ...over,
   }
 }
 
@@ -84,14 +86,14 @@ describe('isLive', () => {
   })
 })
 
-describe('waitNote', () => {  it('排队要说前面还有几个', () => {
+describe('waitNote', () => {
+  it('排队要说前面还有几个', () => {
     expect(waitNote(progress({ state: 'queued', position: 3 }))).toContain('前面还有 3 个')
     expect(waitNote(progress({ state: 'queued', position: 0 }))).toBe('排队中')
   })
 
   it('等锁要说谁在占与还要多久；ETA 未知就说未知', () => {
-    const waiting = waitNote(progress({ state: 'running', holder: 'cli-eval', waited_s: 12.4, eta_s: 30 })
-    )
+    const waiting = waitNote(progress({ state: 'running', holder: 'cli-eval', waited_s: 12.4, eta_s: 30 }))
     expect(waiting).toContain('cli-eval')
     expect(waiting).toContain('30s')
     expect(waiting).toContain('已等 12s')
@@ -123,5 +125,76 @@ describe('splitChoices / keepSplit', () => {
 
   it('选项跟着实际要用的那份数据走', () => {
     expect(splitChoices(miniSource)).toEqual(['hard'])
+  })
+})
+
+describe('resumeTargetOf', () => {
+  function runView(over: Partial<RunView> = {}): RunView {
+    return {
+      id: 'run-abcdef0123', task_id: 'intent_classification', model_id: 'qwen3.5:9b',
+      status: 'cancelled', started_at: '2026-10-05T01:00:00+00:00', finished_at: null,
+      seed: 42, app_version: '0.1.0', git_rev: 'x', params_snapshot: {},
+      config: { k: 3, limit: 20, split: 'hard' }, n_cases: 5, n_done: 3, n_error: 0,
+      n_skipped: 0, dataset_id: 'intent_zh', dataset_revision: 'r1', aggregate: {},
+      cost: {}, ...over,
+    }
+  }
+
+  it('done 与 running 不给续跑入口', () => {
+    // 续 done 只是重扫已评过的 case（纯烧 GPU）；接 running 就是两个持有者写同一批行
+    expect(RESUMABLE).toEqual(['cancelled', 'error'])
+    expect(resumeTargetOf(runView({ status: 'done' }))).toBeNull()
+    expect(resumeTargetOf(runView({ status: 'running' }))).toBeNull()
+    expect(resumeTargetOf(null)).toBeNull()
+  })
+
+  it('续跑目标带齐"同一份考卷"的每个坐标', () => {
+    const target = resumeTargetOf(runView())
+    expect(target).toMatchObject({
+      run_id: 'run-abcdef0123', task: 'intent_classification', model: 'qwen3.5:9b',
+      k: 3, limit: 20, split: 'hard', seed: 42, dataset: 'intent_zh',
+    })
+  })
+
+  it('老运行缺 config 时退回任务默认，而不是 NaN 或 undefined', () => {
+    // 空 config 是真的存在的（S23 之前的运行），写成 k: NaN 会提交出一个后端报错的表单
+    const target = resumeTargetOf(runView({ config: {}, seed: null, dataset_id: null }))
+    expect(target?.k).toBe(1)
+    expect(target?.limit).toBeNull()
+    expect(target?.split).toBe('default')
+    expect(target?.seed).toBeNull()
+    expect(target?.dataset).toBeNull()
+  })
+})
+
+describe('formForResume', () => {
+  const target: ResumeTarget = {
+    run_id: 'run-abcdef0123', task: 'intent_classification', model: 'qwen3.5:9b',
+    k: 3, limit: 20, split: 'hard', seed: 42, dataset: 'intent_zh',
+  }
+
+  it('预填后的提交体回到原 run 的参数，并带上 resume_run_id', () => {
+    const body = buildBody(formForResume(form(), target))
+    expect(body.resume_run_id).toBe('run-abcdef0123')
+    expect(body).toMatchObject({ task: 'intent_classification', model: 'qwen3.5:9b', k: 3, limit: 20, split: 'hard', seed: 42, dataset: 'intent_zh' })
+  })
+
+  it('default 子集在表单里仍是「没填」', () => {
+    const body = buildBody(formForResume(form(), { ...target, split: 'default', limit: null, seed: null }))
+    expect(body.split).toBe('default')
+    expect(body.limit).toBeNull()
+    expect(body.seed).toBeNull()
+    expect(body.resume_run_id).toBe('run-abcdef0123')
+  })
+
+  it('人不续跑了就把这个坐标清掉', () => {
+    // 留着它会让下一次普通评测悄悄写成旧 run 的行
+    expect(buildBody(form()).resume_run_id).toBeNull()
+    expect(buildBody(form({ resumeRunId: 'run-abcdef0123' })).resume_run_id).toBe('run-abcdef0123')
+  })
+
+  it('notes 空时给一句能看出是续跑的说明，人已写过就不覆盖', () => {
+    expect(formForResume(form(), target).notes).toBe('续跑 run-abcd')
+    expect(formForResume(form({ notes: '补测 hard' }), target).notes).toBe('补测 hard')
   })
 })

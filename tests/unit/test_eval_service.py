@@ -387,6 +387,114 @@ def test_trimming_keeps_live_jobs(env):
         holder.release()
 
 
+# ── 续跑（S26：被中断的 run 要在界面上能接上）─────────────────────
+def test_resume_writes_back_into_the_same_run(env):
+    """续跑的 id 必须沿用原来那条：新样本写回同一个 run，进度条也不用换目标。"""
+    env.provider.delay = 0.05
+    interrupted = env.service.submit(_req(limit=6))
+    _wait_until(lambda: env.service.snapshot(interrupted.run_id).done >= 1)
+    env.service.cancel(interrupted.run_id)
+    assert env.service.settle(20.0)
+    repo = EvalRepo(env.db)
+    run_id = interrupted.run_id
+    assert repo.get_run(run_id).status == "cancelled"
+    graded_before = len(repo.list_grades(run_id))
+    calls_before = len(env.provider.calls)
+
+    view = env.service.submit(_req(limit=6, resume_run_id=run_id))
+    assert view.run_id == run_id, "续跑另起 id 等于把分数历史劈成两半"
+    assert env.service.settle(30.0)
+
+    row = repo.get_run(run_id)
+    final = env.service.snapshot(run_id)
+    assert final is not None and final.state == "done"
+    assert row.status == "done" and row.n_done == 6
+    assert len(repo.list_grades(run_id)) == 6
+    assert len(env.provider.calls) - calls_before == 6 - graded_before, \
+        "已评过的 case 不许再发一遍：那是最贵的重复"
+    assert row.config["trigger"] == "api"
+    # 续跑这件事记在 aggregate 里（config 是"这条 run 当初怎么建起来的"，不该被后一段改写）
+    assert row.aggregate["resumed"] is True
+    assert row.aggregate["already_graded_before"] == graded_before
+    # 续跑段的成本必须接在原来的成本上：只看这一段会显示"这次没花钱"，
+    # 而之前那几秒 GPU 真的花掉了
+    assert row.cost["requests"] == 6
+
+
+def test_resume_rejects_a_run_that_does_not_exist(env):
+    with pytest.raises(EvalError, match="找不到要续跑的 run"):
+        env.service.submit(_req(resume_run_id="never-existing"))
+
+
+def test_resume_rejects_a_finished_run(env):
+    done = _run_once(env)
+    with pytest.raises(EvalError, match="已经跑完"):
+        env.service.submit(_req(limit=1, resume_run_id=done))
+
+
+def test_resume_rejects_a_run_still_being_written(env):
+    """running 行说明有进程在写它：这时接上去就是两个人跑同一个 run、重复计费。"""
+    _run_once(env)
+    repo = EvalRepo(env.db)
+    task_id = repo.list_runs(limit=1)[0].task_id
+    repo.insert_run(RunRecord(
+        id="someone-else", task_id=task_id, model_id=MODEL,
+        started_at="2026-10-04T00:00:00+00:00", status="running",
+        config={"trigger": "cli"},
+    ))
+    with pytest.raises(EvalError, match="别的进程"):
+        env.service.submit(_req(limit=1, resume_run_id="someone-else"))
+
+
+def test_resume_requires_the_same_task_and_model(env):
+    run_id = _run_once(env)
+    row = EvalRepo(env.db).get_run(run_id)
+    with pytest.raises(EvalError, match="任务与模型"):
+        env.service.submit(SubmitRequest(
+            task="tool_selection", model=row.model_id, limit=1, resume_run_id=run_id,
+        ))
+    with pytest.raises(EvalError, match="任务与模型"):
+        env.service.submit(SubmitRequest(
+            task=row.task_id, model="other/model", limit=1, resume_run_id=run_id,
+        ))
+
+
+def test_resume_cannot_switch_the_dataset(env):
+    """换考卷还接在同一份分数历史里，回归对比就废了。"""
+    env.provider.delay = 0.0
+    view = env.service.submit(_req(limit=6))
+    _wait_until(lambda: env.service.snapshot(view.run_id).done >= 1)
+    env.service.cancel(view.run_id)
+    assert env.service.settle(20.0)
+    with pytest.raises(EvalError, match="数据集必须与原 run 一致"):
+        env.service.submit(_req(limit=6, resume_run_id=view.run_id, dataset="tool_calls_zh"))
+
+
+def test_resume_without_a_dataset_inherits_the_original_one(env):
+    """省略 dataset 的意思是"照旧"，不是"换成任务当前默认"。
+
+    界面会从 run 行预填，CLI/API 调用方却不填才是常态；那时如果按默认集载入，
+    新分数就接在另一批样本上，回归对比读起来仍然自洽，却是错的。
+    """
+    env.provider.delay = 0.05
+    view = env.service.submit(_req(limit=6))
+    _wait_until(lambda: env.service.snapshot(view.run_id).done >= 1)
+    env.service.cancel(view.run_id)
+    assert env.service.settle(20.0)
+    repo = EvalRepo(env.db)
+    original = repo.get_run(view.run_id)
+    assert original.status == "cancelled", "前提：这条真的被中断了，否则续跑会被「已经跑完」拒掉"
+    assert original.dataset_id, "前提：原 run 记下了它用的是哪份数据集"
+
+    resumed = env.service.submit(_req(limit=6, resume_run_id=view.run_id))
+    assert env.service.settle(30.0)
+    after = repo.get_run(resumed.run_id)
+    assert after.dataset_id == original.dataset_id
+    assert after.status == "done" and after.n_done == 6
+    # 考卷大小不能因为"这段只新跑了 4 条"或"上次只计划 2 条"而缩水
+    assert after.n_cases == 6
+
+
 # ── 关停 ──────────────────────────────────────────────────────────
 def test_shutdown_settles_the_queue_and_refuses_new_work(env):
     service = EvalService(env.gateway, env.db,

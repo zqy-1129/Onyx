@@ -949,11 +949,16 @@ def _runtime(
 def models_sync(
     url: str = typer.Option(None, "--url", help="引擎 base url（默认为配置文件 [provider].base_url）"),
     db: Path = typer.Option(None, "--db"),
+    provider: str = typer.Option(
+        None, "--provider",
+        help="ollama | openai-compat | mock | 插件 kind（默认取配置文件）。"
+             "pull/rm 能指到别的通道，sync/ls 也必须能——否则会出现「拉得下来、同步不上」",
+    ),
 ) -> None:
     """从引擎拉取模型清单并落库。"""
     from onyx.runtime import sync_models
 
-    runtime = _runtime(url, db)
+    runtime = _runtime(url, db, provider_kind=provider)
     try:
         count = sync_models(runtime)
         runtime.flush()
@@ -966,6 +971,7 @@ def models_sync(
 def models_ls(
     url: str = typer.Option(None, "--url", help="引擎 base url（默认为配置文件 [provider].base_url）"),
     db: Path = typer.Option(None, "--db"),
+    provider: str = typer.Option(None, "--provider", help="ollama | openai-compat | mock（默认取配置文件）"),
 ) -> None:
     """列出已安装模型与当前载入状态（显存 / 上下文 / keep-alive 剩余）。"""
     from rich.console import Console
@@ -973,7 +979,7 @@ def models_ls(
 
     from onyx.core.types import Cap
 
-    runtime = _runtime(url, db)
+    runtime = _runtime(url, db, provider_kind=provider)
     try:
         # 通道不报告驻留时（OpenAI 兼容层没有统一的"哪些模型在显存里"端点），
         # 状态必须显示「未知」而不是「未载入」——后者是一个我们没问出来的断言
@@ -998,6 +1004,88 @@ def models_ls(
                 status, vram, f"{ctx_loaded} / {card.context_length or '—'}",
             )
         Console().print(table)
+    finally:
+        runtime.close()
+
+
+def _refuse_admin(action: str, provider) -> None:
+    """这个通道没有控制面时说清楚为什么不做，而不是硬做一个假的。"""
+    typer.echo(
+        f"{provider.id}（{provider.kind} 通道）不暴露控制面，{action} 用不了。\n"
+        "  这不是缺实现：OpenAI 兼容层没有统一的「卸载/拉取/删除」端点，"
+        "编一个假的会让「显存已经让出来了」这种关键判断建立在谎话上。\n"
+        "  要么换成 --provider ollama，要么直接在引擎侧操作。",
+        err=True,
+    )
+
+
+@models_app.command("pull")
+def models_pull(
+    name: str = typer.Argument(..., help="模型名，例如 qwen3:8b"),
+    url: str = typer.Option(None, "--url", help="引擎 base url（默认为配置文件 [provider].base_url）"),
+    db: Path = typer.Option(None, "--db"),
+    provider: str = typer.Option(None, "--provider", help="ollama | mock（默认取配置文件）"),
+    yes: bool = typer.Option(False, "--yes", help="跳过确认（脚本里用）"),
+) -> None:
+    """拉取一个模型进本地。
+
+    这一步会往引擎的模型目录写 GB 级权重，所以要确认；`--yes` 给脚本用。
+    拉完顺手同步清单：模型不落库的话 `models ls` 和看板上都看不到它，
+    而"我明明拉了、界面说没有"是最容易被误判成 bug 的一种状态。
+    """
+    from onyx.core.types import Cap
+    from onyx.runtime import sync_models
+
+    runtime = _runtime(url, db, provider_kind=provider)
+    try:
+        if Cap.ADMIN not in runtime.provider.capabilities():
+            _refuse_admin("拉取", runtime.provider)
+            raise typer.Exit(2)
+        if not yes:
+            typer.confirm(f"拉取 {name} 会写入 GB 级权重，继续？", abort=True)
+        typer.echo(f"[i] 拉取 {name}…（下载在引擎侧发生，可能要几分钟）")
+        result = runtime.provider.pull(name)
+        if not result.ok:
+            typer.echo(f"拉取失败: {result.error or result.detail}", err=True)
+            raise typer.Exit(1)
+        count = sync_models(runtime)
+        runtime.flush()
+        typer.echo(f"已拉取 {name}（digest={result.detail.get('digest') or '—'}）"
+                   f"→ 清单已同步 {count} 个模型")
+    finally:
+        runtime.close()
+
+
+@models_app.command("rm")
+def models_rm(
+    name: str = typer.Argument(..., help="要删除的本地模型名"),
+    url: str = typer.Option(None, "--url", help="引擎 base url（默认为配置文件 [provider].base_url）"),
+    db: Path = typer.Option(None, "--db"),
+    provider: str = typer.Option(None, "--provider", help="ollama | mock（默认取配置文件）"),
+    yes: bool = typer.Option(False, "--yes", help="跳过确认（脚本里用）"),
+) -> None:
+    """删掉一个本地模型。**不可逆**。
+
+    只删引擎侧的权重：库里那些 trace / grade 一行都不动——它们记录的那次测量
+    已经发生过，删权重不会让它变成没发生。删完之后 trace 的原始 body 仍然可查，
+    这正是"分数永久、证据有限期"里"永久"那一半的意义。
+    """
+    from onyx.core.types import Cap
+
+    runtime = _runtime(url, db, provider_kind=provider)
+    try:
+        if Cap.ADMIN not in runtime.provider.capabilities():
+            _refuse_admin("删除", runtime.provider)
+            raise typer.Exit(2)
+        if not yes:
+            typer.confirm(f"删除 {name} 不可逆（权重会被释放），继续？", abort=True)
+        result = runtime.provider.delete(name)
+        if not result.ok:
+            typer.echo(f"删除失败: {result.error or result.detail}", err=True)
+            raise typer.Exit(1)
+        typer.echo(f"已删除 {name}。历史 trace 与分数保留；"
+                   "模型页与 `models ls` 读引擎的实时清单，所以它不会再出现；"
+                   "库里那一行留作出处（trace 要能追溯到当时的模型）")
     finally:
         runtime.close()
 

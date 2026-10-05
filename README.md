@@ -43,7 +43,7 @@ uv run onyx db init         # 初始化 .data/onyx.sqlite
 
 | M8 配置与发行 | ✅ | **S20** `onyx.toml` 部署配置（provider / GPU 锁 / 保留窗口 / sandbox / serve 绑定）：优先级只有一条规则 **flag > 环境 > 文件 > 默认**，为此每条命令的 flag 内建默认都改成 `None` —— 带着具体默认值的 flag 会永远赢过配置文件，让它当场变成摆设且不报错 · 格式用 TOML 而不是设计稿里的 YAML，因为 `config.py` 在 `settings → runtime/store` 这条核心管道上，用 YAML 就等于要求"只用库不用 CLI"的人也装 `runtime` extra；`tomllib` 是标准库（详见 DESIGN §13） · `onyx config show` 逐项标出生效值来自哪一层（token 只报"已设置"，值不落终端） · `doctor` 抓"写了不生效"：未知键与坏类型（含 `port = true` 这种被当成 1 号端口的手滑）会指名并报红 · **S21** 非回环绑定的姿态：`--host 0.0.0.0` 没有 token 就**拒绝启动**（退出码 2），共享时 `--read-only` 只让看不让操作 · **S22** 版本策略（`0.8.0`＝M8；版本号单点定义在 `onyx/__init__.py`）+ `CHANGELOG.md` + `.github/workflows/ci.yml` 跑五道门与安装冒烟 |
 
-| M9 操作闭环 | 🟡 | **S23** 评测可以在界面发起了：`POST /api/runs` 只入队并立刻返回 run_id（跑评测的是服务里的一个 worker 线程，不是请求线程），进程内单飞排队 + 与 Playground 共用**同一把**机器级 GPU 锁；界面上看得到逐条进度、排队位置、"谁在占 GPU + ETA"，三条路都能取消（排队中 / 等锁中 / 跑一半）；跑完自动选中那条 run 并下钻 grade。被中断的运行不再留 `running` 僵尸：服务启动时把上次进程发起、且锁已空闲的行标成 `error` 并写明原因，**但不碰别的进程（CLI）正在跑的行**。**S24** 数据集也在界面导入了：`POST /api/datasets` 收 JSONL **文本**（不收路径——路径来自请求体就是任意文件读），来历 `upstream/revision/license` 一起落库，覆盖同名 id 要显式勾选确认，并且补上了断掉的闭环：以前 `onyx eval import --id x` 之后 `onyx eval run --dataset x` 会报"未知数据集"，而样本明明就在同一张库里。**S25** 工具库也能在界面审计了（Tool Bench）：注册表（内容 hash 版本 / 副作用 / tokens / 启用）、契约审计（逐条规则带修法，文案与 CLI 同源）、上下文开销（JSON 与模板脚手架分两笔，没传模板开销时占比是「—」而不是 0%）、执行器契约矩阵（点一次才真跑：✓ / ✗ / n/a / "没这列"四态互不冒充）、运行历史。做这一页时发现 `tool_run` 表与它的保留规则存在很久但**从来没有写入方** —— 现在 `onyx tools run` 会落一行，而确定性/幂等两列留「—」（跑一次测不出这两件事）。欠 S26 `models pull/rm` 与续跑入口 |
+| M9 操作闭环 | ✅ | **S23** 评测可以在界面发起了：`POST /api/runs` 只入队并立刻返回 run_id（跑评测的是服务里的一个 worker 线程，不是请求线程），进程内单飞排队 + 与 Playground 共用**同一把**机器级 GPU 锁；界面上看得到逐条进度、排队位置、"谁在占 GPU + ETA"，三条路都能取消（排队中 / 等锁中 / 跑一半）；跑完自动选中那条 run 并下钻 grade。被中断的运行不再留 `running` 僵尸：服务启动时把上次进程发起、且锁已空闲的行标成 `error` 并写明原因，**但不碰别的进程（CLI）正在跑的行**。**S24** 数据集也在界面导入了：`POST /api/datasets` 收 JSONL **文本**（不收路径——路径来自请求体就是任意文件读），来历 `upstream/revision/license` 一起落库，覆盖同名 id 要显式勾选确认，并且补上了断掉的闭环：以前 `onyx eval import --id x` 之后 `onyx eval run --dataset x` 会报"未知数据集"，而样本明明就在同一张库里。**S25** 工具库也能在界面审计了（Tool Bench）：注册表（内容 hash 版本 / 副作用 / tokens / 启用）、契约审计（逐条规则带修法，文案与 CLI 同源）、上下文开销（JSON 与模板脚手架分两笔，没传模板开销时占比是「—」而不是 0%）、执行器契约矩阵（点一次才真跑：✓ / ✗ / n/a / "没这列"四态互不冒充）、运行历史。做这一页时发现 `tool_run` 表与它的保留规则存在很久但**从来没有写入方** —— 现在 `onyx tools run` 会落一行，而确定性/幂等两列留「—」（跑一次测不出这两件事）。**S26** 模型治理有了出口：模型页可以拉取 / 卸载 / 删除权重（与 `onyx models pull|rm` 同一个 `AdminProvider`，未勾选确认时按钮点不动，通道不暴露控制面时报 501 并说清"为什么不做个假的"——兼容层没有统一端点，编一个会让"显存已经让出来了"这种判断建立在谎话上），删除只释放权重而**历史 trace 与分数一行都不动**；被中断的运行也能在界面上续跑（「续跑这条」→ 预填表单 → 同一个 `POST /api/runs` 带 `resume_run_id`，**写回原来那条 id**，实测中断在 12 条的 run 续到 236 且请求数只增 224；`dataset` 省略时继承原 run 那份而不是任务当前默认）。这一步顺带修掉两处只有真点才会露出来的口径：`n_cases` 被收尾缩成已评条数（`12/12` 与跑完那行完全同形，⚠ 未跑完 badge 因此永不亮），以及 Windows 上删不掉的锁文件（看板每秒读锁 ⇒ `unlink` 拿到 `ACCESS_DENIED`，原先被静默吞掉，留下一条心跳新鲜的假持有让后面的人白等 600 秒）|
 
 > CI 与安装冒烟都在本机验证过命令本身（干净环境里 `uv sync --extra dev,runtime,api,bench` → 1128 passed / 覆盖率 89%；
 > `uv build` + `uv tool install` 隔离装起来后 `onyx version / db init / chat --provider mock / doctor` 全通），
@@ -130,7 +130,7 @@ source=engine，confidence=high）、分段归因（`msg:0=8 + template_ctl=11 =
 评测怎么跑才不出错觉：[`docs/eval-recipes.md`](docs/eval-recipes.md)。
 **现在到底有什么、还欠什么**：[`docs/STATUS.md`](docs/STATUS.md)（数字当场核对，含核对命令）。
 
-下一步见 [`docs/ROADMAP.md`](docs/ROADMAP.md)（M9 剩下的 S24–S26 + M10 告警出口，含三个需要决策的问题）。
+下一步见 [`docs/ROADMAP.md`](docs/ROADMAP.md)（M10 告警出口与 M11 评测资产起，含三个需要决策的问题）。
 
 ## 共享给同事看（非回环绑定）
 

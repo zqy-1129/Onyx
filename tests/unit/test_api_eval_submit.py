@@ -191,6 +191,60 @@ def test_progress_of_an_unknown_run_is_404(app):
     assert client.get("/api/runs/00NOPE/progress").status_code == 404
 
 
+# ── 续跑（S26）────────────────────────────────────────────────────
+def test_resume_continues_the_interrupted_run_in_place(app, monkeypatch):
+    """界面上点「续跑」必须接回同一条 run：另起 id 会把一次评测的历史劈成两半。"""
+    client, runtime, _ = app
+    original = runtime.provider.generate
+
+    def slow(req, **kw):        # 给取消留出真实的时间窗（每条样本 ~60ms）
+        time.sleep(0.06)
+        return original(req, **kw)
+
+    monkeypatch.setattr(runtime.provider, "generate", slow)
+    run_id = client.post("/api/runs", json={"task": TASK, "model": MODEL, "limit": 4}).json()["run_id"]
+    _wait_progress(client, run_id, lambda p: p["done"] >= 1, "至少跑完一条")
+    assert client.post(f"/api/runs/{run_id}/cancel").json()["cancelled"] is True
+    _wait_state(client, run_id, "cancelled")
+    graded_before = len(client.get(f"/api/runs/{run_id}/grades").json())
+    assert 1 <= graded_before < 4
+
+    resp = client.post("/api/runs", json={
+        "task": TASK, "model": MODEL, "limit": 4, "resume_run_id": run_id})
+    assert resp.status_code == 202, resp.text
+    assert resp.json()["run_id"] == run_id, "续跑必须是同一条 run"
+
+    final = _wait_state(client, run_id, "done")
+    assert final["total"] == 4
+    body = client.get(f"/api/runs/{run_id}").json()["run"]
+    assert body["status"] == "done" and body["n_done"] == 4
+    assert body["aggregate"]["resumed"] is True
+    assert body["aggregate"]["already_graded_before"] == graded_before
+    assert len(client.get(f"/api/runs/{run_id}/grades").json()) == 4
+
+
+def test_resume_rejects_a_finished_run(app):
+    """已跑完的 run 续它只会重扫一遍已评过的 case —— 那是纯浪费的 GPU 时间。"""
+    client, _, cli_run_id = app
+    resp = client.post("/api/runs", json={
+        "task": TASK, "model": MODEL, "limit": 3, "resume_run_id": cli_run_id})
+    assert resp.status_code == 422, resp.text
+    assert "已经跑完" in resp.json()["error"]["message"]
+
+
+def test_resume_rejects_an_unknown_id_and_a_mismatched_task(app):
+    client, _, cli_run_id = app
+    bad = client.post("/api/runs", json={
+        "task": TASK, "model": MODEL, "limit": 1, "resume_run_id": "never-existing"})
+    assert bad.status_code == 422
+    assert "找不到要续跑的 run" in bad.json()["error"]["message"]
+
+    mismatch = client.post("/api/runs", json={
+        "task": "tool_selection", "model": MODEL, "limit": 1, "resume_run_id": cli_run_id})
+    assert mismatch.status_code == 422
+    assert "任务与模型" in mismatch.json()["error"]["message"]
+
+
 def test_cancel_a_foreign_running_run_is_409(app):
     """别的进程持有锁在跑的运行，本服务既没有它的取消开关，也不该动它的锁。"""
     client, runtime, cli_run_id = app

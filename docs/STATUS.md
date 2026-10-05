@@ -1,13 +1,14 @@
 # 项目现状（Onyx · v0.8.0）
 
-核对时间 **2026-10-04**，HEAD = M8 收口（S20–S22）+ M9 前三步（S23 界面发起评测、S24 数据集闭环、S25 Tool Bench）之后。
+核对时间 **2026-10-05**，HEAD = M8 收口（S20–S22）+ M9 四步（S23 界面发起评测、S24 数据集闭环、
+S25 Tool Bench、S26 模型治理出口与续跑）之后 ⇒ **M9 收口**。
 本文所有数字都是当场跑出来的（命令附在每节末尾），不是从旧文档抄的；
 `README.md` 的进度表、`docs/IMPLEMENTATION.md` 的分步档案是历史沿革，
 **这里回答的是"现在有什么、能干什么、还欠什么"**。
 
-一句话：**M0–M8 全部达成；M9 已交付三步——评测能在界面发起（队列/进度/取消）、数据能在界面导入、
-工具库能在界面审计。欠的是 S7 剩下的 `report usage` / `token explain` 两个入口、M10 的告警出口，
-以及一批"带原因推迟"的项。**
+一句话：**M0–M9 全部达成——不发一句命令就能完成"导入数据 → 拉模型 → 跑评测 → 续跑中断 →
+看矩阵 → 下钻 trace → 审计工具库"。欠的是 S7 剩下的 `report usage` / `token explain` 两个入口、
+M10 的告警出口，以及一批"带原因推迟"的项。**
 
 ---
 
@@ -65,8 +66,14 @@ WAL + 批量 sink（队列满丢样本但 `dropped` 计数可见）、
 - 模型 × 任务矩阵（每格取**最新一次 done**，薄覆盖率强制显示分母）
 - 报告导出：md / csv / 自包含 html（含手写 SVG 雷达图，任务数 ≥3 才画）
 - 调度：GPU **机器级**独占锁 + 心跳 + ETA + `--unload-others`、断点续跑（成本与 n_done 不被后续片段清零）
+- **`n_cases` 是考卷大小，不是已评条数（S26 修正）**：中断的 run 显示 `12/236` 并带 ⚠，
+  而不是与跑完那行同形的 `12/12`；续跑段的 `max(原计划, 已评)` 也不许把考卷改小
 - **提交服务 `eval/service.py`（S23）**：进程内单飞队列（`max_pending=8`，满了报 429 而不是默默排队）、
   取消（排队中 / 等锁中 / 跑一半三条路都真能停）、逐条进度快照、启动时回收上次进程留下的 `running` 僵尸行
+- **界面上能续跑被中断的 run（S26）**：运行页「续跑这条」（只有 `cancelled`/`error` 可点）→ 预填表单 →
+  同一个 `POST /api/runs` 带 `resume_run_id`，**写回原来那条 id**；四条拒绝各说自己的修法
+  （id 不存在 / 任务或模型变了 / 已经跑完 / 状态还是 running 说明有别的进程在写）；
+  `dataset` 省略时**继承原 run 那份**而不是任务当前默认——"省略"的本意是"照旧"
 - 能力不满足 ⇒ 整任务 skip 且**留下带原因的记录**（禁止隐式降级）
 - 数据集导入：`--source bfcl`、JSONL、`file:<路径>`；来历（upstream/revision/license）参与可比性判定
 - **导入 → 读回 → 跑评测 是通的（S24）**：`load_registered` 把已登记的 id 读回成 Dataset，
@@ -74,18 +81,23 @@ WAL + 批量 sink（队列满丢样本但 `dropped` 计数可见）、
   `register_dataset` 是唯一的落库口，覆盖旧 revision / 条数变化会返回警告（CLI 打印、API 一起回给界面）
 
 ### L6 接口
-- **CLI 39 条命令**：顶层 7（`chat` / `serve` / `doctor` / `plugins` / `version` / `calibrate` / `rotate`）
-  + 分组 32（`db 5` / `probe 4` / `models 2` / `traces 3` / `tools 9` / `eval 8` / `config 1`）
+- **CLI 41 条命令**：顶层 7（`chat` / `serve` / `doctor` / `plugins` / `version` / `calibrate` / `rotate`）
+  + 分组 34（`db 5` / `probe 4` / `models 4` / `traces 3` / `tools 9` / `eval 8` / `config 1`）
+  ——`models pull|rm` 是 S26 补的出口，且 `sync`/`ls` 一起补上 `--provider`
+  （pull/rm 能指到别的通道而 sync/ls 不能，就会出现「拉得下来、同步不上」）
 - **部署配置 `onyx.toml`**（S20）：provider / GPU 锁 / 保留窗口 / sandbox / serve 绑定收在一处。
   优先级只有一条规则 **flag > 环境 > 文件 > 默认**；`onyx config show` 逐项标出它来自哪一层，
   `onyx doctor` 把"写了不生效"的未知键与坏类型报成红项（模板见 `onyx.example.toml`）
-- **API 30 个操作 / 28 条路径**（29 REST + `GET /api/stream` SSE）。写操作 5 个：
-  Playground chat、admin unload、**发起评测**、**取消评测**、**导入数据集**（S21 的 `--read-only` 全部挡 403）；
+- **API 32 个操作 / 30 条路径**（31 REST + `GET /api/stream` SSE）。写操作 7 个：
+  Playground chat、admin unload、**拉取模型**、**删除权重**（后两个 S26，都要求 `confirm=1`，
+  通道没有控制面时 501）、**发起评测**、**取消评测**、**导入数据集**
+  （S21 的 `--read-only` 全部挡 403）；
   Tool Bench 的五个端点全是 GET，所以只读看板也能完整审计工具库
 - **非回环绑定强制 token**（S21）：`serve --host 0.0.0.0` 没有 token 就拒绝启动；
   `--read-only` 让共享看板不变成共享操作台；错误体统一 `{error:{code,message,detail.hint}}`
-- **Web 11 页**：Fleet / Models / Traces / TraceDetail / Token Ledger / Playground / **Tool Bench** /
-  评测（运行与发起）/ 矩阵 / 回归 / 数据集
+- **Web 11 页**：Fleet / Models（含 S26 的治理面板：拉取 / 卸载 / 删除，勾选才可用）/ Traces /
+  TraceDetail / Token Ledger / Playground / **Tool Bench** /
+  评测（运行与发起，S26 起可「续跑这条」）/ 矩阵 / 回归 / 数据集
   ——手写 CSS token 与手写 SVG，无组件库无图表库；每页都实测过（零 console 错误）。
   评测的四个子页从 S24 起有 subnav——之前矩阵与回归**只能手敲 hash** 才到得了
 
@@ -114,22 +126,34 @@ WAL + 批量 sink（队列满丢样本但 `dropped` 计数可见）、
 ## 2. 质量门与规模
 
 ```
-uv run pytest            # 1216 passed, 1 skipped（S17–S25 新增：retention 28 / backup 20 / doctor 9 / config 25 / auth 31 / 发行面 15 / 提交服务 25 / 发起评测 API 16 / 数据集 registry 11 + API 10 / 矩阵 7 + Tool Bench API 11 + CLI 留痕 2）
+uv run pytest            # 1251 passed, 1 skipped（S17–S26 新增：retention 28 / backup 20 / doctor 9 / config 25 / auth 31 / 发行面 15 / 提交服务 25 / 发起评测 API 16 / 数据集 registry 11 + API 10 / 矩阵 7 + Tool Bench API 11 + CLI 留痕 2 / S26 的治理 API 8 + CLI models 10 + 续跑 10 + 锁释放 3）
 uv run pytest -m live     # 20 passed（真打 qwen3.5:9b，与评测共用机器级 GPU 锁）
 uv run pytest -m probe     # 4 passed（P 系列实验的可重跑版本）
 uv run ruff check .         # All checks passed（`ruff format` 不是门禁）
 uv run lint-imports          # 3 contracts kept（两条网络例外显式登记）
-uv run coverage run -m pytest -q && uv run coverage report   # 89% ≥ 80%（分支覆盖，离线套件；S23–S24 新代码 service 95% / evals 路由 97% / deps 100%）
+uv run coverage run -m pytest -q && uv run coverage report   # 89% ≥ 80%（分支覆盖，离线套件，12,003 句；S23–S24 新代码 service 95% / evals 路由 97% / deps 100%）
 uv run python scripts/check_extension_boundary.py   # 接入实现未触碰受保护内核文件
 uv run onyx doctor            # 9 项体检：配置 / Python / 可写 / 磁盘 / 迁移 / blob / 档位 / 插件 / 引擎
 uv run onyx config show       # 每一项生效值标出来自 flag/环境/文件/默认哪一层（token 只报"已设置"）
 uv build && uv tool install --from dist/*.whl …  # 干净环境装起来：version / db init / chat(mock) / doctor 全通
-前端：tsc --noEmit / vitest 79 / vite build（228KB js）+ 浏览器 take_snapshot
-API：openapi 28 paths / 30 operations（含 `GET /api/stream` SSE）
+前端：tsc --noEmit / vitest 93 / vite build（232.64KB js）+ 浏览器 take_snapshot
+API：openapi 30 paths / 32 operations（含 `GET /api/stream` SSE）
 CI：.github/workflows/ci.yml 跑上面这些（本机已验证命令本身可跑通；仓库尚无远端 ⇒ 还没真跑过一次）
 ```
 
 真机跑过的证据（可复查，都在 git 里）：
+S26 在浏览器里把两条新出口都走到底：`#/eval/run` 真提交一条评测、立刻取消 ⇒ 该行显示
+`12/236` 并带 ⚠ 未跑完（**修 `n_cases` 之前它显示 `12/12`，与跑完那行完全同形**）⇒
+点「续跑这条」⇒ 面板出现「续跑」badge 与"正在续跑 1EGG17ZJYVP7"⇒ ✓ done `236/236`，
+**run id 不变**、`cost.requests=236`（旧 12 + 新 224，已评过的没有重复计费）、
+`aggregate.resumed=true / already_graded_before=12`。`#/models` 的治理面板：未勾选确认时
+拉取/卸载/删除三个按钮实测都 disabled；勾选后拉取回执 `已拉取 mock/demo-pulled（digest —）`
+（没有 digest 就印「—」而不是空）、卸载说清"下一次请求是冷启动"、删除用后端那句
+`权重已释放；历史 trace 与分数保留`。这一步又挖出一处 Windows 真实缺陷：
+`release()` 的 `unlink` 会因看板每秒读锁文件而拿到 `ACCESS_DENIED`，原先被
+`contextlib.suppress` 吞掉 ⇒ 留下一条**心跳新鲜**的锁，后面所有人白等 `stale_after_s`
+（默认 600 秒），现象只是"一直排队"看起来像死锁（我自己测续跑时卡住 19.5s 才发现，
+持有者是我自己的 owner 串）。现在删不动就把心跳推到 `2000-01-01`——"已不在持有"正是事实。
 S25 在浏览器里跑通了 Tool Bench：导入 `examples/tools.yaml`（5 个工具）后点「跑一次」，
 矩阵显示 4 列 × 8 断言，`timeout_is_reported` 在 mock 列是 **n/a**、
 `mock_policy_makes_no_real_call` 在 python_fn 列是 n/a，`ollama_builtin` 整列是「—」并写明"未实现"；
@@ -163,7 +187,7 @@ S23 在浏览器里真跑过：`--provider mock` 的 serve 上点「开始评测
 | `onyx token explain <trace>`（多源对比表） | S7 / 附录 A 的自测命令 | 功能其实存在但埋在 `traces show` 的对账表里，没有独立入口；对照"某个数字为什么被采信"这个高频问题，命令行入口是必要的 |
 | `hf_tokenizer`（T1）与 `gguf_vocab`（T2）没有实现 | P9 结论：T2 应提前为 S4 主实现 | 阶梯、采信优先级、`CounterContext.tokenizer` 插拔位都在，缺的是实现本身。后果：分段归因最多到 `fitted/medium`，做不了"逐段完全归因"；`tokens` extra（minja/tokenizers/gguf）装了也不生效。`doctor` 现在会把这件事写在明面上，`onyx token explain` 入口也还没有 |
 | `TOOL_EXEC_START` 事件的 `args_ref` 无处落库 | S17 真机 dry-run 查出来的 | 循环每次工具调用都写一个 args blob，但 schema 里没有任何列存它（`tool_call` 存的是内联 `args_json`）⇒ **每次工具循环泄漏一个小 blob**。`rotate` 能把孤儿回收掉，但正确的修法是别再写或者把它落库——别让"能删孤儿"掩盖"一直在造孤儿" |
-| `-m e2e` 用例（附录 A 的 S9 自测行） | 附录 A | 现在 **0 个 e2e 用例**：浏览器验证是手工做的（`take_snapshot` + 读 console）。手工是唯一一次 SSE 静默失效被发现的途径，也是 S23/S24/S25 三处真实缺陷（心跳判死、导入后跑不了、`tool_run` 没有写入方）唯一的暴露途径——但也意味着**没人记得住的那些路径**没有回归保护 |
+| `-m e2e` 用例（附录 A 的 S9 自测行） | 附录 A | 现在 **0 个 e2e 用例**：浏览器验证是手工做的（`take_snapshot` + 读 console）。手工是唯一一次 SSE 静默失效被发现的途径，也是 S23–S26 **五处**真实缺陷（心跳判死、导入后跑不了、`tool_run` 没有写入方、锁删不掉让后面的人白等 600 秒、`n_cases` 被缩成已评条数）唯一的暴露途径——但也意味着**没人记得住的那些路径**没有回归保护 |
 | `onyx serve --reload` | 附录 A 的自测命令 | 小：开发体验，非功能缺口（vite 的 HMR 已覆盖前端） |
 
 ### B. 明确推迟、带原因的（不是遗漏）
@@ -197,12 +221,13 @@ S23 在浏览器里真跑过：`--provider mock` 的 serve 上点「开始评测
 
 1. ~~M7 跑得住~~（S17 保留策略 / S18 可验证备份 / S19 体检补齐 + 迁移前自动快照 + 体积曲线，全部达成）。
    ~~M8 配置与发行~~（S20 `onyx.toml` / S21 token 姿态 / S22 版本 + CHANGELOG + CI）。
-   **M9 操作闭环进行中**：S23 界面发起评测 ✅、S24 数据集导入与读回 ✅、S25 Tool Bench 页 ✅；
-   欠 S26 `models pull|rm` 与被中断运行的续跑入口。
+   ~~M9 操作闭环~~（S23 界面发起评测 / S24 数据集导入与读回 / S25 Tool Bench 页 /
+   S26 模型治理出口与被中断运行的续跑入口，**全部达成**）。
 2. **`-m e2e` 用例**：把已经手工验证过的页面路径固化成回归（SSE 联通、矩阵分母显示、劣化清单下钻、
-   发起评测的排队与取消、Tool Bench 的「跑一次」）。S23–S25 之后这条最值钱：
-   三步的真实缺陷全是浏览器点出来的，而它们现在没有任何回归保护。
-3. **`onyx models pull|rm` + 界面上的续跑入口**（S26）：`AdminProvider` 早就有能力，缺的是出口。
+   发起评测的排队与取消、Tool Bench 的「跑一次」、S26 的续跑与治理三动作）。
+   S23–S26 之后这条最值钱：四步的真实缺陷**全部**是浏览器点出来的，而它们现在没有任何回归保护。
+3. **M10 观测触达**（G4）：告警规则 + 两个出口（本地文件 / 通用 webhook）+ 触发历史页；
+   多引擎观测形态在这里定案（要么一进程多 provider，要么文档化"多实例 + 汇总视图"）。
 4. **`token explain` + `doctor` 两项检查 + `report usage`**：都属于"每天都在用但入口缺失"。
 5. C 组三条一致性（`RECONCILED` 不发、`base_url` 默认值、兼容通道探针覆盖）适合凑成一次"口径一致性"清理。
 
