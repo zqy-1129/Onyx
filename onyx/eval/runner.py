@@ -282,6 +282,11 @@ class EvalRunner:
         # 一个跑完的 run 看起来一条都没跑过
         n_done = len(all_records)
         n_error = _error_count(all_records)
+        # n_cases 是**考卷大小**（计划要评多少条），不是已评条数。
+        # 收尾拿 grade 条数覆盖它，被中断在 26 条的 run 就会写成 26/26 ——
+        # 与跑完那行长得一模一样，而"这条还欠 210 条"恰恰是最需要看出来的信息
+        planned = previous.n_cases if previous is not None and previous.n_cases else total
+        n_cases = max(planned, n_done)
         # 立刻转成 JSON-safe：报告里看到的与库里存的必须是同一个形状。
         # 否则刚跑完时 CI 是 dataclass、`eval show` 读回来是字符串，
         # 同一次运行的置信区间在两个入口一个显示一个消失
@@ -295,13 +300,13 @@ class EvalRunner:
 
         self.repo.update_run(
             run_id, status=status, finished_at=utc_now_iso(), n_done=n_done,
-            n_error=n_error, n_skipped=skipped_count, n_cases=len(all_records),
+            n_error=n_error, n_skipped=skipped_count, n_cases=n_cases,
             aggregate=aggregate, cost=cost,
         )
         return RunReport(
             run_id=run_id, task_id=self.task.id, model=config.model, status=status,
             aggregate=aggregate, grades=tuple(grades),
-            cost=cost, n_cases=len(all_records), n_done=n_done, n_error=n_error,
+            cost=cost, n_cases=n_cases, n_done=n_done, n_error=n_error,
             n_skipped=skipped_count, started_at=started_at, finished_at=utc_now_iso(),
         )
 

@@ -257,6 +257,11 @@ def test_cancel_preserves_completed_grades(env):
     assert len(EvalRepo(env[0]).list_grades(report.run_id)) == 3
     assert report.aggregate["cancelled"] is True
     assert report.aggregate["n_total"] == 3
+    # n_cases 是考卷大小，不是已评条数：写成 3/3 会让这行与跑完的那行完全同形，
+    # 而"还欠 3 条"正是这一行唯一需要说清的事（界面的 ⚠ 未跑完 badge 也依赖它）
+    assert report.n_cases == 6 and report.n_done == 3
+    row = EvalRepo(env[0]).get_run(report.run_id)
+    assert (row.n_cases, row.n_done) == (6, 3)
 
 
 class _GradeCrashRepo(EvalRepo):
@@ -335,6 +340,7 @@ def test_resume_skips_already_graded_cases(env):
     assert resumed.run_id == partial.run_id, "续跑必须写回同一个 run"
     assert resumed.status == "done"
     assert resumed.n_done == 6, "n_done 是整个 run 的完成数（2 条已评 + 新跑 4 条）"
+    assert resumed.n_cases == 6, "续跑这段拿的是剩下 4 条，不能把考卷大小改成 4"
     assert len(provider.calls) - first_round_requests == 4, "已评过的 case 不许再发请求"
 
     sink.flush(5.0)
