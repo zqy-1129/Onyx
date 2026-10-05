@@ -30,7 +30,10 @@ class AlertRepo:
                 VALUES({','.join("?" * len(_COLUMNS))})
                 ON CONFLICT(id) DO UPDATE SET status=excluded.status, detail=excluded.detail""",
             (
-                rec.id, rec.created_at, rec.code, rec.severity, dumps(rec.rule),
+                rec.id, rec.created_at, rec.code, rec.severity,
+                # rule_json 是 NOT NULL：判据快照正是这张表的存在理由，空规则也要落成 `{}`
+                # 而不是 NULL（NULL 会让"当时没记判据"与"记了空规则"这两种情况混在一起）
+                dumps(rec.rule) or "{}",
                 rec.n_in_window, rec.window_s, rec.first_anomaly_id, rec.last_anomaly_id,
                 dumps(list(rec.trace_ids)), rec.channel, rec.status, rec.detail,
                 1 if rec.is_test else 0,

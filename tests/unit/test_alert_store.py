@@ -54,6 +54,12 @@ def test_round_trip_keeps_rule_and_sample_traces(alerts):
     assert got.is_test is False and got.n_in_window == 3
 
 
+def test_an_empty_rule_snapshot_still_round_trips(alerts):
+    """空规则落成 `{}` 而不是 NULL：rule_json 的 NOT NULL 就是"判据必须被记下来"这件事。"""
+    alerts.insert_trigger(_trigger("bare", rule={}))
+    assert alerts.list_triggers()[0].rule == {}
+
+
 def test_filters_are_independent(alerts):
     for rec in (
         _trigger("w1", channel="webhook", status="failed", detail="超时"),
