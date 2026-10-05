@@ -2281,9 +2281,61 @@ uv run ruff check . · uv run lint-imports（3 kept）· scripts/check_extension
 
 ## S31 — `instruction_following`：多条约束的可判定遵循（M11 第二步）
 
-一条样本带 N 条**可机械检查**的约束（长度、必须包含/禁止包含、大小写、条目数、语言、
-"只输出 JSON"），分数是"满足的约束数 / 总约束数"，同时保留"全满足率"。
-判据必须是代码可判的——凡需要人读才知道是否遵循的，不进这个任务（那是评审不是测量）。
+**产出文件（计划）**
+```
+onyx/eval/graders/constraints.py              # check(text, constraint) -> Result(ok, why)：每种约束一个纯函数
+onyx/eval/datasets/builtin/instructions_zh.py # 生成器：先有一条"必然满足"的参考回答，约束从它派生
+onyx/eval/tasks/instruction_following.py      # 任务本体：满足率 / 全满足率 / by_kind（各带分母）
+onyx/eval/tasks/__init__.py · loader.py       # 注册 + 数据集别名 + revision
+tests/unit/test_constraint_grader.py          # 每种约束的通过形状与失败形状（含边界）
+tests/unit/test_instructions_zh_dataset.py    # 考卷自检：参考回答必须满足它自己的每一条约束
+tests/unit/test_instruction_following_grade.py# 形态表：全满足 / 部分 / 全违反 / 空正文 / 拒答 / 引擎故障
+tests/unit/test_instruction_following_run.py  # mock 真跑：两个口径、by_kind 分母、CI 同源、trace 下钻
+```
+
+**判据必须是代码可判的**（ROADMAP 原话）：凡需要人读才知道是否遵循的，不进这个任务——那是评审不是测量。
+约束种类（每种都必须给出**可行动的失败原因**，"没满足"不算原因）：
+`max_chars` `min_chars` `contains`（全部出现）`forbids`（任一出现即违反）
+`items_between`（按分隔符数条目）`line_count` `zh_share_min`（汉字占比）
+`json_object`（复用 `parse_json(strict_object=True)`）`prefix` `no_code_fence` `no_markdown_prefix`。
+复用现成的 `fuzz.contains_all/contains_none`、`normalize.strip_code_fence/strip_wrappers`，
+**不新写第四套包含/归一化逻辑**。
+
+**核心取舍 1 —— 约束从参考回答派生，而不是先写数字再指望有人能满足。**
+每条 case 带一个 `meta.reference`：一句**必然满足该 case 全部约束**的参考文本，
+约束参数（长度上限、条目数、汉字占比、必须出现的词）由它算出来并留一点余量。
+于是数据集测试可以断言一件此前没法断言的事：**这道题存在解**
+（`test_reference_satisfies_every_constraint_of_its_case`）。
+S30 的对应物是"期望值过自己的 schema"；这里是"约束不许互相矛盾"。
+数字写死了而没人能同时满足"≤20 字 / 必须含『风险』『收益』/ 分 3 行"，
+测的就不是听话能力而是无解——现场只会怀疑模型。
+难例（tag `hard`）是**故意紧张但仍有解**的组合，参考文本给得更紧。
+
+**核心取舍 2 —— 两个口径同时报，因为"满足率"的分母逐条不同。**
+`score`（主分数）= 每条样本"满足数 / 该条约束数"的平均（宏观，样本等权）；
+`micro_rate` = Σ满足 / Σ约束（微观，约束等权）。一条带 5 个约束的题答对 4 个 = 0.8，
+但它在微观里是 4/5，与三条题各错一个的 3/15 不等价。
+再加 `all_satisfied_rate`（全满足率，最严口径）。三个数各说一件事，只引用好看的那个就是说谎。
+`by_kind` 必须带分母：某类约束只考了 2 条时，它的"满足率 0.5"没有意义。
+
+**核心取舍 3 —— 空正文计 0 分但格式维度同时说清原因。**
+本任务的主分数是"满足了多少条约束"，空输出确实一条都没满足 ⇒ 进 `judged`、得 0；
+但 `invalid_format` / `format_valid_rate` 同层显示，且正文非空却全是 thinking 时
+沿用 P12 那句"预算被 thinking 吃光"（这是这台机器上最常见的假失败原因）。
+与 S30 的区别是有道理的：抽取任务里"没解析出 JSON"意味着内容判据无意义，
+而遵循任务里"什么都没写"就是零条遵循，不是"没考到"。
+**引擎故障（`status != OK`）仍然是 ERROR，不进能力分母**——那是环境不是模型。
+
+**`requires = {CHAT}`**：约束全是文本层面的形态，不需要受理解码也不需要工具。
+
+**自测**
+```bash
+uv run pytest tests/unit/test_constraint_grader.py tests/unit/test_instructions_zh_dataset.py -q
+uv run onyx eval run --task instruction_following --model qwen3.5:9b --seed 42   # 真机一次
+uv run onyx eval tasks     # 4 个任务，指标数与 aggregate 同源（契约测试自动覆盖新任务）
+```
+**DoD**：三条同源对新任务全绿（契约测试无需为它加一行）；考卷自检那条能抓到"无解的题"；
+真机一次带 `score` / `micro_rate` / `all_satisfied_rate` 三个口径与 `by_kind` 分母；矩阵 4 列。
 
 ## S32 — 长上下文中文集（M11 第三步）
 

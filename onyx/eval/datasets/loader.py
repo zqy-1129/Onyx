@@ -297,6 +297,12 @@ def _build_structured_ie():
     return build_cases()
 
 
+def _build_instructions_zh():
+    from onyx.eval.datasets.builtin.instructions_zh import build_cases
+
+    return build_cases()
+
+
 #: 内置数据集登记表。加一个数据集只需要在这里加一行 + 一个生成器模块
 _BUILTIN: dict[str, dict[str, Any]] = {
     "intent_zh": {
@@ -318,6 +324,13 @@ _BUILTIN: dict[str, dict[str, Any]] = {
         "revision": "seed=20261003+anchor=2026-03-01",
         "notes": "生成器：模板槽位轮换 + 人工难例（中文数字/相对日期/多主体）+ 无可抽取负样本；"
                  "相对日期的期望值由锚定日算出；见 onyx/eval/datasets/builtin/structured_ie.py",
+    },
+    "instructions_zh": {
+        "build": _build_instructions_zh,
+        "revision": "seed=20261005",
+        "notes": "生成器：每条样本的约束由一句必然满足它的参考回答派生（所以题目一定有解），"
+                 "提示语再由约束渲染出来（所以不会考没说过的话）；"
+                 "见 onyx/eval/datasets/builtin/instructions_zh.py",
     },
 }
 

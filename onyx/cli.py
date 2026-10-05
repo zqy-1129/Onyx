@@ -2816,6 +2816,8 @@ _REPORT_METRICS = (
     # none_correct_rate 单看负样本（少抽/多抽在这里才看得见）
     ("score", "内容"), ("field_em", "内容"), ("exact_object_rate", "内容"),
     ("none_correct_rate", "内容"),
+    # 指令遵循的三个口径必须一起打印：只报一个就会被引用成三种不同的故事
+    ("micro_rate", "内容"), ("all_satisfied_rate", "内容"),
     ("hit_at_1", "选择"), ("set_f1", "选择"),
     ("no_call_rate", "选择"), ("wrong_tool_rate", "选择"),
     ("false_call_rate", "选择"), ("refusal_rate", "选择"),

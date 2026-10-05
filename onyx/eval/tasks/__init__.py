@@ -17,6 +17,7 @@ from typing import Any
 from onyx.discovery import GROUP_TASKS, discover, record_failure
 from onyx.eval.datasets.loader import Dataset, load_builtin
 from onyx.eval.task import EvalTask, TaskSpec, coerce_task_spec
+from onyx.eval.tasks.instruction_following import InstructionFollowing
 from onyx.eval.tasks.intent_classification import IntentClassification
 from onyx.eval.tasks.structured_extraction import StructuredExtraction
 from onyx.eval.tasks.tool_selection import ToolSelection
@@ -30,6 +31,9 @@ BUILTIN_TASKS: dict[str, TaskSpec] = {
     StructuredExtraction.id: TaskSpec(
         StructuredExtraction, lambda: load_builtin("structured_ie")
     ),
+    InstructionFollowing.id: TaskSpec(
+        InstructionFollowing, lambda: load_builtin("instructions_zh")
+    ),
 }
 
 #: 内置数据集的规范别名（两种写法必须落到同一个 id，理由见 `load_dataset`）
@@ -37,6 +41,7 @@ _BUILTIN_DATASETS = {
     "tool_calls_zh": "tool_calls_zh", "tool_calls_zh-v1": "tool_calls_zh",
     "intent_zh": "intent_zh", "intent_zh-v1": "intent_zh",
     "structured_ie": "structured_ie", "structured_ie-v1": "structured_ie",
+    "instructions_zh": "instructions_zh", "instructions_zh-v1": "instructions_zh",
 }
 
 
