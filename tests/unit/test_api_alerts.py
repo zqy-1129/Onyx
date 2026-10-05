@@ -126,14 +126,14 @@ def test_assembled_service_reports_its_rule_and_channels(tmp_path):
 def test_the_poll_thread_actually_delivers(tmp_path):
     """DoD 的最小版本：异常落库之后，没人点任何东西，文件出口就该在几分钟内多一行。
 
-    这里把 poll 压到 50ms、stale 阈值不参与，只验"线程在跑 + 判定读库 + 出口落盘"这条链，
-    不验规则本身（规则在 test_alert_rules.py 里穷举过）。
+    cooldown 用默认值（600s），所以一条在窗口里反复存在的异常**只投一次**——
+    这条测试同时把这件事钉住：反复投会把人训练成忽略通知。
     """
     runtime = _runtime(tmp_path)
     path = tmp_path / "alerts" / "alerts.jsonl"
     app = create_app(
         runtime=runtime, gpu_lock_path=tmp_path / "g.lock", sample_gpu=False,
-        alert_rule=AlertRule(poll_s=0.05, cooldown_s=0),
+        alert_rule=AlertRule(poll_s=0.05),
         alert_channels=(FileChannel(path),),
     )
     with TestClient(app) as c:
@@ -154,6 +154,10 @@ def test_the_poll_thread_actually_delivers(tmp_path):
         assert lines, "后台线程没把这条异常通知出去"
         assert lines[0]["code"] == "CONTEXT_OVERFLOW"
         assert "建议" in lines[0]["message"], "通知要带上下一步做什么（文案来自 SPECS，不重写）"
+
         history = c.get("/api/alerts").json()
         assert [r["status"] for r in history] == ["sent"]
+        # 再等几个周期：窗口里那条异常还在，但 cooldown 不该让它再发一遍
+        time.sleep(0.4)
+        assert len(c.get("/api/alerts").json()) == 1, "cooldown 内重复投递"
     runtime.close()
