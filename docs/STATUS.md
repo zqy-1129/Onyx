@@ -235,8 +235,9 @@ WAL + 批量 sink（队列满丢样本但 `dropped` 计数可见）、
 ## 2. 质量门与规模
 
 ```
-uv run pytest            # 1815 passed, 1 skipped, 38 deselected（默认档就是离线套件，CI 用它量覆盖率。S32 三个文件 58 条 + S33 六个文件 60 条 + 样本重写与能力闸门 6 条；`test_task_contract.py` 41 → 49 条：多一个任务就多 8 条断言，一行任务专属逻辑都不用加。S33 只逼它泛化了一次——原来写死用 `Generation` 造样本，现在按任务自己 `build()` 的返回类型造。S35 加的 11 条：真 stdio 列的隔离/并发/迟到回答 +5（`test_tools_mcp_stdio.py` 7 → 12）、第五列（存在·出处·无豁免·起不来=未知）+3、覆盖率地板的钉子 +1、settle 与库里的顺序 +2。S36 加的 97 条：口径收敛 7、perf 的网格/语料/采集/落库 62、可比性契约 17、CLI 的"四条拒绝与三种读数" 11。S37 加的 16 条：`test_obs_timing.py` 13（事件→状态→落库，含"摘掉注册就会红"）+`test_streaming.py` 2（首字事件的发射时机与只发一次），外加一条文档结构检查（表格一行必须写完，S36 曾把 README 的进度表撑成 17 行）。S38 加的 41 条：`test_measurement_explain.py` 10（阶梯逐档状态/差值符号/闭合判定/标定还差几个样本）、`test_report_usage.py` 21（p50 只用唯一那份定义 + 阈值只用 `reconciler` 那一个常量 + CLI/API 同数 + `--since` 的 6 种坏写法与"不折 UTC 就丢边界那一发"的对照 + 三种渲染的数据行与「—」规则）、`test_cli_token_report.py` 10（退出码：不闭合 1、`--since 7d` 2、未知 trace 2 且给出下一步）。**S39 加的 14 条**：explain 的 clamp 分支 +8（未标定给命令 / 已标定不重复叫人标定 / 已标定还被 clamp 指向引擎截断 / 老行承认说不出原因 / 恒等式闭合不算验证 / 没有采信计数就判不了 / 建议不许被展开成单字符）、CLI +4（`traces show` 的条件句与 clamp 结论、归因档位 + 残差进 `--json`）、repo +1（速率列 NULL 而 token 的 0 仍是 0）、结构门禁 +1（全仓扫代码字符串：出现那句等式就必须同一行出现 `clamp`——把限定词删掉它真的红）
+uv run pytest            # 1818 passed, 1 skipped, 47 deselected（默认档就是离线套件，CI 用它量覆盖率。S32 三个文件 58 条 + S33 六个文件 60 条 + 样本重写与能力闸门 6 条；`test_task_contract.py` 41 → 49 条：多一个任务就多 8 条断言，一行任务专属逻辑都不用加。S33 只逼它泛化了一次——原来写死用 `Generation` 造样本，现在按任务自己 `build()` 的返回类型造。S35 加的 11 条：真 stdio 列的隔离/并发/迟到回答 +5（`test_tools_mcp_stdio.py` 7 → 12）、第五列（存在·出处·无豁免·起不来=未知）+3、覆盖率地板的钉子 +1、settle 与库里的顺序 +2。S36 加的 97 条：口径收敛 7、perf 的网格/语料/采集/落库 62、可比性契约 17、CLI 的"四条拒绝与三种读数" 11。S37 加的 16 条：`test_obs_timing.py` 13（事件→状态→落库，含"摘掉注册就会红"）+`test_streaming.py` 2（首字事件的发射时机与只发一次），外加一条文档结构检查（表格一行必须写完，S36 曾把 README 的进度表撑成 17 行）。S38 加的 41 条：`test_measurement_explain.py` 10（阶梯逐档状态/差值符号/闭合判定/标定还差几个样本）、`test_report_usage.py` 21（p50 只用唯一那份定义 + 阈值只用 `reconciler` 那一个常量 + CLI/API 同数 + `--since` 的 6 种坏写法与"不折 UTC 就丢边界那一发"的对照 + 三种渲染的数据行与「—」规则）、`test_cli_token_report.py` 10（退出码：不闭合 1、`--since 7d` 2、未知 trace 2 且给出下一步）。**S39 加的 14 条**：explain 的 clamp 分支 +8（未标定给命令 / 已标定不重复叫人标定 / 已标定还被 clamp 指向引擎截断 / 老行承认说不出原因 / 恒等式闭合不算验证 / 没有采信计数就判不了 / 建议不许被展开成单字符）、CLI +4（`traces show` 的条件句与 clamp 结论、归因档位 + 残差进 `--json`）、repo +1（速率列 NULL 而 token 的 0 仍是 0）、结构门禁 +1（全仓扫代码字符串：出现那句等式就必须同一行出现 `clamp`——把限定词删掉它真的红）。**S40 的默认档只 +3**（门禁清单两条 + 一条"浏览器档既是 CI 的一步、又被默认档排除"的成对断言）——九条浏览器用例住在 `-m browser`，不进这一档，覆盖率数字因此不随浏览器时序抖动
 uv run pytest -m e2e     # 12 passed（S34：六页取数同源 10 条 + SSE 真 HTTP 消费与"断链自检"2 条。默认档把它 deselect 了，CI 里是独立一步）
+uv run pytest -m browser  # 9 passed（**S40 真浏览器**：六页渲染真数据 / Ledger 全 null 的速率列必须是「—」/ clamp 那条的条件句+档位+残差+带真模型名的 calibrate / 页内第二个 EventSource 订阅者收到这一发的帧 / 侧栏开合刷新后仍在 / 1280 与 1600 无横向溢出 / 标签不被压成竖排。本机 `channel="msedge"` 直接吃系统 Edge，零下载；CI 才真装 chromium。摘掉 broker ⇒ 那条总线用例当场红）
 uv run pytest -m live     # 22 passed（真打 qwen3.5:9b，与评测共用机器级 GPU 锁。S36 加了一条真机最小网格：断言引擎真的回报纳秒分段，且每个基线数字点得回真 trace；S37 加了一条流式的：`first_token_at` 与 `wall_ms − ttft_ms` 必须讲同一个故事，非流式那一发则断言代理值不冒充测量）
 uv run pytest -m probe     # 4 passed（P 系列实验的可重跑版本）
 uv run ruff check .         # All checks passed（`ruff format` 不是门禁）
@@ -248,7 +249,9 @@ uv run onyx config show       # 每一项生效值标出来自 flag/环境/文�
 uv build && uv tool install --from dist/*.whl …  # 干净环境装起来：version / db init / chat(mock) / doctor 全通
 前端：tsc --noEmit / vitest 116（10 个文件）/ vite build（238.87KB js，gzip 78.25KB）+ 浏览器 take_snapshot
 API：openapi 32 paths / 34 operations（含 `GET /api/stream` SSE）
-CI：.github/workflows/ci.yml 跑上面这些（本机已验证命令本身可跑通；仓库尚无远端 ⇒ 还没真跑过一次）
+CI：.github/workflows/ci.yml 四个 job——后端五道门 + `-m e2e`、前端（tsc/vitest/build）、
+**浏览器（S40：npm ci + playwright install chromium + `-m browser`）**、打包安装冒烟
+（本机已验证命令本身可跑通；仓库尚无远端 ⇒ 还没真跑过一次）
 ```
 
 真机跑过的证据（可复查，都在 git 里）：
@@ -371,12 +374,13 @@ S23 在浏览器里真跑过：`--provider mock` 的 serve 上点「开始评测
 ### A. 计划里承诺、但确实没做的（S7 的运维交付物 + 一个页面）
 | 缺什么 | 计划出处 | 为什么算事 |
 |---|---|---|
-| `onyx report usage --since 7d --format md` + `report/exporters/{csv,md,jsonl}` | S7 产出文件 | 只有 `eval report`（评测报告）；**用量周报**没有。今天要看一周吞吐只能自己写 SQL |
-| `onyx token explain <trace>`（多源对比表） | S7 / 附录 A 的自测命令 | 功能其实存在但埋在 `traces show` 的对账表里，没有独立入口；对照"某个数字为什么被采信"这个高频问题，命令行入口是必要的 |
-| `hf_tokenizer`（T1）与 `gguf_vocab`（T2）没有实现 | P9 结论：T2 应提前为 S4 主实现 | 阶梯、采信优先级、`CounterContext.tokenizer` 插拔位都在，缺的是实现本身。后果：分段归因最多到 `fitted/medium`，做不了"逐段完全归因"；`tokens` extra（minja/tokenizers/gguf）装了也不生效。`doctor` 现在会把这件事写在明面上，`onyx token explain` 入口也还没有 |
+| `hf_tokenizer`（T1）与 `gguf_vocab`（T2）没有实现 | P9 结论：T2 应提前为 S4 主实现 | 阶梯、采信优先级、`CounterContext.tokenizer` 插拔位都在，缺的是实现本身。后果：分段归因最多到 `fitted/medium`（前提是**这个模型标定过**，见 P25），做不了"逐段完全归因"；`tokens` extra（minja/tokenizers/gguf）装了也不生效。`doctor` 会把这件事写在明面上，`onyx token explain` 也逐档标出"未实现" |
 | `TOOL_EXEC_START` 事件的 `args_ref` 无处落库 | S17 真机 dry-run 查出来的 | 循环每次工具调用都写一个 args blob，但 schema 里没有任何列存它（`tool_call` 存的是内联 `args_json`）⇒ **每次工具循环泄漏一个小 blob**。`rotate` 能把孤儿回收掉，但正确的修法是别再写或者把它落库——别让"能删孤儿"掩盖"一直在造孤儿" |
-| **真浏览器** e2e 仍为 0（S34 补的是数据通路那一半） | G6 / 附录 A | `-m e2e` 现在有 12 条：六页取数同源 + SSE 在真 HTTP 连接上被读到 + "摘掉 broker 会红"的自检。但本仓库**没有浏览器驱动**（实测：Python 侧无 playwright，web devDeps 只有 vitest + @testing-library + jsdom），所以**渲染本身**仍靠手工 `take_snapshot`。S23–S29 手工点出的八处缺陷里六处是数据通路（已被 e2e 覆盖），两处是前端映射（由 vitest 纯函数测试钉住）。要补的是驱动那一层（Playwright + 起 vite/serve），这属于"决定要分发/给别人用"之后才划算的投入 |
+| **视觉回归**（截图比对 / 跨浏览器） | —（原本挂在 G6 的"真浏览器"那条下面） | S40 的 `-m browser` 只在 **Chromium/Edge 一个引擎**上跑，断言的是"这句话出现在屏幕上"与几何不变量（溢出、竖排），**不比像素**。所以"S34+S40 全绿"不等于"改版式没花"——那需要基线图库，是另一件事，别把它当成已经有 |
 | `onyx serve --reload` | 附录 A 的自测命令 | 小：开发体验，非功能缺口（vite 的 HMR 已覆盖前端） |
+
+> 这一张表原先还列着 `onyx report usage` / `onyx token explain`（S38 交付）与"真浏览器 e2e 为 0"
+> （S39/S40 交付）——**欠的东西被补上之后必须从这张表里删掉**，留着它会让下一个读者以为入口还没做。
 
 ### B. 明确推迟、带原因的（不是遗漏）
 - **视觉任务仍推迟**：`/api/show` 之外还需要"图片 token 怎么计"与 `cached_tokens` 是否存在
@@ -467,8 +471,8 @@ S23 在浏览器里真跑过：`--provider mock` 的 serve 上点「开始评测
    S29 Fleet 可见性 + doctor「告警」项 + **一进程一引擎定案**，**全部达成**）。
 2. ~~`-m e2e` 用例~~（**S34 已交付数据通路那一半**：六页取数互相核对 + SSE 在真 HTTP 连接上被读到
    + "摘掉 broker 就会红"的自检 + CI 独立一步并钉进门禁清单）。
-   剩下的部分是**真浏览器驱动**：**S40 方案已定**（八条用例 + 新 marker `-m browser` + 独立 CI job），
-   驱动方式已实测可用（`playwright` 以 `channel="msedge"` 直接吃系统 Edge，本机不下载浏览器）。
+   ~~剩下的部分是真浏览器驱动~~（**S40 已交付**：`-m browser` 九条，独立 CI job，
+   本机用 `channel="msedge"` 零下载。**仍欠的是视觉回归**——不比像素、只跑一个引擎，见 §3A）。
 3. ~~M11 评测资产（S30–S33）~~ **全部达成**：`structured_extraction` 45 条（真机 `score 0.893`）、
    `instruction_following` 39 条 / 10 种可机械检查的约束（`0.920 / 0.916 / 0.641` 三口径分叉）、
    `long_context` 9 条三档长文 + 干扰项（`1.000`，负控制 `--num-ctx 4096` 整场 `score —`）、
@@ -479,7 +483,8 @@ S23 在浏览器里真跑过：`--provider mock` 的 serve 上点「开始评测
    `compare` 拒绝跨条件并逐字段说清、两个吞吐口径分开报、`mock` 直接拒（S36）。
    真机第一条基线 `01M47V50M7HW…`：qwen3.5:9b @ ollama 0.35.1、decode 30.5-32.0 t/s、
    并发 2 时 TTFT 从 125ms 涨到 ~1.2-2.2s（单请求 decode 却几乎不掉 ⇒ 两个口径必须分开看）。
-   **G6 还剩两条**：真浏览器驱动（Playwright，仍为 0）与 i18n 抽取（挂在"是否对外发行"上，可长期搁置）。
+   **G6 只剩一条**：i18n 抽取（挂在"是否对外发行"上，可长期搁置）——
+   S40 把"真浏览器驱动"那条补上了（`-m browser` 九条 + 独立 CI job）。
    S36 查出的缺陷也在同一步系列里结案：**TTFT 曾经没有写入方**（S37 接上，见 L3）。
    视觉任务仍等 U8/U9 的未决实测。
 4. ~~**`token explain` + `report usage`**：都属于"每天都在用但入口缺失"~~（**S38 已交付**：
@@ -490,7 +495,7 @@ S23 在浏览器里真跑过：`--provider mock` 的 serve 上点「开始评测
    `token explain` 点名档位与残差并给出命令、速率列从 SQL 起就是 NULL 且折线在 NULL 处断线、
    前后端统一成"精确相等才算闭合"。**不缩放分段**（那等于把"计数器高估"抹成一个自洽的假数），
    历史行不回填。**还欠的那半件**：库里 4 个模型仍未标定（`doctor`「token 计量档位」会提醒），
-   以及真浏览器那一层（Playwright 仍为 0）。
+   以及**视觉回归**（S40 只跑 Chromium/Edge 一个引擎、不比像素）。
 6. C 组三条一致性（`RECONCILED` 不发、`base_url` 默认值、兼容通道探针覆盖）适合凑成一次"口径一致性"清理。
 
 核对方式（本文数字的来源）：

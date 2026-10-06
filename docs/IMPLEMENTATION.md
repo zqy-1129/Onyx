@@ -3385,7 +3385,7 @@ Ledger 的 warm 那一行在没有数据的桶上不再掉出 0 的折线，改�
 
 ---
 
-## S40 — 真浏览器 e2e：把"只有点浏览器才发现的缺陷"变成会红的测试
+## S40 — 真浏览器 e2e：把"只有点浏览器才发现的缺陷"变成会红的测试 ✅
 
 **为什么是这一步**：G6 的出口判据里只剩这一条功能项（另一条 i18n 可长期搁置）。
 这不是补覆盖率——S23–S29 期间**八处真实缺陷全部只能靠手工点浏览器发现**
@@ -3477,6 +3477,78 @@ netstat -ano | grep -E ":(5173|51[0-9]{3})\s+.*LISTENING"   # 跑完之后端口
 
 ---
 
+## S40 ✅ 实测：九条真浏览器用例，以及"哪条断言其实不依赖总线"这件事
+
+**跑起来是什么样**（`uv run pytest -m browser`，本机零下载）：
+```
+9 passed in 12.1s        # 连 vite 冷启动 + 起后端 + 起浏览器一起算
+```
+编排没有踩"回落到别人的端口"那个坑：后端与 vite 都拿随机端口（`--strictPort`），
+跑完之后按端口复核——`netstat` 上除开发用的 8787/5173 与 11434 之外只剩
+Qoder / 飞书 / ollama-app / Zcode 自己的监听口（逐个查过 PID 与进程名，不是测试漏的进程）。
+连跑三遍都是 9 passed ⇒ 这一档不偶发。
+
+**八条变九条，而且新加的那条才是守总线的**
+计划里第 4 条写的是"Playground 发一发 ⇒ 页面真的更新"。做完注入自检才发现它**不依赖事件总线**：
+`send()` 拿 POST 的返回值把 `run.result` 填上，broker 被摘掉它照样绿——
+而 S23 那次静默失效的形状正是"REST 全好、SSE 死了"。于是加了一条真正依赖总线的：
+在页内再开一个 `EventSource('/api/stream')`，测试期间从 API 发一发请求，
+然后要求**这个订阅者收到属于那条 trace 的帧**。
+```
+把 app.py 的 resolved.events.add(state.broker) 注释掉 ⇒
+  test_sse_event_frames_reach_a_real_browser_subscriber   FAILED   ← 该红的红了
+  test_playground_request_shows_up_in_the_page_and_sse_is_live  passed ← 它守的是往返，不是总线
+两条都留着，因为它们是两件事。
+```
+
+**过程中修掉的四处"测试自己的错"**（都写进断言，不只是改完就算）
+1. 页面锚点最初拿的是**数据值**（`"qwen"`）——种的是 mock 模型，必红。
+   换成每一页独有的**静态文案**（`已载入模型` / `模型（` / `发送` / `已加载` / `采信来源分布` / `工具注册表`）。
+2. 拿"正文超过 200 字"当"渲染出来了"的判据——Playground 本来就只有一堆控件，正常形状 178 字。
+   换成"骨架屏已经退了 + 这一页自己的 marker 在屏幕上"。
+3. `wait_loaded` 只等 `.skeleton` 消失，而 **Traces 页的加载完成信号是「共 N 条」被写出来**
+   （它压根不用骨架屏），于是拿到过 `共 — 条 · 已加载 0 加载中…`。改成等那个具体文本
+   （`re.compile(r"共 \d+ 条")`）。**每一页的"加载完了"要各自定义**，没有通用条件。
+4. `get_by_text("转账")` 当终点是**假通过**：模型名里就有这两个字，它一开始就可见。
+   改成等结果态才出现的「查看 trace →」按钮，再断言输出区 `.code` 真的是那发正文。
+   还有一处 API 用错：`locator.wait_for(state="enabled")` 不存在（只有 attached/detached/visible/hidden），
+   click 自己会等 enabled。
+
+**种数据的动作抽成 `tests/e2e/seed.py`**：取数档与浏览器档必须共用同一份形状，
+各写一份就会漂，而漂掉之后浏览器档测的就不再是那条我们知道会坏的路径。
+浏览器档另外做了一件事——把最早那一发整体往前挪 3 小时（走 `TraceRepo.upsert`，
+不是手写 SQL；`finished_at` 一起挪、`first_token_at` 清空），
+否则全栈落在同一个小时里，Ledger 的时序面板只说"样本不足，画不出趋势"，
+S39 那条"没测到的速率不许画成 0"就没有可看的地方。
+
+**与计划的偏差**：① 八条变九条（上面那条总线用例）；② `fix(web): Playground 的可及名称`
+**没做也不需要**——`get_by_role("button", name="发送")`、label 包 checkbox、`.rail-logo`
+的 `aria-expanded` 都已经够用，加没必要的 aria 是噪声；③ CI 那一步的注释里
+顺手修了一处过期数字（live 从"20 条"改成 22）。
+
+**本机验证**
+```bash
+uv run pytest -m browser                                             # 9 passed（连跑三遍稳定）
+uv run pytest -m e2e -q                                              # 12 passed（抽 seed.py 之后仍全绿）
+uv run pytest -q                                                     # 1818 passed + 1 skipped，47 deselected
+uv run coverage run -m pytest -q && uv run coverage report           # 90%（14,977 句 / 3,744 分支）——
+                                                                    #   浏览器档不进默认档，数字不随之抖动
+uv run ruff check . && uv run lint-imports                           # All checks passed / 3 kept
+uv run python scripts/check_extension_boundary.py                    # 无新增扩展点实现
+# 注入：注释掉 resolved.events.add(state.broker) ⇒ 总线那条红（已还原）
+# 门禁：把 `browser` 从 addopts 的排除项里删掉，或从 CI 里删掉那一步 ⇒ test_release_surface 红
+```
+**DoD 核对**：① 本机全绿且不依赖任何手工先起的服务（端口随机 + `--strictPort` + 收尾复核）✓；
+② 摘掉 broker ⇒ 守总线的那条红 ✓（并暴露了原计划那条其实不守）；③ 默认档与覆盖率不动 ✓；
+④ CI 有独立浏览器 job，`pytest -m browser` 与 `playwright install` 都在被断言的清单里，
+且新增一条"两半边都要钉"的成对断言（CI 里有 / 默认档里没有）✓；
+⑤ STATUS/README/ROADMAP 那句"本仓库没有浏览器驱动"已删，改成"仍欠视觉回归"✓。
+
+**留下的边界（写清，别让九条全绿被读成"界面没问题"）**：只跑 Chromium/Edge 一个引擎；
+不比像素（版式回归仍需基线图库，那是另一步）；`-m live` 与 `-m probe` 仍不在 CI 跑。
+
+---
+
 ## 附录 A — 每步自测速查
 
 | 步 | 命令 | 绿的条件 |
@@ -3521,6 +3593,7 @@ netstat -ano | grep -E ":(5173|51[0-9]{3})\s+.*LISTENING"   # 跑完之后端口
 | S37 | `uv run pytest tests/unit/test_obs_timing.py tests/unit/test_streaming.py -q` + `uv run onyx chat --model … --stream …` + `uv run pytest tests/integration/test_gateway_live.py -m live` | 流式那一发：CLI 表里 TTFT 有数（不再是「—」）、库里 `usage.ttft_ms` 与 `trace.first_token_at` 同时非空且 `ttft_source=measured`、且 `finished − first_token ≈ wall − ttft`（旧行为差整段生成时间）；非流式那发留空但写明 `proxy:prompt_eval_duration`；把 `timing` 从注册表摘掉 ⇒ 落库那条必须变回空 |
 | S38 | `uv run onyx token explain <trace_id>` + `uv run onyx report usage --fmt csv` + `uv run onyx report usage --since 7d` | 四问齐答（采信为何落这档 / 各来源差值 / 分段是否闭合 / 离标定还差几个样本），且 CLI 与 `/api/usage/summary` 逐字段相等（同一份库同一时刻：实测 12 字段全等）；把一个 part 的 tokens 改大 ⇒ `token explain` 退出码 1 并印出差值（真机 bench 那条本来就差 +146 tok，同样是 1）；时间桶没 trace ⇒ 不产生 0 行；`--since` 写不成 ISO ⇒ 退出码 2/HTTP 400，**不是**一张看起来像"没跑过"的空表 |
 | S39 | `uv run onyx calibrate --model <名字> --n 40` + `uv run onyx token explain <标定前后各一条>` + `uv run onyx traces show <clamp 的那条>` | 标定前那条 ✗ 不闭合（退出码 1，点名 heuristic + 残差 + `onyx calibrate`），标定后新跑那条 ✓ 闭合（退出码 0）；**已经标定的模型不会再被叫去重复标定**（改口说"这一发是标定前跑的，重跑就闭合"）；`traces show` 与看板的那句等式带「仅未 clamp 时成立」，且全仓库扫一遍：代码里出现这句话的同一行必须有 `clamp`；时间桶速率列从 SQL 起就是 NULL（看板折线在 NULL 处断线，`warm_prefill_tps` 无样本的那行显示「—」），而 token 数的 0 仍显示 0；前后端闭合判据统一成精确相等（**原先前端 ±2% 容差还带一条钉着它自己的测试**） |
+| S40 | `uv run pytest -m browser` + （注入自检）注释掉 `resolved.events.add(state.broker)` 再跑一次 | 九条全绿且**自己起服务**：真 uvicorn（线程、随机端口、只绑回环、mock 引擎不抢 GPU 锁）+ vite dev（另一个随机端口、`ONYX_API` 指过去、`--strictPort`），收尾**按端口复核**，绝不复用别人开着的 8787/5173；摘掉 broker ⇒ **页内第二个 `EventSource` 那条红**，而"结果上屏"那条照绿（它守往返不是总线，所以两条都得在）；Ledger 里全 null 的速率列必须渲染成「—」而不是 0；clamp 那条把条件句 + 档位 + 残差 + 带真模型名的 `onyx calibrate` 一起印在屏幕上；六页无横向溢出、标签不竖排、侧栏开合刷新后仍在；默认档仍是 1818 passed（`browser` 被 addopts 排除，覆盖率不随浏览器时序抖动），CI 里 `pytest -m browser` 与 `playwright install` 都被门禁断言钉着 |
 
 ## 附录 B — 架构自测（让"模块化"可验证，而非口号）
 
