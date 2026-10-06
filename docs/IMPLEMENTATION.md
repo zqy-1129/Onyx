@@ -2505,9 +2505,94 @@ uv run ruff check . · uv run lint-imports（3 kept）· check_extension_boundar
 
 ## S33 — embedding 任务（M11 收口）
 
-能力位 `Cap.EMBED` 早就有，但没有消费它的任务。先做"中文同义/反义对"的排序质量（recall@k、
-MRR），它比"相似度阈值分类"更可解释。**视觉要等 U8/U9 的未决实测**（图片 token 怎么计、
-`cached_tokens` 到底存不存在），否则视觉分数会建在猜出来的 token 数上。
+能力位 `Cap.EMBED` 从 S3 起就存在，但**没有任何消费点**：没有 embed 调用路径、
+`TraceKind.EMBED` 这个枚举位自诞生起零写入方（实测 grep 零命中）。
+这一步做"中文同义/反义对的**排序**质量"，它比"相似度阈值分类"可解释得多——原因见下面实测第 4 条。
+**视觉仍等 U8/U9 的未决实测**（图片 token 怎么计、`cached_tokens` 到底存不存在），
+否则视觉分数会建在猜出来的 token 数上。
+
+**前提实测（2026-10-06，qwen3-embedding:0.6b，Q8_0，595.78M）**
+1. **Ollama 0.35.1 支持 embeddings，但只对带 `embedding` 能力的模型**。
+   对 `qwen3.5:9b` 调 `/api/embed` 与 `/v1/embeddings` 都回
+   `This server does not support embeddings. Start it with --embeddings`——
+   而 `ollama serve` 在 0.35.1 **一个 flag 都没有**（`--help` 只有 `-h`）。
+   ⇒ 那句文案说的是**那个模型不支持**，不是服务器不支持。**照着引擎的错误文案做决定就会走错**：
+   我据此以为要重启引擎，实际只需要换一个有 embedding 能力的模型。
+2. `/api/embed` 的形状：请求 `{model, input: [str, ...]}`，响应
+   `{model, embeddings: [[1024 floats], ...], total_duration, load_duration, prompt_eval_count}`。
+   **维度 1024**（card 的 `embedding_length` 与实测一致），`prompt_eval_count` 有值 ⇒
+   token 有**引擎出处**，不必落到启发式档。card 的 `capabilities` 是
+   `['tools','thinking','embedding']`：**embedding 模型也自称支持 tools/thinking**，
+   那是模板元数据，不许被当成"这个模型能跑工具评测"的证据。
+3. **批次不改变向量，冷启动也不改变**：同一条字符串"单独一次调用"与"混在 20 条一批里"
+   的向量 cos = **1.0**；`keep_alive:0` 卸载后重新冷启的首次调用与热调用向量 cos = **1.0**。
+   重复调用之间有 **≤3e-4** 的抖动（同一条 3 次：cos 0.999726 / 1.0 / 0.999835）⇒
+   排序类判据要能吸收这个量级，而"保留 6 位小数的距离"这种展示精度是没意义的。
+   耗时：warm 后 4 条一批 74ms、4 次单条共约 50ms（**批次不比逐条快**）；
+   而**首次调用含 load 3.1s** ⇒ 成本与耗时统计必须把 load 与 compute 分开，
+   否则第一轮的分钟数会被读成"引擎慢"。
+4. **同义对与反义对的相似度是重叠的** ⇒ 阈值判据不能用：
+   5 组同义对 cos = 0.749 / 0.798 / 0.857 / 0.859 / 0.909，
+   5 组反义对 cos = 0.649 / 0.746 / 0.756 / 0.784 / 0.796。
+   也就是"离得近"完全可能是"意思相反"。⇒ 判据取**排序**（同义句在候选池里排第几：
+   recall@1 / recall@k / MRR）+ **反义项单独成为一个考点**（它是不是抢在第 1 位），
+   而不是拍一个"≥0.8 算相似"的绝对阈值。
+5. 顺带修掉一处挡路的自身缺陷：`onyx models pull` 用 `last["done"]` 判成败，而 0.35.1 的
+   收尾是 `{"status":"success"}`（**没有 `done`**）⇒ 每次真拉都被判成失败（`507f02c`）。
+6. **还有一条属于"装置说谎"**：最初用 `curl -d '…中文…'` 量出的同义对 cos 是 0.4774，
+   与后来 Python 客户端的 0.7489 差了一大截——差在**编码**（Git Bash 把 UTF-8 中文按本地码页
+   送进请求体），不是引擎行为。⇒ S33 的实测一律用能显式控制 UTF-8 的客户端；
+   中文凡是走 shell 传参都要怀疑这一层。
+
+**产出文件（计划）**
+```
+onyx/core/types.py                       # L0：EmbedRequest / Embedding（向量 + usage + status，仅 stdlib）
+onyx/llm/providers/base.py               # 可选协议 EmbeddingProvider（不塞进 LlmProvider，见决定 1）
+onyx/llm/providers/ollama/embed.py       # /api/embed 的实现 + usage 归因（新文件，别塞进 native.py）
+onyx/llm/providers/mock.py               # 确定性假向量（按文本 sha 造单位向量），让任务与契约测试离线可跑
+onyx/llm/gateway.py                      # 唯一喉咙加 embed()：受保护文件 ⇒ 单独一个提交
+onyx/eval/datasets/builtin/embeddings_zh.py   # 生成器：同义/反义/无关三类关系由构造给出，不是人标
+onyx/eval/tasks/semantic_similarity.py        # recall@1 / recall@k / MRR / 反义抢占率 / 分离度
+tests/contract/test_provider_contract.py      # 加"没有 EmbeddingProvider 时必须明确 unsupported"
+tests/unit/test_embedding_dataset.py · test_semantic_similarity_grade.py · test_semantic_similarity_run.py
+```
+
+**四条设计决定**
+1. **`EmbeddingProvider` 是可选协议，不塞进 `LlmProvider`**。openai-compat 与外部插件未必支持，
+   塞进主协议就是逼所有实现假装支持——而协议里每个方法都要有契约测试兜着（S16a 的教训）。
+   代价写清楚：`gateway.embed()` 遇到不支持的 provider 必须返回**明确的 unsupported**
+   （带 `Cap.EMBED` 与 provider_id），不是 TypeError、更不是假向量。
+2. **判据只用排序，不用绝对阈值**（实测第 4 条）。每条 case 是"1 个 query + 一个候选池"，
+   gold 是同义项；指标：`recall_at_1` / `recall_at_k` / `mrr`，另出
+   `antonym_first_rate`（反义项抢在第 1 位的比例——这一位才是 embedding 模型的真短板）。
+   `k` 与候选池大小都进 metrics 分母，不许只看均值。
+3. **`requires = {Cap.EMBED}` 且不降级**。没有该能力就整场 skip 并写原因；
+   **不许**改成"用 chat 模型生成文本再 parse 成向量"——那是第二条测量路径，
+   也违反"评测不许建立第二条调用路径"。
+4. **`TraceKind.EMBED` 的第一写入方就是这一步**，同时把口径分开的理由写进观测：
+   一次 embed 的输出 token 恒为 0，混进"平均输出长度/吞吐"会把它拉平成假数字。
+   向量**不落库**（`.data` 会白白膨胀），只在 `grade.metrics` 里留 rank、距离与候选池摘要。
+
+**未决（写在动手之前，不要实现时现场猜）**
+- openai-compat 的 `/v1/embeddings` 支持性本机无法实测（没有第二个引擎）⇒ 本步**不加**该实现，
+  只让契约测试允许"没有 EmbeddingProvider"这一档。
+- 批次大小：实测 warm 后批次不省时间，且第一次含 load ⇒ 默认 `batch=8` 只是把请求数降下来
+  （排队友好），**不宣称"更快"**；真跑时记下 `load_ms` 与 compute 的分界。
+- 词表与模板的可复现性：gold 关系由**构造**给出（同义=同一语义槽两种表述，
+  反义=受控反义词表替换，无关=跨话题采样），数据集测试要能查出
+  "反义替换其实没换极性"与"候选池里 gold 不唯一"。
+
+**自测**
+```bash
+uv run pytest tests/unit/test_embedding_dataset.py tests/unit/test_semantic_similarity_grade.py
+uv run pytest tests/contract            # EmbeddingProvider 缺位时必须明确 unsupported
+uv run onyx eval run --task semantic_similarity --model qwen3-embedding:0.6b   # 真机
+uv run onyx eval run --task semantic_similarity --model qwen3.5:9b             # 能力闸门：整场 skip + 原因
+```
+**DoD**：三条同源对新任务全绿（矩阵第 6 列）；`recall@1` / `mrr` / `antonym_first_rate` 各自带分母；
+无 EMBED 能力的模型走 skip 且原因可行动；真机一次留下维度、批次数、load/compute 分界
+与"反义抢占"的具体条数；`TraceKind.EMBED` 从"有枚举无写入方"变成有写入方且有断言守着。
+
 
 ---
 
