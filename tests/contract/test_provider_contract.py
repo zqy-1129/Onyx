@@ -26,9 +26,9 @@ from example_provider.provider import EchoProvider
 
 from onyx.core.content import FileBlobStore
 from onyx.core.errors import OnyxError
-from onyx.core.types import Cap, GenerationRequest, ModelDetail, Status, TokenSource
+from onyx.core.types import Cap, EmbedRequest, GenerationRequest, ModelDetail, Status, TokenSource
 from onyx.llm.gateway import Gateway
-from onyx.llm.providers.base import LlmProvider
+from onyx.llm.providers.base import EmbeddingProvider, LlmProvider
 from onyx.llm.providers.mock import MockProvider
 from onyx.llm.providers.ollama import client as ollama_client
 from onyx.llm.providers.ollama import provider as ollama_provider
@@ -53,6 +53,11 @@ _STUB_SHOW = {
 }
 
 
+def _stub_vectors(texts: list) -> list:
+    """按输入条数造等长向量：契约测试要的是"条数与顺序对得上"，不是数值。"""
+    return [[round(0.25 * (i + 1) + 0.01 * j, 4) for j in range(4)] for i in range(len(texts))]
+
+
 def _stub_handler(request: httpx.Request) -> httpx.Response:
     path = request.url.path
     if path == "/api/version":
@@ -63,6 +68,15 @@ def _stub_handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json=_STUB_SHOW)
     if path == "/api/ps":
         return httpx.Response(200, json={"models": []})
+    if path == "/api/embed":
+        payload = json.loads(request.read())
+        texts = payload.get("input") or []
+        return httpx.Response(200, json={
+            "model": payload.get("model"), "embeddings": _stub_vectors(texts),
+            "prompt_eval_count": 2 * max(1, len(texts)),
+            "total_duration": 20_000_000, "load_duration": 1_000_000,
+            "prompt_eval_duration": 18_000_000,
+        })
     if path == "/api/chat":
         payload = json.loads(request.read())
         counts = {
@@ -197,6 +211,35 @@ def test_generate_accepts_gateway_style_call(provider):
     )
     assert gen.status is Status.OK
     assert gen.text
+
+
+def test_embed_is_optional_but_its_shape_is_enforced(provider):
+    """`EmbeddingProvider` 是**可选**协议——但"有"就必须对得上 gateway 的调用方式。
+
+    两条边界都要钉住：
+    - 不强制实现：`openai_compat` 与外部插件没有向量能力是合法状态，
+      强制的话就是逼实现者交一个假向量（那比 missing 更坏）；
+    - 一旦实现，签名必须收 `trace_id` / `on_event`：当年 `generate` 的协议里漏了 `trace_id`，
+      照协议写的外部 provider 直接 TypeError——同一个坑不许在第二个方法上重踩。
+    """
+    embed = getattr(provider, "embed", None)
+    assert isinstance(provider, EmbeddingProvider) is (embed is not None), (
+        "协议识别只能是结构化的：有 embed 就该被认成 EmbeddingProvider，反之亦然"
+    )
+    if embed is None:
+        return
+    params = inspect.signature(embed).parameters
+    assert {"req", "trace_id", "on_event"} <= set(params)
+    for name in ("trace_id", "on_event"):
+        assert params[name].kind is inspect.Parameter.KEYWORD_ONLY, f"{name} 必须是关键字参数"
+        assert params[name].default is not inspect.Parameter.empty, f"{name} 必须有默认值"
+
+    result = embed(EmbedRequest(model=_model(provider), inputs=("你好", "你好吗")),
+                   trace_id="t-1", on_event=None)
+    assert result.status is Status.OK
+    #: 条数与顺序是向量通路的契约：少一条会让后面每条都错位，而错位看着完全正常
+    assert len(result.vectors) == 2
+    assert len({len(v) for v in result.vectors}) == 1, "一批里维度必须一致"
 
 
 # ── 2. 自洽 ────────────────────────────────────────────────────────

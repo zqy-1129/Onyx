@@ -9,6 +9,8 @@ from onyx.core.types import (
     AdminResult,
     ApiStyle,
     Cap,
+    Embedding,
+    EmbedRequest,
     Generation,
     GenerationRequest,
     LoadedModel,
@@ -18,6 +20,7 @@ from onyx.core.types import (
     ProviderKind,
 )
 from onyx.llm.providers.base import EventCB
+from onyx.llm.providers.ollama import embed as embed_impl
 from onyx.llm.providers.ollama import lifecycle, native
 from onyx.llm.providers.ollama.client import OllamaClient
 
@@ -104,6 +107,19 @@ class OllamaProvider:
         return lifecycle.delete_model(self.client, name)
 
     # ── 数据面 ────────────────────────────────────────────────────
+    def embed(
+        self,
+        req: EmbedRequest,
+        *,
+        trace_id: str = "",
+        on_event: EventCB | None = None,
+    ) -> Embedding:
+        """/api/embed。能力位由 card 的 `capabilities` 决定（含 `embedding`），
+        没有它的模型引擎侧就会回"不支持"——那是**模型**不支持，不是服务器不支持。"""
+        return embed_impl.embed(
+            self.client, req, trace_id=trace_id, clock=self.clock, on_event=on_event,
+        )
+
     def generate(
         self,
         req: GenerationRequest,

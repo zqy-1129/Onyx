@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -19,6 +20,8 @@ from onyx.core.types import (
     AdminResult,
     ApiStyle,
     Cap,
+    Embedding,
+    EmbedRequest,
     Generation,
     GenerationRequest,
     LoadedModel,
@@ -33,7 +36,24 @@ from onyx.llm.streaming import StreamAssembler, consume_chunks, emit_final_event
 
 MOCK_CAPS: frozenset[Cap] = frozenset({
     Cap.CHAT, Cap.TOOLS, Cap.THINKING, Cap.STRUCTURED_OUTPUT, Cap.STREAM_USAGE, Cap.ADMIN,
+    Cap.EMBED,
 })
+
+#: 假向量的维度。16 维够测排名，又不至于让断言里塞一串浮点
+EMBED_DIM = 16
+
+
+def mock_vector(text: str, *, dim: int = EMBED_DIM) -> tuple[float, ...]:
+    """由文本 sha256 造一个确定性的单位向量：同文本恒等、不同文本彼此近乎正交。
+
+    刻意**不模拟语义**——那不是 mock 的职责，而让测试依赖"假出来的相似"会更糟：
+    它全绿的时候什么都没说，它红了的时候你不知道是判据错还是模型错。
+    需要"同义项必须排第 1"这种可控结果时，用 `MockProvider(embeddings={文本: 向量})` 显式给。
+    """
+    digest = hashlib.sha256(text.encode("utf-8")).digest()
+    raw = [digest[i % len(digest)] / 127.5 - 1.0 for i in range(dim)]
+    norm = sum(v * v for v in raw) ** 0.5
+    return tuple(v / norm for v in raw) if norm else tuple([0.0] * dim)
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,6 +153,7 @@ class MockProvider:
         default: MockScript = DEFAULT_SCRIPT,
         clock: Clock = SYSTEM_CLOCK,
         models: tuple[str, ...] = ("mock/echo",),
+        embeddings: dict[str, Sequence[float]] | None = None,
     ) -> None:
         self.id = id
         self.base_url = base_url  # 仅为与真实 provider 的构造签名兼容，不发起任何请求
@@ -141,6 +162,9 @@ class MockProvider:
         self.clock = clock
         self.models = models
         self.calls: list[GenerationRequest] = []
+        #: 显式给定的向量（文本 → 向量）：排名判据的测试要能指定"谁排第几"
+        self.embeddings = {k: tuple(float(x) for x in v) for k, v in (embeddings or {}).items()}
+        self.embed_calls: list[EmbedRequest] = []
         #: 序列脚本的消费游标：model → 已消费条数
         self._cursors: dict[str, int] = {}
 
@@ -211,6 +235,30 @@ class MockProvider:
             gen, assembler.last_raw, trace_id=trace_id, clock=self.clock, on_event=on_event, ttft_ms=None
         )
         return gen
+
+    def embed(
+        self,
+        req: EmbedRequest,
+        *,
+        trace_id: str = "",
+        on_event: EventCB | None = None,
+    ) -> Embedding:
+        """确定性假向量。**不报任何 token 数字**——mock 没跑真模型，编一个计数
+        就是让下游以为"引擎报了 12 tok"，而那正是本项目最忌的假事实来源。
+        """
+        self.embed_calls.append(req)
+        vectors = tuple(
+            self.embeddings.get(text) or mock_vector(text) for text in req.inputs
+        )
+        dims = {len(v) for v in vectors}
+        if len(dims) > 1:
+            # 真实引擎一批里维度恒定；给了不一致的向量就是配置错了，
+            # 而"不一致"往下游走会变成余弦计算抛错或静默截断——先在这里报死
+            return Embedding(
+                model=req.model, status=Status.ERROR,
+                error=f"mock 的向量维度不一致：{sorted(dims)}（一批里必须同维）",
+            )
+        return Embedding(vectors=vectors, model=req.model, status=Status.OK)
 
     # ── 控制面 ────────────────────────────────────────────────────
     def pull(self, name: str, *, on_event: EventCB | None = None) -> AdminResult:
