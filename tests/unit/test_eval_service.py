@@ -323,6 +323,81 @@ def test_worker_crash_gives_the_run_row_a_terminal_status(env):
     assert row.aggregate["failure"]["reason"] == after.error
 
 
+class _SlowTerminalRepo(EvalRepo):
+    """崩在第 N 条 grade，且把"写终态"那一步放慢——用来把 settle 与库里的顺序顶出来。"""
+
+    def __init__(self, db, *, boom_at: int, delay: float) -> None:
+        super().__init__(db)
+        self.boom_at = boom_at
+        self.delay = delay
+        self.upserts = 0
+        self.terminal_written = threading.Event()
+
+    def upsert_grade(self, rec):
+        self.upserts += 1
+        if self.upserts == self.boom_at:
+            raise RuntimeError("模拟崩在写终态之前")
+        return super().upsert_grade(rec)
+
+    def update_run(self, run_id, **kw):
+        if kw.get("status") in ("error", "done", "cancelled", "skipped"):
+            time.sleep(self.delay)
+            self.terminal_written.set()
+        return super().update_run(run_id, **kw)
+
+
+def test_settle_does_not_report_idle_before_the_row_is_terminal(env):
+    """`settle()` 说"没有活了"的那一刻，库里必须已经有终态——否则它在撒谎。
+
+    `_fail` 原本先改内存里的 `state`（`live` 就是从它推导的）再写库，于是中间有一个窗口。
+    快机器上是微秒级，谁都看不见；套件的覆盖率追踪阶段慢 5–10 倍，它就变成一次偶发失败
+    （测试读到 running）。看板读的是库，所以"哪个是真"必须有答案，而不是靠机器快。
+    """
+    repo = _SlowTerminalRepo(env.db, boom_at=2, delay=0.3)
+    env.service.repo = repo
+    view = env.service.submit(_req(limit=5))
+    assert env.service.settle(20.0)
+
+    row = EvalRepo(env.db).get_run(view.run_id)
+    assert row is not None and row.status == "error", (
+        "settle 已经返回，库里却还停在 running：人会在界面前等一个不会来的结果")
+    assert repo.terminal_written.is_set()
+
+
+def test_a_failing_terminal_write_does_not_wedge_the_worker(env):
+    """连写终态都失败时：worker 线程必须活着，这条 job 也不能永远 live。
+
+    `_fail` 是被 worker 的 `except` 调用的。它要是把异常抛出去，线程当场死掉，
+    之后每一条从界面发起的评测都只会留在 queued——"评测入口静默失效"就是这么发生的。
+    """
+    class _BadWrite(EvalRepo):
+        """grade 一定写崩（触发 `_fail`），而 `_fail` 要写的那个终态也失败。"""
+
+        def upsert_grade(self, rec):
+            raise RuntimeError("模拟 grade 写不下去")
+
+        def update_run(self, run_id, **kw):  # type: ignore[override]
+            if kw.get("status") == "error":
+                raise RuntimeError("模拟写终态失败")
+            return super().update_run(run_id, **kw)
+
+    env.service.repo = _BadWrite(env.db)
+    view = env.service.submit(_req(limit=5))
+    assert env.service.settle(8.0), "job 永远 live ⇒ worker 线程已经死了"
+
+    after = env.service.snapshot(view.run_id)
+    assert after is not None and after.state == "error"
+    assert "库里没能写下终态" in after.error, "库里没落终态这件事必须写在人看得见的地方"
+    assert EvalRepo(env.db).get_run(view.run_id).status == "running", \
+        "这条测试的前提：终态确实没写进去（真实库里留下的就是这种行，由重启后的 reclaim 兜底）"
+
+    # 关键不是这条 job 的状态，而是**入口还在**：下一条照样跑得完
+    env.service.repo = EvalRepo(env.db)
+    second = env.service.submit(_req(limit=2))
+    assert env.service.settle(8.0)
+    assert env.service.snapshot(second.run_id).state == "done", "worker 死了就再没人取队列"
+
+
 def test_reclaim_marks_only_api_owned_rows(env):
     """服务重启留下的僵尸要能解释，但不能碰别的进程发起的运行。"""
     _run_once(env)

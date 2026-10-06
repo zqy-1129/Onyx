@@ -469,17 +469,30 @@ class EvalService:
         return on_progress
 
     def _fail(self, job: _Job, exc: BaseException) -> None:
-        job.state = "error"
-        job.error = f"{type(exc).__name__}: {exc}"[:500]
-        job.finished_at = utc_now_iso()
-        # 库里如果已经有 running 行（runner 开跑之后才写），必须给它一个终态：
-        # 留在 running 就是"界面显示这条还在跑，而线程早就退出了"
-        row = self.repo.get_run(job.run_id)
-        if row is not None and row.status == "running":
-            self.repo.update_run(
-                job.run_id, status="error", finished_at=job.finished_at,
-                aggregate={**row.aggregate, "failure": {"reason": job.error}},
-            )
+        """给这次任务一个终态：库里那份在前，内存那份在后。
+
+        顺序不是讲究，是这条方法存在的理由：`settle()` 只看 `job.live`（由 `state` 推导），
+        先改内存再写库就留下一个窗口——"settle 说没有活了，而库里还是 running"。
+        看板读的是库，于是人会一直等一个不会来的结果，而这正是本服务最坏的失效方式。
+        快机器上这个窗口是微秒级；在覆盖率追踪阶段（整个套件慢 5–10 倍）它变成过一次偶发失败。
+
+        写库自己失败时**不许把异常抛出去**：调用点是 worker 的 `except`，异常逃出去
+        会让 worker 线程死掉，而"worker 死了整个看板的评测入口静默失效"是同一类的事故。
+        """
+        reason = f"{type(exc).__name__}: {exc}"[:500]
+        finished = utc_now_iso()
+        try:
+            # 库里如果已经有 running 行（runner 开跑之后才写），必须给它一个终态
+            row = self.repo.get_run(job.run_id)
+            if row is not None and row.status == "running":
+                self.repo.update_run(
+                    job.run_id, status="error", finished_at=finished,
+                    aggregate={**row.aggregate, "failure": {"reason": reason}},
+                )
+        except Exception as db_exc:  # noqa: BLE001 - 见上面那段
+            reason = f"{reason}；库里没能写下终态（重启后由 reclaim 兜底）：" \
+                     f"{type(db_exc).__name__}: {db_exc}"
+        job.state, job.error, job.finished_at = "error", reason[:500], finished
 
     # ── 生命周期 ──────────────────────────────────────────────────
     def settle(self, timeout: float = 30.0) -> bool:
