@@ -309,6 +309,12 @@ def _build_longctx_zh():
     return build_cases()
 
 
+def _build_embeddings_zh():
+    from onyx.eval.datasets.builtin.embeddings_zh import build_cases
+
+    return build_cases()
+
+
 #: 内置数据集登记表。加一个数据集只需要在这里加一行 + 一个生成器模块
 _BUILTIN: dict[str, dict[str, Any]] = {
     "intent_zh": {
@@ -348,6 +354,15 @@ _BUILTIN: dict[str, dict[str, Any]] = {
                  "填充文本刻意不含任何数字，每个埋点配一个同句式、另一实体的干扰项，"
                  "所以「检索到了」「猜了个常见数字」「认错实体」三件事分得开；"
                  "见 onyx/eval/datasets/builtin/longctx_zh.py",
+    },
+    "embeddings_zh": {
+        "build": _build_embeddings_zh,
+        # frame 集合与池大小共同决定 gold：换任何一个都不与旧分数可比
+        "revision": "seed=20261006+frames=12+pool=4",
+        "notes": "生成器：12 个语义框，每框派生同义/反义/无关三种关系（query 与 gold 是同一命题的"
+                 "两种写法，anti 只在极性上相反而词面几乎全同）；关系由构造给出、由自检核对，"
+                 "判据是排序不是相似度阈值（实测同义与反义的 cos 区间重叠）；"
+                 "见 onyx/eval/datasets/builtin/embeddings_zh.py",
     },
 }
 

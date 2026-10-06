@@ -2834,6 +2834,9 @@ _REPORT_METRICS = (
     # 长上下文：主分数是"三个埋点全找到"，needle_rate 是逐埋点命中率——差值就是"只找到一个"的题；
     # confusion_rate 说清掉的那部分是"认错实体"还是"没读到"，两者修法完全不同
     ("needle_rate", "内容"), ("confusion_rate", "内容"),
+    # 语义检索：score 就是 recall@1，mrr 看名次分布；anti_first_rate 是"被否定词骗走第 1 位"
+    # 的比例——这一位比 recall@1 更能分出 embedding 模型的高下，所以单独打印
+    ("mrr", "内容"), ("anti_first_rate", "内容"),
     ("hit_at_1", "选择"), ("set_f1", "选择"),
     ("no_call_rate", "选择"), ("wrong_tool_rate", "选择"),
     ("false_call_rate", "选择"), ("refusal_rate", "选择"),

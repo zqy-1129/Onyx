@@ -20,6 +20,7 @@ from onyx.eval.task import EvalTask, TaskSpec, coerce_task_spec
 from onyx.eval.tasks.instruction_following import InstructionFollowing
 from onyx.eval.tasks.intent_classification import IntentClassification
 from onyx.eval.tasks.long_context import LongContext
+from onyx.eval.tasks.semantic_similarity import SemanticSimilarity
 from onyx.eval.tasks.structured_extraction import StructuredExtraction
 from onyx.eval.tasks.tool_selection import ToolSelection
 
@@ -36,6 +37,8 @@ BUILTIN_TASKS: dict[str, TaskSpec] = {
         InstructionFollowing, lambda: load_builtin("instructions_zh")
     ),
     LongContext.id: TaskSpec(LongContext, lambda: load_builtin("longctx_zh")),
+    #: `Cap.EMBED` 到 S33 才有消费者：这个任务的 `build()` 不返回 GenerationRequest
+    SemanticSimilarity.id: TaskSpec(SemanticSimilarity, lambda: load_builtin("embeddings_zh")),
 }
 
 #: 内置数据集的规范别名（两种写法必须落到同一个 id，理由见 `load_dataset`）
@@ -45,6 +48,7 @@ _BUILTIN_DATASETS = {
     "structured_ie": "structured_ie", "structured_ie-v1": "structured_ie",
     "instructions_zh": "instructions_zh", "instructions_zh-v1": "instructions_zh",
     "longctx_zh": "longctx_zh", "longctx_zh-v1": "longctx_zh",
+    "embeddings_zh": "embeddings_zh", "embeddings_zh-v1": "embeddings_zh",
 }
 
 

@@ -18,12 +18,13 @@
 from __future__ import annotations
 
 import json
+import math
 from itertools import islice
 from typing import Any
 
 import pytest
 
-from onyx.core.types import Cap, Generation, GenerationRequest, Status, TracePurpose
+from onyx.core.types import Cap, Embedding, EmbedRequest, Generation, GenerationRequest, Status, TracePurpose
 from onyx.eval.metrics import LOW_CONFIDENCE_N, jsonable
 from onyx.eval.task import Verdict, check_capabilities, headline_of
 from onyx.eval.tasks import BUILTIN_TASKS, build_task, specs
@@ -42,23 +43,39 @@ def _cases(task: Any, *, limit: int = 4) -> list[Any]:
     return list(islice(task.load(), limit))
 
 
+def _sample(task: Any, case: Any, shape: int, *, status: Status, error: str = "") -> Any:
+    """按任务**自己的请求类型**造同类型的假样本。
+
+    契约测试必须跟着协议一起泛化（S33）：写死 `Generation` 就等于宣布
+    "只有生成式任务能通过验收"，那下一个非生成任务要么去改内核要么来改这条契约——
+    两者都比"契约本身支持多形态"更坏。
+    """
+    request = task.build(case)
+    if isinstance(request, EmbedRequest):
+        n = request.batch_size
+        # shape 0 什么都没拿到 / 1 全同（排名不可分）/ 2 有区分度
+        vectors: tuple[tuple[float, ...], ...] = ()
+        if shape == 1:
+            vectors = tuple((1.0, 0.0) for _ in range(n))
+        elif shape == 2:
+            vectors = tuple((math.cos(0.3 * i), math.sin(0.3 * i)) for i in range(n))
+        return Embedding(vectors=vectors, model=request.model, status=status, error=error)
+    texts = ("", "{}", "42", "")
+    return Generation(text=texts[shape], model=request.model, status=status, error=error)
+
+
 def _shapes(task: Any) -> list[Any]:
-    """几种通用输出形态：空正文 / 空对象 / 一个整数 / 引擎失败。
+    """几种通用输出形态：空产出 / 退化产出 / 可用产出 / 引擎失败。
 
     刻意不给"正确答案"：契约测的是指标集合与不变式，不是分数高低。
     """
     grades: list[Any] = []
     for case in _cases(task):
-        for text, status, error in (
-            ("", Status.OK, ""),
-            ("{}", Status.OK, ""),
-            ("42", Status.OK, ""),
-            ("", Status.ERROR, "engine down"),
-        ):
-            grades.append(task.grade(
-                case,
-                Generation(text=text, model="mock/contract", status=status, error=error),
-            ))
+        for shape in range(3):
+            grades.append(task.grade(case, _sample(task, case, shape, status=Status.OK)))
+        grades.append(task.grade(
+            case, _sample(task, case, 3, status=Status.ERROR, error="engine down")
+        ))
     return grades
 
 
@@ -140,10 +157,17 @@ def test_build_returns_a_request_with_thinking_off(task_id):
     task = _task(task_id)
     for case in _cases(task):
         request = task.build(case)
-        assert isinstance(request, GenerationRequest)
+        assert isinstance(request, GenerationRequest | EmbedRequest), (
+            f"{task_id} 的 build() 交回来的是 {type(request).__name__}，"
+            "既不是生成请求也不是向量请求——那 runner 就没法在不看任务 id 的前提下分派"
+        )
         assert request.model == "mock/contract"
         assert request.context.purpose is TracePurpose.EVAL
-        assert request.thinking is False, f"{task_id} 没有显式关掉 thinking"
+        if isinstance(request, GenerationRequest):
+            # P12 的实测结论：thinking 计入 eval_count 且会吃光小预算，必须由请求显式关掉
+            assert request.thinking is False, f"{task_id} 没有显式关掉 thinking"
+        else:
+            assert request.batch_size >= 2, f"{task_id} 的向量请求没有可比的候选"
 
 
 @pytest.mark.parametrize("task_id", TASK_IDS)
@@ -186,9 +210,7 @@ def test_an_engine_outage_leaves_no_score_rather_than_zero(task_id):
     """
     task = _task(task_id)
     case = _cases(task, limit=1)[0]
-    failed = task.grade(
-        case, Generation(text="", model="mock/contract", status=Status.ERROR, error="engine down")
-    )
+    failed = task.grade(case, _sample(task, case, 3, status=Status.ERROR, error="engine down"))
     assert failed.verdict is Verdict.ERROR and not failed.attributable
 
     aggregate = task.aggregate([failed])
