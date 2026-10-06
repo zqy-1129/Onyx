@@ -11,7 +11,6 @@
 from __future__ import annotations
 
 import enum
-import math
 import random
 from collections import Counter
 from collections.abc import Callable, Iterable, Sequence
@@ -279,18 +278,15 @@ def macro_f1_ci(
 
 
 def _percentile(sorted_values: Sequence[float], q: float) -> float:
-    """线性插值分位数。q ∈ [0,1]。"""
-    if not sorted_values:
-        raise ValueError("空序列没有分位数")
-    if len(sorted_values) == 1:
-        return sorted_values[0]
-    position = q * (len(sorted_values) - 1)
-    lower = math.floor(position)
-    upper = math.ceil(position)
-    if lower == upper:
-        return sorted_values[int(position)]
-    weight = position - lower
-    return sorted_values[lower] * (1 - weight) + sorted_values[upper] * weight
+    """线性插值分位数。q ∈ [0,1]。
+
+    实现只有一份，在 `onyx.llm.measurement.stats`：置信区间的端点、标定用的中位数、
+    以及 `onyx perf` 的 P95 必须是同一个定义，否则同一批数会在两个页面上给出不同的分位数，
+    而每一处都能自证"我是按定义算的"。
+    """
+    from onyx.llm.measurement.stats import percentile
+
+    return percentile(sorted_values, q)
 
 
 def summarize_pairs(

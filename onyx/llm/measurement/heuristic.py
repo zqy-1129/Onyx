@@ -42,3 +42,23 @@ def estimate_tokens(
 
 def text_tokens(text: str) -> int:
     return estimate_tokens(text)
+
+
+#: 一个汉字**至少**值多少 token。这是下限而不是估计值：本机 qwen 系实测约 0.68 tok/汉字
+#: （PROBES / S32 量过），取 0.5 是往保守方向留余量——判据只会"少测一条"，不会"把没测说成测过"。
+MIN_TOKENS_PER_HANZI = 0.5
+
+
+def min_prompt_tokens(text: str, *, tokens_per_hanzi: float = MIN_TOKENS_PER_HANZI) -> int:
+    """正文的 token **下限**（只由汉字数推出）。0 表示推不出来 ⇒ 不该做任何截断判断。
+
+    用途是"引擎回报的数字低于这个下限 ⇒ 它一定切过正文"。S32 那条负控制就是这么抓到的：
+    16.8k tok 的正文被 Ollama 裁到 `in_tokens=2050`，比 `num_ctx` 还小，
+    于是"`in_tokens ≥ num_ctx` 才算被切"这条判据永远不响，被切的样本反而得了 0 分。
+    吞吐基线同样需要它：一个"8k 档"的格子如果被裁到 2k，数字看着完全合理，量的却是别的长度。
+
+    **这不是"用估算冒充测量"**：估算在这里的用途是把样本踢出分母（记 skip / 不记分），
+    而不是给任何东西打分或当聚合值。
+    """
+    cjk, _other = split_cjk(text)
+    return int(cjk * tokens_per_hanzi)
