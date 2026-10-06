@@ -88,13 +88,13 @@ class OllamaProvider:
         return lifecycle.running_models(self.client)
 
     def pull(self, name: str, *, on_event: EventCB | None = None) -> AdminResult:
-        last: dict[str, Any] = {}
-        for chunk in lifecycle.pull_model(self.client, name):
-            last = chunk
+        ok, error, last = lifecycle.pull_outcome(lifecycle.pull_model(self.client, name))
         return AdminResult(
-            ok=bool(last.get("done")), action="pull",
-            detail={"name": name, "digest": last.get("digest", "")},
-            error=str(last.get("error", "")),
+            ok=ok, action="pull", error=error,
+            detail={"name": name, "digest": last.get("digest", ""),
+                    "status": str(last.get("status") or ""),
+                    # 收尾形状一起留着：判成失败时第一个要问的就是"引擎最后说了什么"
+                    "last": {k: v for k, v in last.items() if k != "_unparsed"}},
         )
 
     def unload(self, name: str) -> AdminResult:

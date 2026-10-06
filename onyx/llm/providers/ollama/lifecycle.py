@@ -7,7 +7,7 @@ Ollama 0.35 的 /api/tags 实际返回 capabilities 与 details.context_length�
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from typing import Any
 
 from onyx.core.errors import ProviderRejected
@@ -129,6 +129,26 @@ def pull_model(
         if on_progress is not None:
             on_progress(chunk)
         yield chunk
+
+
+def pull_outcome(chunks: Iterable[dict[str, Any]]) -> tuple[bool, str, dict[str, Any]]:
+    """按 ndjson 流的**收尾形状**判定拉取成败：返回 (ok, error, 判据所在的那条 chunk)。
+
+    Ollama 0.35.1 的 `/api/pull` 以 `{"status":"success"}` 结尾，**没有 `done` 字段**。
+    早先按 `last["done"]` 判 ⇒ 每一次真拉都被报成失败（模型其实已经在盘上，
+    用户接着会遇到"我说没拉到、你再拉一次又说已经有了"）。现在两代形状都认，
+    并且**任何一条带 error 就算失败**：成功的操作被判成失败，与失败被判成成功，
+    同样是把用户的判断带偏。
+    """
+    last: dict[str, Any] = {}
+    for chunk in chunks:
+        last = chunk
+        if chunk.get("error"):
+            return False, str(chunk["error"]), chunk
+    status = str(last.get("status") or "")
+    if last.get("done") or status == "success":
+        return True, "", last
+    return False, f"拉流没有正常收尾（最后一条是 {status or '空'}）", last
 
 
 def unload_model(client: OllamaClient, name: str) -> AdminResult:
