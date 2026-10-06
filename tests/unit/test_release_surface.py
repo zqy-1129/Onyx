@@ -128,6 +128,30 @@ def test_markdown_tables_have_one_line_per_row():
     assert not problems, "表格行被换行拆断了：\n  " + "\n  ".join(problems[:8])
 
 
+def test_the_equality_claim_is_only_made_with_its_condition():
+    """「Σ分段 + template_ctl = 引擎计数」是**有条件**的：残差为负时 `template_ctl` 被 clamp 成 0
+    （`llm/measurement/parts.py`，S39 取证：未标定的模型条条如此）。
+
+    文档里可以自由讨论这句话，但**给用户看的那一行字符串**不许再说它是无条件等式——
+    那会把人骗去查引擎，而真正该跑的是 `onyx calibrate`。所以这里只扫代码（py/ts/tsx），
+    并要求同一行里出现 `clamp` 这个限定词。
+    """
+    phrase = "Σ分段 + template_ctl = 引擎计数"
+    targets = [p for p in (ROOT / "onyx").rglob("*.py") if "__pycache__" not in p.parts]
+    targets += [p for p in (ROOT / "onyx" / "web" / "src").rglob("*.ts")]
+    targets += [p for p in (ROOT / "onyx" / "web" / "src").rglob("*.tsx")]
+    problems = []
+    for path in targets:
+        for number, line in enumerate(path.read_text(encoding="utf-8").split("\n"), start=1):
+            if phrase in line and "clamp" not in line:
+                problems.append(f"{path.relative_to(ROOT)}:{number}: {line.strip()[:90]}")
+    assert not problems, "这句等式必须带着「仅未 clamp 时成立」一起出现：\n  " + "\n  ".join(problems[:6])
+
+    # 而且两端（终端与看板）必须真的都在说这句带限定的话——只删掉旧句子不算补上了条件
+    assert "仅未 clamp 时成立" in (ROOT / "onyx" / "cli.py").read_text(encoding="utf-8")
+    assert "仅未 clamp 时成立" in (ROOT / "onyx" / "web" / "src" / "format.ts").read_text(encoding="utf-8")
+
+
 def test_makefile_exposes_the_coverage_gate():
     make = (ROOT / "Makefile").read_text(encoding="utf-8")
 

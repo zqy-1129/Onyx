@@ -3,6 +3,7 @@
 import { describe, expect, it } from 'vitest'
 import { render, screen } from '@testing-library/react'
 import {
+  attributionNote,
   fmtBytes,
   fmtGb,
   fmtCompact,
@@ -12,6 +13,7 @@ import {
   fmtSeconds,
   shortId,
   shortRef,
+  isClosed,
   residencyOf,
   timeAgo,
   UNKNOWN,
@@ -156,5 +158,25 @@ describe('体积（GB）', () => {
     // 0.00GB 会被读成"这个模型不占磁盘"，而真相是我们没问出来
     expect(fmtGb(0)).toBe('0.00GB')
     expect(fmtGb(4.567)).toBe('4.57GB')
+  })
+})
+
+describe('分段闭合（S39：等式是有条件的，且前后端只能有一份定义）', () => {
+  it('精确相等才算闭合——没有容差', () => {
+    expect(isClosed(1000, 1000)).toBe(true)
+    expect(isClosed(1001, 1000)).toBe(false) // 差 1 也得响：未 clamp 时相等由构造保证
+    expect(isClosed(621, 475)).toBe(false)
+  })
+
+  it('没有引擎计数就不判（未知不是闭合，也不是不闭合）', () => {
+    expect(isClosed(10, null)).toBe(false)
+    expect(isClosed(10, undefined)).toBe(false)
+  })
+
+  it('说明句把条件与档位一起说，老行没记档位就明说', () => {
+    expect(attributionNote({ count_source: 'fitted' })).toContain('仅未 clamp 时成立')
+    expect(attributionNote({ count_source: 'fitted' })).toContain('分段按 fitted 数')
+    expect(attributionNote({})).toContain('这条没记归因档位')
+    expect(attributionNote(null)).toContain('这条没记归因档位')
   })
 })

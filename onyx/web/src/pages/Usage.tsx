@@ -58,11 +58,17 @@ function BarList({
 
 function SeriesChart({ rows }: { rows: Array<Record<string, number | string>> }) {
   if (rows.length < 2) return <EmptyState title="样本不足，画不出趋势" hint="至少需要 2 个时间桶" />
+  /** token 数的 0 是真 0（空输出），速率的"没测到"是 null（SQL 那侧已不再 COALESCE 成 0）。
+   *  两者混成一个值，折线就会为空桶掉出 0 的坑，读起来像"这一格测到 0 t/s"。
+   *  这里把 0 也归到 null：`decode_tps` 是 0 意味着没吐出字，那不是一个可画的速率。 */
+  const rate = (value: unknown): number | null => (typeof value === 'number' && value > 0 ? value : null)
   const inTokens = rows.map((r) => Number(r.in_tokens ?? 0))
   const outTokens = rows.map((r) => Number(r.out_tokens ?? 0))
-  const cold = rows.map((r) => Number(r.cold_prefill_tps ?? 0))
-  const warm = rows.map((r) => Number(r.warm_prefill_tps ?? 0))
-  const decode = rows.map((r) => Number(r.decode_tps ?? 0))
+  const cold = rows.map((r) => rate(r.cold_prefill_tps))
+  const warm = rows.map((r) => rate(r.warm_prefill_tps))
+  const decode = rows.map((r) => rate(r.decode_tps))
+  const lastKnown = (values: Array<number | null>) =>
+    [...values].reverse().find((v) => v != null) ?? null
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-2)' }}>
       <div className="row small">
@@ -80,7 +86,7 @@ function SeriesChart({ rows }: { rows: Array<Record<string, number | string>> })
       <div className="row small">
         <span className="muted" style={{ width: 120, flex: '0 0 120px' }}>decode t/s</span>
         <Sparkline values={decode} width={220} color="var(--accent)" />
-        <b className="num">{fmtFloat(decode[decode.length - 1])}</b>
+        <b className="num">{fmtFloat(lastKnown(decode))}</b>
         <span className="muted nowrap">最新</span>
       </div>
       {/* 冷/热两条独立系列，绝不合并（R3） */}
@@ -100,8 +106,8 @@ function SeriesChart({ rows }: { rows: Array<Record<string, number | string>> })
   )
 }
 
-function avg(values: number[]): number | null {
-  const positive = values.filter((v) => v > 0)
+function avg(values: Array<number | null>): number | null {
+  const positive = values.filter((v): v is number => v != null && v > 0)
   if (!positive.length) return null
   return positive.reduce((a, b) => a + b, 0) / positive.length
 }

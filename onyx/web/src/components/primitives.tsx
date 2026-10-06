@@ -227,23 +227,37 @@ export function Sparkline({
   height = 20,
   color = 'var(--info)',
 }: {
-  values: number[]
+  /** `null` = 这一格**没有测到**（不是 0）。折线在此断线，绝不补值。 */
+  values: Array<number | null>
   width?: number
   height?: number
   color?: string
 }) {
-  const points = values.filter((v) => Number.isFinite(v))
-  if (points.length < 2) return <span className="muted small">{UNKNOWN}</span>
-  const max = Math.max(...points)
-  const min = Math.min(...points)
+  const known = values.filter((v): v is number => v != null && Number.isFinite(v))
+  if (known.length < 2) return <span className="muted small">{UNKNOWN}</span>
+  const max = Math.max(...known)
+  const min = Math.min(...known)
   const span = max - min || 1
-  const step = width / (points.length - 1)
-  const path = points
-    .map((v, i) => `${i === 0 ? 'M' : 'L'}${(i * step).toFixed(1)},${(height - ((v - min) / span) * height).toFixed(1)}`)
-    .join(' ')
+  // x 按**原始下标**算，所以断点后的点不会挤到一起；补 0 会让空桶看起来像一次真实测量
+  const step = width / Math.max(1, values.length - 1)
+  const segments: string[] = []
+  let current = ''
+  values.forEach((value, index) => {
+    if (value == null || !Number.isFinite(value)) {
+      if (current) segments.push(current.trim())
+      current = ''
+      return
+    }
+    const x = (index * step).toFixed(1)
+    const y = (height - ((value - min) / span) * height).toFixed(1)
+    current += `${current ? 'L' : 'M'}${x},${y} `
+  })
+  if (current) segments.push(current.trim())
   return (
     <svg width={width} height={height} role="img" aria-label="趋势">
-      <path d={path} fill="none" stroke={color} strokeWidth={1.5} />
+      {segments.map((d, i) => (
+        <path key={i} d={d} fill="none" stroke={color} strokeWidth={1.5} />
+      ))}
     </svg>
   )
 }

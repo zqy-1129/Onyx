@@ -15,7 +15,7 @@ import {
   StatCard,
   StatusBadge,
 } from '../components/primitives'
-import { fmtBytes, fmtFloat, fmtInt, fmtMs, fmtPct, shortRef, UNKNOWN } from '../format'
+import { attributionNote, fmtBytes, fmtFloat, fmtInt, fmtMs, fmtPct, shortRef, UNKNOWN } from '../format'
 import { useApi } from '../hooks/useApi'
 import { navigate } from '../router'
 
@@ -179,13 +179,22 @@ export function TraceDetailPage({ traceId }: { traceId: string }) {
         <div className="col-5">
           <Panel
             title="分段归因"
-            note={attribution.count_source ? `count_source=${String(attribution.count_source)}` : 'Σ分段 + template_ctl = 引擎计数'}
+            note={attributionNote(attribution)}
           >
-            <PromptBreakdown parts={detail.parts} engineIn={usage?.in_tokens ?? null} />
+            <PromptBreakdown
+              parts={detail.parts}
+              engineIn={usage?.in_tokens ?? null}
+              attribution={attribution}
+              model={trace.model_name}
+            />
             {attribution.clamped ? (
               <p className="small" style={{ color: 'var(--warn)', marginTop: 'var(--space-2)' }}>
-                ! 分段和超过引擎计数（残差 {String(attribution.residual_raw ?? UNKNOWN)}）：
-                计数档位高估或引擎发生截断，归因不可信。
+                ! 残差 {String(attribution.residual_raw ?? UNKNOWN)} 为负 ⇒ 模板控制符记 0：
+                分段计数器（{String(attribution.count_source ?? UNKNOWN)}）比引擎高估，
+                各段只能比相对占比。
+                {attribution.count_source === 'heuristic'
+                  ? ` 修法：onyx calibrate --model ${trace.model_name ?? '<模型名>'}（标定后新行才闭合，历史行不回填）。`
+                  : ' 已标定还被 clamp ⇒ 查引擎有没有裁正文（对照 ctx_util 与正文的 token 下限）。'}
               </p>
             ) : null}
             {detail.gpu?.size_vram != null ? (

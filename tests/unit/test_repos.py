@@ -363,3 +363,34 @@ def test_summarize_aggregates(db, repos):
     assert len(summary.drift_samples) == 4
     filtered = usage.summarize(since="2026-10-03T00:00:00.000000+00:00")
     assert filtered.traces == 2
+
+
+def test_timeseries_leaves_unmeasured_rates_as_null_not_zero(db, repos):
+    """S39：速率列的"这一格没测到"必须是 NULL。
+
+    原先 SQL 写 `COALESCE(AVG(decode_tps),0)`，于是空桶与"真的 0 t/s"在数据里同形，
+    折线会为没数据的桶掉出一个 0 的坑——而 0 t/s 读起来像一个测量结果。
+    token 数的 0 是**真 0**（空输出），所以那两列仍然 COALESCE，这条断言把它们隔开。
+    """
+    _, traces, usage = repos
+    rec = _trace(model_id="m1", started_at="2026-10-05T10:00:00.000000+00:00")
+    traces.upsert(rec)
+    usage.upsert(UsageRecord(trace_id=rec.id, source="engine", confidence="high",
+                             in_tokens=0, out_tokens=0))     # 没有任何延迟数据的一次真实请求
+    bucket = usage.timeseries(bucket_minutes=60)[0]
+    assert bucket["decode_tps"] is None and bucket["cold_prefill_tps"] is None
+    assert bucket["warm_prefill_tps"] is None
+    assert bucket["in_tokens"] == 0 and bucket["out_tokens"] == 0, "token 的 0 是真的 0"
+    assert bucket["traces"] == 1
+
+    second = _trace(model_id="m1", started_at="2026-10-05T11:30:00.000000+00:00")
+    traces.upsert(second)
+    usage.upsert(UsageRecord(trace_id=second.id, source="engine", confidence="high",
+                             in_tokens=10, out_tokens=2, decode_tps=30.0, prefill_mode="cold",
+                             prefill_tps=900.0))
+    buckets = usage.timeseries(bucket_minutes=60)
+    assert len(buckets) == 2
+    by_hour = {b["bucket"][-5:]: b for b in buckets}
+    assert by_hour["10:00"]["decode_tps"] is None, "补了数据也不能把空桶顶成 0"
+    assert by_hour["11:00"]["cold_prefill_tps"] == 900.0
+    assert by_hour["11:00"]["warm_prefill_tps"] is None, "这一小时没有 warm 样本，不是 0"

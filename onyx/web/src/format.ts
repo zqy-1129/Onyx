@@ -152,3 +152,24 @@ export function residencyOf(loaded: boolean | null): Residency {
     title: '驻留状态未知：这个通道不报告（OpenAI 兼容层没有该端点）',
   }
 }
+
+/** 分段闭合的**唯一**判据：Σ非 output 分段恰好等于引擎计数。
+ *
+ * 与后端 `llm/measurement/explain._closure` 是同一条（那里也是 `total == in_tokens`）。
+ * 这里原先留了 ±2% 容差，注释写的是"计数档位本身有舍入"——但 `template_ctl` 就是那条残差，
+ * 没被 clamp 时相等**由构造保证**，所以差 1 个 token 恰恰说明"两边不是同一次计算"。
+ * 把它包进容差等于把唯一能发现不自洽的机会抹掉，而且会让看板与 `onyx token explain`
+ * 对同一条 trace 给出不同结论。 */
+export function isClosed(inputTotal: number, engineIn: number | null | undefined): boolean {
+  return engineIn != null && inputTotal === engineIn
+}
+
+/** 分段归因那一行说明：等式是有条件的，条件就是"没被 clamp"。
+ *  档位（count_source）与残差来自 `trace.extra.attribution`；老行没记就得说"没记"，
+ *  不能假装有档位。 */
+export function attributionNote(attribution: Record<string, unknown> | null | undefined): string {
+  const base = 'Σ分段 + template_ctl = 引擎计数（仅未 clamp 时成立）'
+  const tier = attribution?.count_source
+  if (!tier) return `${base} · 这条没记归因档位`
+  return `${base} · 分段按 ${String(tier)} 数`
+}

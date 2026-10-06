@@ -141,7 +141,13 @@ class UsageRepo:
         return {str(r["k"]): int(r["n"]) for r in self.db.query(sql, params)}
 
     def timeseries(self, *, bucket_minutes: int = 60, since: str | None = None, limit: int = 200) -> list[dict]:
-        """按时间桶聚合，供看板 sparkline / 折线用。桶边界在 SQL 里截断，避免把数据拉到前端再算。"""
+        """按时间桶聚合，供看板 sparkline / 折线用。桶边界在 SQL 里截断，避免把数据拉到前端再算。
+
+        **速率列不 COALESCE**：`COALESCE(AVG(decode_tps),0)` 把"这一格没有延迟数据"
+        与"测到 0 t/s"压成同一个值，于是空桶会在折线上掉出一个 0 的坑，
+        而 0 t/s 读起来就是一个测量结果（decode 为 0 意味着没吐出字）。
+        token 数的 0 是真的 0（空输出），所以那两列保留 COALESCE。
+        """
         sql = (
             "SELECT strftime('%Y-%m-%dT%H:', t.started_at) "
             f"|| printf('%02d', (CAST(strftime('%M', t.started_at) AS INTEGER) / {max(1, int(bucket_minutes))}) "
@@ -149,9 +155,9 @@ class UsageRepo:
             "COUNT(*) AS traces, "
             "COALESCE(SUM(u.in_tokens),0) AS in_tokens, "
             "COALESCE(SUM(u.out_tokens),0) AS out_tokens, "
-            "COALESCE(AVG(u.decode_tps),0) AS decode_tps, "
-            "COALESCE(AVG(CASE WHEN u.prefill_mode='cold' THEN u.prefill_tps END),0) AS cold_prefill_tps, "
-            "COALESCE(AVG(CASE WHEN u.prefill_mode='warm' THEN u.prefill_tps END),0) AS warm_prefill_tps "
+            "AVG(u.decode_tps) AS decode_tps, "
+            "AVG(CASE WHEN u.prefill_mode='cold' THEN u.prefill_tps END) AS cold_prefill_tps, "
+            "AVG(CASE WHEN u.prefill_mode='warm' THEN u.prefill_tps END) AS warm_prefill_tps "
             "FROM usage u JOIN trace t ON t.id=u.trace_id"
         )
         params: list[object] = []

@@ -1,7 +1,7 @@
 /** Prompt 分段归因：堆叠条（不用饼图——占比接近时饼图分不出来）。
  *  核心价值：让"工具定义每次请求偷走多少上下文"和"模板控制符成本"可见。 */
 import type { TokenPartView } from '../api/types'
-import { fmtInt, fmtPct, UNKNOWN } from '../format'
+import { fmtInt, fmtPct, isClosed, UNKNOWN } from '../format'
 
 const PART_LABELS: Record<string, string> = {
   system: 'system',
@@ -31,10 +31,16 @@ export function PromptBreakdown({
   parts,
   engineIn,
   showOutput = false,
+  attribution,
+  model,
 }: {
   parts: TokenPartView[]
   engineIn?: number | null
   showOutput?: boolean
+  /** `trace.extra.attribution`：这一条的分段是按哪一档计数数的、残差有没有被 clamp */
+  attribution?: Record<string, unknown> | null
+  /** 模型名。只有拿到真名才敢写 `onyx calibrate --model …`——占位符是抄不动的命令 */
+  model?: string | null
 }) {
   const visible = parts.filter((p) => p.tokens > 0 && (showOutput || p.part !== 'output'))
   if (!visible.length) {
@@ -42,8 +48,8 @@ export function PromptBreakdown({
       <div className="empty">
         <div className="empty-title">归因不可用</div>
         <div className="empty-hint">
-          该模型当前没有可用的分段计数档位（见 docs/PROBES.md P9）。总量仍由引擎给出，
-          但无法拆到 system / 工具定义 / 各消息。
+          这条 trace 没有分段归因记录（分段全为 0 或缺失）。总量仍由引擎给出；
+          各段的档位与残差见 docs/PROBES.md P9 与 onyx token explain。
         </div>
       </div>
     )
@@ -55,7 +61,9 @@ export function PromptBreakdown({
     .filter((p) => p.part !== 'output')
     .reduce((sum, p) => sum + p.tokens, 0)
   const outputTotal = total - inputTotal
-  const closed = engineIn != null && Math.abs(inputTotal - engineIn) <= Math.max(1, engineIn * 0.02)
+  const closed = isClosed(inputTotal, engineIn)
+  const clamped = attribution?.clamped === true
+  const tier = attribution?.count_source ? String(attribution.count_source) : null
 
   return (
     <div>
@@ -94,9 +102,23 @@ export function PromptBreakdown({
         ) : null}
         {engineIn != null ? (
           closed ? (
-            <span className="badge badge-ok">✓ 归因闭合</span>
+            <span className="badge badge-ok" title={tier ? `分段按 ${tier} 数，残差没有被 clamp` : undefined}>
+              ✓ 归因闭合
+            </span>
+          ) : clamped ? (
+            <span
+              className="badge badge-warn"
+              title={`残差 ${String(attribution?.residual_raw ?? UNKNOWN)} 为负 ⇒ template_ctl 记 0。`
+                + '分段计数器比引擎高估，各段只能比相对占比。'
+                + (tier === 'heuristic' && model ? `修法：onyx calibrate --model ${model}` : '')}
+            >
+              ! 计数器高估（差 {fmtInt(inputTotal - engineIn)}）
+            </span>
           ) : (
-            <span className="badge badge-warn" title="分段计数之和与引擎计数不一致：计数档位可能高估或引擎发生截断">
+            <span
+              className="badge badge-warn"
+              title="没被 clamp 时相等由构造保证，所以这个差值说明分段与采信总数不是同一次计算的结果"
+            >
               ! 未闭合（差 {fmtInt(inputTotal - engineIn)}）
             </span>
           )
