@@ -67,6 +67,8 @@ def workflow_text() -> str:
     "coverage run -m pytest",
     "coverage report",
     "pytest -m e2e",
+    "pytest -m browser",
+    "playwright install",
     "tsc --noEmit",
     "vitest run",
     "vite build",
@@ -80,6 +82,24 @@ def test_ci_runs_every_documented_gate(workflow_text: str, command: str):
     少一步等于少一道门，而 CI 变绿时没人会去数步数。
     """
     assert command in workflow_text, f"CI 里少了这一步：{command}"
+
+
+def test_browser_tier_is_its_own_job_and_is_excluded_from_the_default_run():
+    """`-m browser`（S40）要**同时**被两处钉住：CI 里有它，默认档里没有它。
+
+    只钉一边都会漂：CI 少了它＝这八条只剩"有人记得跑"；默认档带上它＝
+    覆盖率数字开始随浏览器时序抖动，而 `fail_under=85` 就不再是一个可信的门禁。
+    """
+    addopts = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    assert "not browser" in addopts, "addopts 不再排除 browser——覆盖率门禁会开始偶发红"
+    assert '"browser: ' in addopts, "marker 没注册：--strict-markers 会让这一档直接跑不起来"
+    assert "playwright" in addopts, "playwright 掉出 dev extra 时，本地与 CI 装到的东西不一样"
+
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    assert "pytest -m browser" in workflow, "浏览器档没被 CI 跑：那八条只能靠本地记得跑"
+    after_e2e = workflow.split("pytest -m e2e")[1]
+    assert "pytest -m browser" in after_e2e, \
+        "浏览器档被并进了后端那个 job——那个 job 里没有 node，它必红"
 
 
 def test_ci_runs_e2e_as_its_own_step_not_by_accident(workflow_text: str):

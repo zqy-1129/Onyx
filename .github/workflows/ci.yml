@@ -62,7 +62,7 @@ jobs:
       - name: 端到端（六页取数同源 + SSE 在真 HTTP 连接上被读到 + 断链自检）
         run: uv run pytest -m e2e
 
-      # `-m live`（20 条）与 `-m probe`（4 条）**不在 CI 跑**：它们真打引擎、真占 GPU，
+      # `-m live`（22 条）与 `-m probe`（4 条）**不在 CI 跑**：它们真打引擎、真占 GPU，
       # 也真依赖那块 16GB 显存上的模型清单。这是刻意的分工——CI 保证不回归，
       # 引擎语义靠真机（结论沉淀在 docs/PROBES.md，每条带引擎版本与证据）。
       - name: 明确标出未在此运行的两档
@@ -90,6 +90,34 @@ jobs:
         run: npx vitest run
       - name: 构建
         run: npx vite build
+
+  # 浏览器档（S40）单独一个 job：它同时要 python 后端与 node 前端，而后端那个 job 里没有 node。
+  # 把 `-m browser` 并进 `-m e2e` 会让后端 job 必红——那不是保护，是把两档捆成一处堵塞。
+  browser:
+    name: 浏览器 e2e（真浏览器：vite + serve + playwright）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: onyx/web/package-lock.json
+      - name: 装依赖（dev extra 里带 playwright）
+        run: uv sync --extra dev --extra runtime --extra api
+      - name: 前端依赖
+        run: npm ci
+        working-directory: onyx/web
+      # 本机不需要这一步：`channel="msedge"` 直接吃系统里的 Edge。
+      # CI 的 ubuntu 镜像没有 Edge/Chrome 可指，所以这里**真的下载** chromium。
+      - name: 装浏览器（CI 上没有可复用的系统浏览器，这一步是真下载）
+        run: uv run playwright install --with-deps chromium
+      - name: 真浏览器八条（六页渲染、「—」不变成 0、clamp 文案上屏、SSE 帧收到订阅者）
+        run: uv run pytest -m browser
 
   install:
     name: 打包与安装冒烟（新机器一条命令能不能装起来）
