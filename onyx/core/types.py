@@ -434,6 +434,54 @@ class Generation:
         return sample.in_tokens / (self.latency.prompt_eval_ns / 1e9)
 
 
+# ── 向量化 ─────────────────────────────────────────────────────────
+@dataclass(frozen=True, slots=True)
+class EmbedRequest:
+    """一次向量化请求。
+
+    刻意不与 `GenerationRequest` 共用类型：embed 没有 messages / tools / thinking / logprobs
+    这些语义位，共用一个类就会让两边都长出"对另一方毫无意义"的字段，
+    而那种字段迟早被某一边填成假数据。
+    """
+
+    model: str
+    inputs: tuple[str, ...]
+    context: TraceContext = field(default_factory=TraceContext)
+    keep_alive: str | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def batch_size(self) -> int:
+        return len(self.inputs)
+
+
+@dataclass(frozen=True, slots=True)
+class Embedding:
+    """向量化的结果。`vectors` 与请求的 `inputs` **按序一一对应**（实测 Ollama 保持顺序）。
+
+    对齐由 provider 侧保证：返回条数与请求条数不一致时是**错误**（`status=ERROR`），
+    不是"少给几条就算了"——少一条会让后面每一条都错位，而错位的排名看着完全正常。
+    """
+
+    vectors: tuple[tuple[float, ...], ...] = ()
+    model: str = ""
+    status: Status = Status.OK
+    error: str = ""
+    #: 向量只有输入没有输出：`usage` 里的 out_tokens 恒为 None，不是 0
+    usage: tuple[TokenSample, ...] = ()
+    latency: EngineLatency | None = None
+    wall_ms: float | None = None
+    extra: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def dimension(self) -> int | None:
+        """向量维度从结果本身推出，不另存一个字段——存了就有说谎的机会。"""
+        return len(self.vectors[0]) if self.vectors else None
+
+    def usage_from(self, source: TokenSource) -> TokenSample | None:
+        return next((s for s in self.usage if s.source == source), None)
+
+
 # ── 控制面 ─────────────────────────────────────────────────────────
 @dataclass(frozen=True, slots=True)
 class ModelCard:
