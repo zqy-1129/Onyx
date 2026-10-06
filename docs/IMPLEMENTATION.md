@@ -3211,7 +3211,7 @@ API 那条不再 400、`--since` 归一化红）。CLI 那条 `exit 2` 不跟着
 
 ---
 
-## S39 — 分段归因"不闭合"的根因是**没标定**，所以修法是把等式写回它的条件
+## S39 — 分段归因"不闭合"的根因是**没标定**，所以修法是把等式写回它的条件 ✅
 
 **为什么是这一步**：S38 的 `token explain` 第一次跑就把自己的判定器判成缺陷——最新 200 条里
 有分段归因的 163 条**只有 2 条闭合**。登记时我以为要在"缩放分段"与"改掉等式"之间做选择，
@@ -3291,6 +3291,100 @@ grep 全仓不再有"Σ分段 + template_ctl = 引擎计数"这句不带条件�
 
 ---
 
+## S39 ✅ 实测：等式带回条件、档位印在旁边，"闭合"这个词被重新称了重量
+
+**真机两条对照（同一条代码路径，只改档案状态）**
+```
+标定前那条 bench 01M47VS1R1W97BYHSX0TVW3WPR（heuristic 归因）
+  分段闭合（Σ非 output 分段 vs 采信 in，分段按 heuristic）：✗ 不闭合｜求和 621 vs 采信 475，
+  差 +146 tok｜残差 -146 被 clamp 成 0                 退出码 1
+  → 分段按启发式数，比引擎高估 ⇒ …先标定：onyx calibrate --model qwen3.5:9b --n 30
+
+onyx calibrate --model qwen3.5:9b --n 40
+  中文 0.693167 tok/字 · 其他 0.173059 · 模板固定开销 10.6243 · R² 1.0 · 最大相对误差 0.89%
+  热 prefill 0.759548 ms/token ⇒ 已写回（fitted 档生效）
+onyx calibrate --model qwen3.5:9b --n 12 --no-write      # 门槛那半边也真跑了一次
+  → "未达可用门槛（n≥30 且 R²≥0.90 且最大相对误差≤20%）⇒ 不写回。
+     fitted 档保持失效，而不是用一个看起来可信的坏标定"
+
+标定后新跑的那条 01M4872J2ZV3NDMPABDDXDA2MY（fitted 归因）
+  分段闭合（…，分段按 fitted）：✓ 闭合（求和 25 == 25）  退出码 0
+```
+
+**最要紧的一条新事实：那个 ✓ 不值那么多钱**（P25 加了表）。全库 2299 条有归因记录的行里
+1813 条是 `heuristic + 未 clamp`——它们的相等是**残差定义的直接结果**（`template_ctl = 引擎计数 − Σ分段`），
+不是"归因被验证过"；485 条 `heuristic + clamp` 才是告警。原因是短 prompt 上启发式反而**低估**
+（模板固定开销 ≈11 tok 在引擎总数里而不在分段里 ⇒ 残差为正），长中文才翻成高估。
+⇒ 所以 S39 把**档位**印在旁边（CLI 那一行、看板那句 note、`token explain` 的闭合行都带），
+而不是去"让等式成立"。这与"分数太好也是缺陷"是同一条信条的又一次发作。
+
+**四处落地**
+1. `explain._closure` 带上 `count_source` / `clamped` / `residual_raw`；`_advice` 拆成四条分支：
+   未标定 ⇒ 给 `onyx calibrate`；**已标定 + 老行 ⇒ 说"这一发是标定前跑的，重跑就闭合"，不再叫人重复标定**
+   （档位是当时的记录，档案是现在的状态，两者会不一致——S38 的文案没有区分这两件事）；
+   已标定还被 clamp ⇒ 指向引擎截断而不是再标定；没记档位的老行 ⇒ 明说"说不出原因"。
+2. `traces show` 与看板的那句等式变成「Σ分段 + template_ctl = 引擎计数（仅未 clamp 时成立）」，
+   并且**由一条扫全仓库代码字符串的断言守着**（`test_release_surface` 那条按行检查
+   "出现这句话就必须同一行出现 clamp"——文档里可以自由讨论，给用户看的那一行不行）。
+   踩到的一次修正：这句话起初写在 rich 的**表标题**里，而 rich 会按表格宽度折行，
+   条件句被劈成两截读不出意思 ⇒ 移到表前一行。
+3. 速率列从 SQL 起就是 NULL（`UsageRepo.timeseries` 去掉三列的 `COALESCE(...,0)`），
+   `Sparkline` 在 NULL 处**断线**（x 按原始下标算，断点后的点不会挤在一起），`avg`/`lastKnown`
+   跳过未知；**token 数的 0 仍然是 0**（空输出是真 0）。真机核对：`/api/usage/summary` 的 14 个桶里
+   10 个 `warm_prefill_tps` 是 null，看板那一行现在显示「—」（原先是一条掉到 0 的线）。
+4. 顺带挖出**第二个"同一个量两份定义"**：前端 `PromptBreakdown` 的闭合判据留着 ±2% 容差，
+   而且**它有自己的回归测试写着"2% 容差内算闭合（计数档位本身有舍入）"**。后端是精确相等 ⇒
+   同一条 trace 在终端与看板上可以一个说闭合一个说不闭合。容差已删，两边统一到精确相等，
+   那条测试换成"差 1 个 token 就是未闭合"。**教训：一条测试能钉住的口径不一定是正确的口径——
+   钉着错的东西的测试比没有测试更坏，它会阻止所有人去改它。**
+
+**与计划的偏差**
+1. 计划说"不需要动内核"——**成立**，四个文件都不是 PROTECTED，边界脚本这一步没话说。
+2. 计划没预计要动前端的闭合判据（第 4 条）；它是"把档位接到 UI 上"这一动作顶出来的。
+3. 计划里的自测命令都真跑了；`token explain` 的文案在第一次真机运行时把 advice 印成了**一个字一行**——
+   `_closure_advice` 有三个分支返回裸字符串而调用方是 `out.extend(...)`。已改成元组，
+   并加了一条**只测形状**的断言（`test_no_advice_line_is_ever_a_single_character`，
+   遍历 3 种归因记录 × 2 种标定状态），这样以后新增分支写错返回类型会当场红。
+
+**本机验证**
+```bash
+uv run pytest tests/unit/test_measurement_explain.py tests/unit/test_cli_token_report.py \
+              tests/unit/test_cli_traces.py tests/unit/test_repos.py \
+              tests/unit/test_release_surface.py -q        # 75 passed（18 + 12 + 4 + 21 + 20）
+cd onyx/web && npx tsc --noEmit && npx vitest run          # 干净 / 116 passed（109 → 116）
+uv run onyx token explain 01M47VS1R1W97BYHSX0TVW3WPR       # 1，点名 heuristic + clamp + calibrate
+uv run onyx token explain 01M4872J2ZV3NDMPABDDXDA2MY       # 0，✓ 闭合（25 == 25）
+uv run onyx traces show 01M47VS1…                          # 条件句 + "! 本条已 clamp" + 只能比相对占比
+curl /api/usage/summary                                    # 14 个桶里 10 个 warm 是 null；?since=7d 仍 400
+uv run coverage run -m pytest -q && uv run coverage report # 1815 passed + 1 skipped，90% ≥ 85
+                                                           #   （14,977 句 / 3,744 分支；explain 99%、
+                                                           #     usage_report 与 usage_repo 各 100%）
+uv run ruff check . && uv run lint-imports                 # All checks passed / 3 contracts kept
+uv run pytest -m live -q                                   # 22 passed（真机，含那条归因闭合断言）
+```
+浏览器实测（`take_snapshot`，两处状态各自核对）：clamp 行显示
+`Σ分段 + template_ctl = 引擎计数（仅未 clamp 时成立） · 分段按 heuristic 数` +
+`! 计数器高估（差 146）` + `修法：onyx calibrate --model qwen3.5:9b（标定后新行才闭合，历史行不回填）`；
+标定后那条显示 `✓ 归因闭合`，tooltip 带上 `分段按 fitted 数，残差没有被 clamp`；
+Ledger 的 warm 那一行在没有数据的桶上不再掉出 0 的折线，改显示「—」。
+
+**注入自检（两条新门禁都真验过）**
+```
+把 cli.py 那句限定词删回无条件等式   ⇒ tests/unit/test_release_surface.py 红，并点名 cli.py:1458
+把 _closure_advice 一个分支改回裸字符串 ⇒ 两条红：形状断言 + 那条分支自己的语义断言
+（两条都已还原；`git diff` 干净到只剩本步真正的改动）
+```
+
+**DoD 核对**：① 未标定的行说得出档位、残差与命令，且已标定的不会被叫去重复标定 ✓（两条真机 + 单测）；
+② 已标定的真机行 ✓ 闭合、退出码 0 ✓；③ 那句等式在代码里只以带条件的形式出现，
+由一条全仓库扫描的断言钉住 ✓；④ 速率列从 SQL 起就是 NULL、折线断线，而 token 的 0 仍显示 0 ✓；
+⑤ 五道门全绿（见下），STATUS §3 那条已从"已知缺陷"改成"已修 + 留下的边界" ✓。
+
+**留下的**：库里还有 4 个模型没标定（`doctor`「token 计量档位」现在报
+"5 个模型：标定可用 1 … 未标定 4"），标定之前的 485 行仍然带着 clamp 记录——不回填。
+
+---
+
 ## 附录 A — 每步自测速查
 
 | 步 | 命令 | 绿的条件 |
@@ -3334,6 +3428,7 @@ grep 全仓不再有"Σ分段 + template_ctl = 引擎计数"这句不带条件�
 | S36 | `uv run onyx perf run --model qwen3.5:9b --prompt-chars 600,2400 --target-tokens 64 --concurrency 1,2 --repeat 1 --device rtx4060ti-16g` + `onyx perf compare A B` + `uv run pytest -m live tests/integration/test_perf_live.py` | 基线落库且 `状态 done`、指纹可复现（同参数两次跑出同一个 `env_hash`）；换网格的第三条与第一条比 ⇒ **退出码 1 并逐字段列出 `grid`**，加 `--force` 才给差值且结果头上印警告；`--provider mock` 退出码 2；真机那条断言 `timing_source == engine_ns` 且每个数字点得回真 trace；把 `FINGERPRINT_FIELDS` 里删掉任一字段 ⇒ 契约测试点名那个字段红 |
 | S37 | `uv run pytest tests/unit/test_obs_timing.py tests/unit/test_streaming.py -q` + `uv run onyx chat --model … --stream …` + `uv run pytest tests/integration/test_gateway_live.py -m live` | 流式那一发：CLI 表里 TTFT 有数（不再是「—」）、库里 `usage.ttft_ms` 与 `trace.first_token_at` 同时非空且 `ttft_source=measured`、且 `finished − first_token ≈ wall − ttft`（旧行为差整段生成时间）；非流式那发留空但写明 `proxy:prompt_eval_duration`；把 `timing` 从注册表摘掉 ⇒ 落库那条必须变回空 |
 | S38 | `uv run onyx token explain <trace_id>` + `uv run onyx report usage --fmt csv` + `uv run onyx report usage --since 7d` | 四问齐答（采信为何落这档 / 各来源差值 / 分段是否闭合 / 离标定还差几个样本），且 CLI 与 `/api/usage/summary` 逐字段相等（同一份库同一时刻：实测 12 字段全等）；把一个 part 的 tokens 改大 ⇒ `token explain` 退出码 1 并印出差值（真机 bench 那条本来就差 +146 tok，同样是 1）；时间桶没 trace ⇒ 不产生 0 行；`--since` 写不成 ISO ⇒ 退出码 2/HTTP 400，**不是**一张看起来像"没跑过"的空表 |
+| S39 | `uv run onyx calibrate --model <名字> --n 40` + `uv run onyx token explain <标定前后各一条>` + `uv run onyx traces show <clamp 的那条>` | 标定前那条 ✗ 不闭合（退出码 1，点名 heuristic + 残差 + `onyx calibrate`），标定后新跑那条 ✓ 闭合（退出码 0）；**已经标定的模型不会再被叫去重复标定**（改口说"这一发是标定前跑的，重跑就闭合"）；`traces show` 与看板的那句等式带「仅未 clamp 时成立」，且全仓库扫一遍：代码里出现这句话的同一行必须有 `clamp`；时间桶速率列从 SQL 起就是 NULL（看板折线在 NULL 处断线，`warm_prefill_tps` 无样本的那行显示「—」），而 token 数的 0 仍显示 0；前后端闭合判据统一成精确相等（**原先前端 ±2% 容差还带一条钉着它自己的测试**） |
 
 ## 附录 B — 架构自测（让"模块化"可验证，而非口号）
 

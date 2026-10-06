@@ -41,7 +41,11 @@ WAL + 批量 sink（队列满丢样本但 `dropped` 计数可见）、
   （`CounterContext.tokenizer`），但没有实现——P9 判定 T1 不能当主路径（3 个模型里 2 个
   根本没有 chat template），T2 的 GGUF 自建 BPE 没做。所以 `tokens` extra 装了也不生效，
   `onyx doctor` 会把这句话写在明面上。
-- 分段归因：`Σ(各分段) + template_ctl == 引擎计数`，残差与标定截距互验（P20/P21）
+- 分段归因：`Σ(各分段) + template_ctl == 引擎计数`，**这句只在没被 clamp 时成立**
+  （`template_ctl` 就是残差，所以相等在 1813/2299 条上是恒等式而不是验证通过，P25）。
+  残差与标定截距互验（P20/P21）；真机上"这一条按哪一档数的"记在
+  `trace.extra["attribution"]`（`count_source` / `clamped` / `residual_raw`），
+  `onyx token explain` 与看板都会把它印出来（S39）
 - 冷/热 prefill 分列（P11：合并聚合是谎话）、keep-alive 剩余、显存 offload 判定
 - 流式与非流式共用同一个 assembler；OpenAI 兼容分支同时吃 `delta` 与 `message`
 
@@ -219,10 +223,11 @@ WAL + 批量 sink（队列满丢样本但 `dropped` 计数可见）、
 同名覆盖可查（`↻内置`）、按 group 缓存但失败不缓存。
 两个样板包在 `plugins_example/`，`scripts/check_extension_boundary.py` 是第四道质量门。
 
-### 实测知识（`docs/PROBES.md`，P1–P24）
-24 条真机结论：缓存语义、thinking 计数、工具格式三态、标定方法、
+### 实测知识（`docs/PROBES.md`，P1–P25）
+25 条真机结论：缓存语义、thinking 计数、工具格式三态、标定方法、
 `/v1` 与原生计数差异、`stream_options.include_usage`、httpx deadline 传播、
-`/v1` 关不掉 thinking（P23）、兼容层计数在"只有它"时是唯一可信自报（P24）。
+`/v1` 关不掉 thinking（P23）、兼容层计数在"只有它"时是唯一可信自报（P24）、
+**生产库的 fitted 档一直是死的 ⇒ 分段闭合从未成立过（P25，含标定前后对照）**。
 未决：U7（27B 的 offload 落差）、U8（图片 token）、U9（`cached_tokens` 字段是否存在）。
 
 ---
@@ -230,18 +235,18 @@ WAL + 批量 sink（队列满丢样本但 `dropped` 计数可见）、
 ## 2. 质量门与规模
 
 ```
-uv run pytest            # 1801 passed, 1 skipped, 38 deselected（默认档就是离线套件，CI 用它量覆盖率。S32 三个文件 58 条 + S33 六个文件 60 条 + 样本重写与能力闸门 6 条；`test_task_contract.py` 41 → 49 条：多一个任务就多 8 条断言，一行任务专属逻辑都不用加。S33 只逼它泛化了一次——原来写死用 `Generation` 造样本，现在按任务自己 `build()` 的返回类型造。S35 加的 11 条：真 stdio 列的隔离/并发/迟到回答 +5（`test_tools_mcp_stdio.py` 7 → 12）、第五列（存在·出处·无豁免·起不来=未知）+3、覆盖率地板的钉子 +1、settle 与库里的顺序 +2。S36 加的 97 条：口径收敛 7、perf 的网格/语料/采集/落库 62、可比性契约 17、CLI 的"四条拒绝与三种读数" 11。S37 加的 16 条：`test_obs_timing.py` 13（事件→状态→落库，含"摘掉注册就会红"）+`test_streaming.py` 2（首字事件的发射时机与只发一次），外加一条文档结构检查（表格一行必须写完，S36 曾把 README 的进度表撑成 17 行）。S38 加的 41 条：`test_measurement_explain.py` 10（阶梯逐档状态/差值符号/闭合判定/标定还差几个样本）、`test_report_usage.py` 21（p50 只用唯一那份定义 + 阈值只用 `reconciler` 那一个常量 + CLI/API 同数 + `--since` 的 6 种坏写法与"不折 UTC 就丢边界那一发"的对照 + 三种渲染的数据行与「—」规则）、`test_cli_token_report.py` 10（退出码：不闭合 1、`--since 7d` 2、未知 trace 2 且给出下一步）
+uv run pytest            # 1815 passed, 1 skipped, 38 deselected（默认档就是离线套件，CI 用它量覆盖率。S32 三个文件 58 条 + S33 六个文件 60 条 + 样本重写与能力闸门 6 条；`test_task_contract.py` 41 → 49 条：多一个任务就多 8 条断言，一行任务专属逻辑都不用加。S33 只逼它泛化了一次——原来写死用 `Generation` 造样本，现在按任务自己 `build()` 的返回类型造。S35 加的 11 条：真 stdio 列的隔离/并发/迟到回答 +5（`test_tools_mcp_stdio.py` 7 → 12）、第五列（存在·出处·无豁免·起不来=未知）+3、覆盖率地板的钉子 +1、settle 与库里的顺序 +2。S36 加的 97 条：口径收敛 7、perf 的网格/语料/采集/落库 62、可比性契约 17、CLI 的"四条拒绝与三种读数" 11。S37 加的 16 条：`test_obs_timing.py` 13（事件→状态→落库，含"摘掉注册就会红"）+`test_streaming.py` 2（首字事件的发射时机与只发一次），外加一条文档结构检查（表格一行必须写完，S36 曾把 README 的进度表撑成 17 行）。S38 加的 41 条：`test_measurement_explain.py` 10（阶梯逐档状态/差值符号/闭合判定/标定还差几个样本）、`test_report_usage.py` 21（p50 只用唯一那份定义 + 阈值只用 `reconciler` 那一个常量 + CLI/API 同数 + `--since` 的 6 种坏写法与"不折 UTC 就丢边界那一发"的对照 + 三种渲染的数据行与「—」规则）、`test_cli_token_report.py` 10（退出码：不闭合 1、`--since 7d` 2、未知 trace 2 且给出下一步）。**S39 加的 14 条**：explain 的 clamp 分支 +8（未标定给命令 / 已标定不重复叫人标定 / 已标定还被 clamp 指向引擎截断 / 老行承认说不出原因 / 恒等式闭合不算验证 / 没有采信计数就判不了 / 建议不许被展开成单字符）、CLI +4（`traces show` 的条件句与 clamp 结论、归因档位 + 残差进 `--json`）、repo +1（速率列 NULL 而 token 的 0 仍是 0）、结构门禁 +1（全仓扫代码字符串：出现那句等式就必须同一行出现 `clamp`——把限定词删掉它真的红）
 uv run pytest -m e2e     # 12 passed（S34：六页取数同源 10 条 + SSE 真 HTTP 消费与"断链自检"2 条。默认档把它 deselect 了，CI 里是独立一步）
 uv run pytest -m live     # 22 passed（真打 qwen3.5:9b，与评测共用机器级 GPU 锁。S36 加了一条真机最小网格：断言引擎真的回报纳秒分段，且每个基线数字点得回真 trace；S37 加了一条流式的：`first_token_at` 与 `wall_ms − ttft_ms` 必须讲同一个故事，非流式那一发则断言代理值不冒充测量）
 uv run pytest -m probe     # 4 passed（P 系列实验的可重跑版本）
 uv run ruff check .         # All checks passed（`ruff format` 不是门禁）
 uv run lint-imports          # 3 contracts kept（网络例外 2 条：executors.http + sinks.otlp/alerts.webhook 合并在契约 2，每条写明是谁与为什么）
-uv run coverage run -m pytest -q && uv run coverage report   # 90% ≥ 85%（分支覆盖，离线套件，14,942 句 / 3,728 分支；S38 新文件里 `usage_report.py` 100%（95 句 / 26 分支全中）、`explain.py` 96%。**地板 S35 从 80 抬到 85**：80 配 90 的实测意味着一次 -10 个点的真实退化会全绿通过，而"门禁在守"看起来照样成立。比 S33 那次少 1 个点主要是 `tools/reference_mcp_server.py` 进了包——57 句里 48 句只在**子进程**里跑，父进程量不到；没有 omit 它，让"这里量不到"留在数字里比藏起来好）
+uv run coverage run -m pytest -q && uv run coverage report   # 90% ≥ 85%（分支覆盖，离线套件，14,977 句 / 3,744 分支；S38 新文件里 `usage_report.py` 100%（95 句 / 26 分支全中）、`explain.py` 99%（S39 补到 127 句，只差一条不可达分支）；S39 动的 `usage_repo.py` 100%。**地板 S35 从 80 抬到 85**：80 配 90 的实测意味着一次 -10 个点的真实退化会全绿通过，而"门禁在守"看起来照样成立。比 S33 那次少 1 个点主要是 `tools/reference_mcp_server.py` 进了包——57 句里 48 句只在**子进程**里跑，父进程量不到；没有 omit 它，让"这里量不到"留在数字里比藏起来好）
 uv run python scripts/check_extension_boundary.py   # 接入实现未触碰受保护内核文件（S30 因此把 RunReport 那条修复单独成一个提交）
 uv run onyx doctor            # 9 项体检（带网络 10 项）：配置 / Python / 可写 / 磁盘 / 迁移 / blob / 档位 / 告警 / 插件
 uv run onyx config show       # 每一项生效值标出来自 flag/环境/文件/默认哪一层（token 与 webhook URL 只报"已设置"）
 uv build && uv tool install --from dist/*.whl …  # 干净环境装起来：version / db init / chat(mock) / doctor 全通
-前端：tsc --noEmit / vitest 109（10 个文件）/ vite build（237.95KB js，gzip 77.55KB）+ 浏览器 take_snapshot
+前端：tsc --noEmit / vitest 116（10 个文件）/ vite build（238.87KB js，gzip 78.25KB）+ 浏览器 take_snapshot
 API：openapi 32 paths / 34 operations（含 `GET /api/stream` SSE）
 CI：.github/workflows/ci.yml 跑上面这些（本机已验证命令本身可跑通；仓库尚无远端 ⇒ 还没真跑过一次）
 ```
@@ -421,18 +426,23 @@ S23 在浏览器里真跑过：`--provider mock` 的 serve 上点「开始评测
   `on()`，需要改内核才修得好本身就是抽象不够用的信号。同一批换掉了
   `test_gateway_live.py` 里那句恒成立的断言（`x is None or x`），并补了一条流式正向断言
   （时刻必须落在 trace 窗口内）。历史行仍然是 NULL——回填它们等于伪造当时没测到的数。
-- **`Σ分段 + template_ctl = 引擎计数` 只在未 clamp 时成立，而文档一直写成无条件等式**
-  （S38 的 `token explain` 第一次跑就查出来的）：最新 200 条里有分段归因的 163 条**只有 2 条闭合**
+- ~~**`Σ分段 + template_ctl = 引擎计数` 被写成了无条件等式**~~ **S39 已修**（S38 的
+  `token explain` 第一次跑就查出来的）：最新 200 条里有分段归因的 163 条**只有 2 条闭合**
   （那 2 条是 in=17 的一元 chat，没什么可错）。形状很稳定：bench 两档分别 +30.7%（621 vs 475）与
   +30.8%（2490 vs 1903），eval 各条 +16~23% ⇒ 不是噪声，是归因计数器随 prompt 长度线性高估
   （这 161 条**全部**带着 `ATTRIBUTION_CLAMPED`，闭合的那 2 条一条都没有 ⇒ 检测一直有，
   缺的是把它讲给人听的入口）。
-  **根因已取证（S39 方案）**：库里 5 个模型的 `usage_ratio` 全是 NULL——**fitted 档从来没被标定过**，
-  于是分段一直按启发式数（比引擎高 31.6%），残差为负 ⇒ `parts.py` 按设计 clamp 成 0 ⇒ 不闭合。
-  真机对照：`onyx calibrate --model qwen3.5:9b --n 40`（0.693 tok/字、模板开销 10.62、R²=1.0、
-  最大相对误差 0.89%）之后同一条路径 ⇒ `✓ 闭合（求和 25 == 25）`、退出码 0。
-  ⇒ **修法不是缩放分段**（那会把"计数器高估"这个事实抹成自洽的假数），而是把等式写回它的条件、
-  让 `token explain` 点名"未标定 ⇒ clamp ⇒ 先 `onyx calibrate`"。历史行不回填。见 S39 方案。
+  **根因已取证并修好（S39）**：库里 5 个模型的 `usage_ratio` 全是 NULL——**fitted 档从来没被标定过**，
+  于是分段一直按启发式数（1.0 tok/汉字 vs 该模型实测 0.693），残差为负 ⇒ `parts.py` 按设计
+  clamp 成 0 ⇒ 不闭合。真机对照：`onyx calibrate --model qwen3.5:9b --n 40`
+  （0.693 tok/字、模板开销 10.62、R²=1.0、最大相对误差 0.89%，见 PROBES P25）之后同一条路径 ⇒
+  `✓ 闭合（求和 25 == 25）`、退出码 0。
+  ⇒ **修法不是缩放分段**（那会把"计数器高估"这个事实抹成自洽的假数），而是把等式写回它的条件
+  （`traces show` 与看板的标题现在都带"仅未 clamp 时成立"，并由一条结构断言守着）、
+  让 `token explain` 点名"哪一档数的 + 被 clamp + 该跑 `onyx calibrate`"，
+  并且**已标定之后不再叫人重复标定**（档位是当时的记录，档案是现在的状态，两者会不一致）。
+  **留下的边界**：标定之前那 161 行仍然不闭合——那是"当时按启发式数的"记录，
+  回填等于伪造当时的测量；库里还有 4 个模型没标定，`onyx doctor`「token 计量档位」每天提醒一次。
 - 非 ollama provider 的 `base_url` 目前仍记录 CLI `--url` 的默认值
   （修它要把散在 6 处的默认值提成常量并区分"用户没填"）。
 - `RECONCILED` 事件在契约与 `PAYLOAD_REQUIRED` 里存在、token visitor 也消费它，
@@ -474,10 +484,12 @@ S23 在浏览器里真跑过：`--provider mock` 的 serve 上点「开始评测
 4. ~~**`token explain` + `report usage`**：都属于"每天都在用但入口缺失"~~（**S38 已交付**：
    两个入口 + 一个 `report/usage_report.py` 的共同实现，CLI 与 `/api/usage/summary` 逐字段相等；
    `--since` 写错格式从"静默空表"改成退出码 2 / HTTP 400）。
-5. **S39（S38 查出，方案已定、待实现）**：分段归因不闭合的根因是**模型从未标定**（fitted 档是死的 ⇒
-   归因走启发式 ⇒ 高估 ⇒ clamp）。修法**不需要动内核**：`token explain` 点名"未标定 ⇒ clamp ⇒
-   `onyx calibrate`"、`traces show` 与看板的表头改成条件句，顺带把速率列的 `COALESCE(...,0)` 换成 NULL
-   并让前端折线在 NULL 处断线。**不缩放分段**——那等于把"计数器高估"抹成一个自洽的假数。
+5. ~~**S39（S38 查出）**：分段归因不闭合的根因是**模型从未标定**（fitted 档是死的 ⇒ 归因走启发式 ⇒
+   高估 ⇒ clamp）~~ **S39 已交付**：等式带回条件（一句扫全仓库代码字符串的断言守着）、
+   `token explain` 点名档位与残差并给出命令、速率列从 SQL 起就是 NULL 且折线在 NULL 处断线、
+   前后端统一成"精确相等才算闭合"。**不缩放分段**（那等于把"计数器高估"抹成一个自洽的假数），
+   历史行不回填。**还欠的那半件**：库里 4 个模型仍未标定（`doctor`「token 计量档位」会提醒），
+   以及真浏览器那一层（Playwright 仍为 0）。
 6. C 组三条一致性（`RECONCILED` 不发、`base_url` 默认值、兼容通道探针覆盖）适合凑成一次"口径一致性"清理。
 
 核对方式（本文数字的来源）：
