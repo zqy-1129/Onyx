@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import platform
 import sys
@@ -56,6 +57,8 @@ db_app = typer.Typer(help="数据库：迁移、体检、备份", no_args_is_hel
 app.add_typer(db_app, name="db")
 probe_app = typer.Typer(help="语义实测探针：把引擎行为变成可复现的结论", no_args_is_help=True)
 app.add_typer(probe_app, name="probe")
+perf_app = typer.Typer(help="吞吐/延迟基线：条件相同才可比，没测到不写 0", no_args_is_help=True)
+app.add_typer(perf_app, name="perf")
 
 
 @dataclass
@@ -3317,6 +3320,374 @@ def eval_report(
         typer.echo(text)
     finally:
         database.close()
+
+
+# ── perf：吞吐/延迟基线（S36）─────────────────────────────────────
+#: 并发上限。再高就是引擎的排队而不是模型的吞吐了，那种数字不该被当成"这台卡的能力"
+PERF_MAX_CONCURRENCY = 16
+
+
+def _perf_plan(
+    model: str, *, prompt_chars: str, target_tokens: str, concurrency: str,
+    repeat: int, cold: bool, budget_s: float, keep_alive: str,
+    num_ctx: int | None, temperature: float, seed: int | None, stream: bool,
+):
+    """把 flag 拼成网格。校验统一由 `BenchPlan` 做，异常在调用方转成退出码 2。"""
+    from onyx.perf.spec import MAX_TARGET_TOKENS, BenchPlan, parse_int_list
+
+    params: dict[str, object] = {"temperature": temperature}
+    if seed is not None:
+        params["seed"] = seed
+    return BenchPlan(
+        model=model,
+        prompt_chars=parse_int_list(prompt_chars, option="--prompt-chars"),
+        target_tokens=parse_int_list(target_tokens, option="--target-tokens",
+                                     hi=MAX_TARGET_TOKENS),
+        concurrency=parse_int_list(concurrency, option="--concurrency", hi=PERF_MAX_CONCURRENCY),
+        repeat=repeat, cold=cold, budget_s=budget_s, keep_alive=keep_alive,
+        stream=stream, num_ctx=num_ctx, params=params,
+    )
+
+
+@perf_app.command("run")
+def perf_run(
+    model: str = typer.Option(None, "--model", help="要测的模型名（必填）"),
+    prompt_chars: str = typer.Option("600,2400", "--prompt-chars",
+                                     help="prompt 长度档位，**汉字数**，逗号分隔"),
+    target_tokens: str = typer.Option("64,256", "--target-tokens", help="生成长度档位"),
+    concurrency: str = typer.Option("1", "--concurrency", help="并发路数档位，如 1,2,4"),
+    repeat: int = typer.Option(2, "--repeat", help="每格跑几批"),
+    cold: bool = typer.Option(False, "--cold", help="先卸载模型，额外测一发冷启动"),
+    budget_s: float = typer.Option(300.0, "--budget-s", help="总预算；用完的格子记「没测到」"),
+    keep_alive: str = typer.Option("10m", "--keep-alive", help="传给引擎的 keep_alive"),
+    num_ctx: int = typer.Option(None, "--num-ctx", help="上下文窗口（默认用引擎的）"),
+    temperature: float = typer.Option(0.0, "--temperature", help="基线要可复现，默认 0"),
+    seed: int = typer.Option(None, "--seed", help="固定采样种子（引擎支持时生效）"),
+    stream: bool = typer.Option(True, "--stream/--no-stream",
+                                help="默认流式：TTFT 只有流式才是真测量，非流式那是代理值"),
+    provider: str = typer.Option(None, "--provider", help="引擎种类（ollama / openai-compat）"),
+    url: str = typer.Option(None, "--url", help="引擎 base url"),
+    db: Path = typer.Option(None, "--db"),
+    device: str = typer.Option("", "--device",
+                               help="设备标注（本工具拿不到 GPU 名）。不填则跨机器对比不成立"),
+    lock_timeout: float = typer.Option(600.0, "--lock-timeout", help="等 GPU 锁的秒数"),
+    no_queue: bool = typer.Option(False, "--no-queue", help="锁被占时直接失败而不排队"),
+    gpu_lock_path: str = typer.Option(None, "--gpu-lock", help="锁文件（默认机器级那一个）"),
+    note: str = typer.Option("", "--note", help="给这条基线留一句人话"),
+    json_out: bool = typer.Option(False, "--json", help="机器可读输出"),
+) -> None:
+    """跑一组吞吐/延迟基线并落库。
+
+    三个"不做"：不接 mock（假延迟存成基线会污染以后每一次对比）、不自称冷启动
+    （拿不到卸载接口就把那一格记成没测到）、不在引擎报不出版本时假装可比。
+    """
+    import json as _json
+
+    from onyx.core.clock import utc_now_iso
+    from onyx.core.errors import GpuLockBusy
+    from onyx.core.meta import git_rev
+    from onyx.eval.gpu_lock import DEFAULT_GPU_STALE_AFTER_S, GpuLock, default_lock_path
+    from onyx.perf.bench import collect
+    from onyx.perf.report import outcome_to_rows, run_lines
+    from onyx.perf.spec import PerfSpecError
+    from onyx.store.repos import PerfRepo
+
+    cfg = _config()
+    kind = pick(provider, cfg.provider.kind, DEFAULT_PROVIDER_KIND)
+    if kind == "mock":
+        typer.echo("perf 拒绝跑 mock：假延迟一旦存成基线，以后每次 compare 都在跟它比。\n"
+                   "要验证命令形状请用测试（tests/unit/test_perf_*.py），"
+                   "要测真机请给 --provider ollama 或 openai-compat。", err=True)
+        raise typer.Exit(2)
+
+    try:
+        plan = _perf_plan(model or "", prompt_chars=prompt_chars, target_tokens=target_tokens,
+                          concurrency=concurrency, repeat=repeat, cold=cold, budget_s=budget_s,
+                          keep_alive=keep_alive, num_ctx=num_ctx, temperature=temperature,
+                          seed=seed, stream=stream)
+    except PerfSpecError as exc:
+        typer.echo(f"网格有问题：{exc}", err=True)
+        raise typer.Exit(2) from None
+
+    # sample_gpu=False：显存采样是每发之后多一次 /api/ps，它会混进基线的墙钟。
+    # 要看显存就去 trace 页（常规请求已经带 GPU_SAMPLE），别把它塞进测量路径。
+    runtime = _runtime(url, db, provider_kind=kind, sample_gpu=False)
+    lock_path = Path(pick(gpu_lock_path, cfg.gpu.lock_path) or default_lock_path())
+    lock = GpuLock(lock_path, owner=f"perf:{plan.model}",
+                   stale_after_s=pick(cfg.gpu.stale_after_s, DEFAULT_GPU_STALE_AFTER_S))
+    try:
+        if not json_out:
+            typer.echo(plan.warn_before_run())
+            typer.echo("数字只认引擎回报的纳秒分段；通道不回报的话吞吐列会是「—」而不是 0，"
+                       "跑完的条件里会写明 timing_source。")
+        try:
+            lock.acquire(timeout=0.0 if no_queue else lock_timeout)
+        except GpuLockBusy as exc:
+            typer.echo(str(exc), err=True)
+            eta = exc.detail.get("eta_s")
+            typer.echo(f"[i] {exc.detail.get('owner')} 进度 {exc.detail.get('progress')}，"
+                       f"预计还需 {'未知' if eta is None else f'{eta:.0f}s'}；"
+                       "--no-queue 可以不排队直接失败", err=True)
+            raise typer.Exit(3) from None
+
+        provider_obj = runtime.gateway.provider
+        unload = getattr(provider_obj, "unload", None)
+        started_at = utc_now_iso()
+        outcome = collect(
+            runtime.gateway, plan, device=device,
+            unload=unload if callable(unload) else None,
+            engine_info={"provider_id": str(getattr(provider_obj, "id", "") or ""),
+                         "version": _engine_version(provider_obj),
+                         "quantization": _model_quantization(provider_obj, plan.model),
+                         "app_version": __version__, "git_rev": git_rev()},
+            on_progress=(None if json_out else
+                         lambda done, total, key: typer.echo(f"  [{done}/{total}] {key}")),
+        )
+        finished_at = utc_now_iso()
+
+        repo = PerfRepo(runtime.db)
+        run, cell_records = outcome_to_rows(outcome, run_id=repo.new_id(),
+                                            started_at=started_at, finished_at=finished_at,
+                                            note=note)
+        repo.insert_run(run)
+        repo.insert_cells(cell_records)
+
+        if json_out:
+            typer.echo(_json.dumps({"run_id": run.id, **outcome.as_dict()},
+                                   ensure_ascii=False, indent=2, default=str))
+        else:
+            typer.echo(f"\n基线已落库：{run.id}")
+            for line in run_lines(outcome):
+                typer.echo(line)
+            missing = [item for item in outcome.unmeasured]
+            if missing:
+                typer.echo(f"\n还欠 {len(missing)} 格：")
+                for item in missing:
+                    typer.echo(f"  · {item.cell.key}：{item.reason or item.status}")
+            peers = repo.find_by_env(run.env_hash, before=run.id)
+            if peers:
+                typer.echo(f"\n同条件的上一次：onyx perf compare {peers[0].id} {run.id}")
+            else:
+                typer.echo("\n这是这个条件下第一条基线（下次跑就能比了）")
+        raise typer.Exit(0 if outcome.status == "done" else 1)
+    finally:
+        with contextlib.suppress(Exception):
+            lock.release()
+        runtime.close()
+
+
+@perf_app.command("ls")
+def perf_ls(
+    model: str = typer.Option(None, "--model"),
+    limit: int = typer.Option(20, "--limit"),
+    db: Path = typer.Option(None, "--db"),
+    json_out: bool = typer.Option(False, "--json"),
+) -> None:
+    """列出历史基线。`可比` 那一列是"这次到底认不认得出自己在测什么"。"""
+    import json as _json
+
+    from onyx.store.repos import PerfRepo
+
+    database = Database(_db_path(_settings(), db))
+    try:
+        runs = PerfRepo(database).list_runs(model=model, limit=limit)
+        if json_out:
+            typer.echo(_json.dumps([{
+                "id": item.id, "started_at": item.started_at, "model": item.model,
+                "status": item.status, "n_requests": item.n_requests,
+                "env_hash": item.env_hash, "comparable": item.comparable,
+                "timing_source": item.timing_source, "note": item.note,
+            } for item in runs], ensure_ascii=False, indent=2, default=str))
+            return
+        if not runs:
+            typer.echo("还没有基线：onyx perf run --model …")
+            raise typer.Exit(1)
+        typer.echo(f"{'id':<28} {'何时':<20} {'模型':<22} {'状态':<8} {'发':>4} "
+                   f"{'指纹':<10} 可比 时序出处")
+        for item in runs:
+            typer.echo(f"{item.id:<28} {item.started_at[:19]:<20} {item.model[:22]:<22} "
+                       f"{item.status:<8} {item.n_requests:>4} {item.env_hash[:10]:<10} "
+                       f"{'是' if item.comparable else '否':<4} {item.timing_source}")
+    finally:
+        database.close()
+
+
+@perf_app.command("show")
+def perf_show(
+    run_id: str = typer.Argument(...),
+    db: Path = typer.Option(None, "--db"),
+    json_out: bool = typer.Option(False, "--json"),
+) -> None:
+    """一条基线的全貌：条件 + 每格数字 + 能点回去的 trace。"""
+    import json as _json
+
+    from onyx.perf.report import record_lines
+    from onyx.store.repos import PerfRepo, TraceRepo
+
+    database = Database(_db_path(_settings(), db))
+    try:
+        repo = PerfRepo(database)
+        run = repo.get_run(run_id)
+        if run is None:
+            typer.echo(f"没有这条基线：{run_id}", err=True)
+            typer.echo("用 onyx perf ls 看有哪些。", err=True)
+            raise typer.Exit(2)
+        cells = repo.cells(run_id)
+        if json_out:
+            typer.echo(_json.dumps({
+                "run": {k: getattr(run, k) for k in (
+                    "id", "started_at", "finished_at", "status", "model", "provider_id",
+                    "engine_version", "quantization", "device", "num_ctx", "keep_alive",
+                    "stream", "timing_source", "env_hash", "comparable", "conditions", "grid",
+                    "elapsed_s", "n_requests", "app_version", "git_rev", "note")},
+                "cells": [{
+                    "key": item.cell_key, "status": item.status, "reason": item.reason,
+                    "n_requests": item.n_requests, "n_measured": item.n_measured,
+                    "metrics": item.metrics, "trace_ids": list(item.trace_ids),
+                } for item in cells],
+                # 有多少 trace 还能点开：0 不代表数字错，代表证据被保留策略摘走了
+                "traces_still_present": sum(
+                    1 for item in cells for tid in item.trace_ids
+                    if TraceRepo(database).get(tid) is not None),
+            }, ensure_ascii=False, indent=2, default=str))
+            return
+        for line in record_lines(run, cells):
+            typer.echo(line)
+        missing = [item for item in cells if item.status != "measured"]
+        if missing:
+            typer.echo(f"\n这条件下一共 {len(cells)} 格，{len(missing)} 格没测到（上面每行都写了为什么）")
+    finally:
+        database.close()
+
+
+@perf_app.command("compare")
+def perf_compare(
+    left: str = typer.Argument(..., help="基线 id（当作甲/上一次）"),
+    right: str = typer.Argument(..., help="基线 id（当作乙/这一次）"),
+    db: Path = typer.Option(None, "--db"),
+    force: bool = typer.Option(False, "--force", help="条件不同时也硬比（把警告印在结果头上）"),
+    json_out: bool = typer.Option(False, "--json"),
+) -> None:
+    """两条基线逐格对比。**条件指纹不同就拒绝**，并列出到底哪几个字段不同。
+
+    "换个模型再比一次，数字涨了"这种事没有人会怀疑，因为差值本身看着完全自洽。
+    所以这里不给一个"仅供参考"的数，而是先问"这两个数是同一个实验吗"。
+    """
+    import json as _json
+
+    from onyx.perf.bench import diff_conditions
+    from onyx.store.repos import PerfRepo
+
+    database = Database(_db_path(_settings(), db))
+    try:
+        repo = PerfRepo(database)
+        a, b = repo.get_run(left), repo.get_run(right)
+        if a is None:
+            typer.echo(f"没有甲那条基线：{left}", err=True)
+            raise typer.Exit(2)
+        if b is None:
+            typer.echo(f"没有乙那条基线：{right}", err=True)
+            raise typer.Exit(2)
+        diffs = diff_conditions(a.conditions, b.conditions)
+        payload = {"left": a.id, "right": b.id, "env_hash": [a.env_hash, b.env_hash],
+                   "diffs": diffs, "cells": []}
+        if diffs and not force:
+            typer.echo("这两条不是同一个实验，不给你差值：", err=True)
+            for item in diffs:
+                typer.echo(f"  · {item['field']}：甲={item['a'] if item['a'] not in (None, '') else '—'}"
+                           f" / 乙={item['b'] if item['b'] not in (None, '') else '—'}", err=True)
+            typer.echo("确认过这些差异你都要看，就加 --force（结果头上会印着这句话）。", err=True)
+            if json_out:
+                typer.echo(_json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+            raise typer.Exit(1)
+        if not (a.comparable and b.comparable):
+            typer.echo("⚠ 至少一边认不出引擎身份（provider/版本/量化有空的），"
+                       "这两条可能来自不同引擎而指纹相同。", err=True)
+
+        cells_a = {item.cell_key: item for item in repo.cells(a.id)}
+        cells_b = {item.cell_key: item for item in repo.cells(b.id)}
+        rows = _perf_diff_rows(cells_a, cells_b)
+        payload["cells"] = rows
+        if json_out:
+            typer.echo(_json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+            raise typer.Exit(0)
+        if diffs:
+            typer.echo(f"（--force：有 {len(diffs)} 个条件字段不同，见上）")
+        if not rows:
+            typer.echo("没有可比的格子（两边都没有 measured 的同名格）")
+            raise typer.Exit(1)
+        for row in rows:
+            typer.echo(_perf_diff_line(row))
+        only = sorted(set(cells_a) ^ set(cells_b))
+        if only:
+            typer.echo(f"只在一边出现的格子：{', '.join(only[:6])}"
+                       + ("…" if len(only) > 6 else ""))
+    finally:
+        database.close()
+
+
+#: compare 看这几列。每列都带 n，n 小的那一行会被标出来
+PERF_DIFF_METRICS: tuple[str, ...] = ("decode_tps", "aggregate_tps", "ttft_ms", "wall_ms")
+PERF_LOW_N = 5
+
+
+def _perf_diff_rows(cells_a: dict, cells_b: dict) -> list[dict]:
+    """同名、两边都 measured 的格子才给差值。"""
+    rows: list[dict] = []
+    for key in sorted(set(cells_a) & set(cells_b)):
+        item_a, item_b = cells_a[key], cells_b[key]
+        if item_a.status != "measured" or item_b.status != "measured":
+            continue
+        changes: dict[str, dict[str, object]] = {}
+        for metric in PERF_DIFF_METRICS:
+            first = (item_a.metrics.get(metric) or {}).get("median")
+            second = (item_b.metrics.get(metric) or {}).get("median")
+            if not isinstance(first, (int, float)) or not isinstance(second, (int, float)) \
+                    or not first:
+                continue
+            changes[metric] = {
+                "a": first, "b": second, "delta": second - first,
+                "pct": (second - first) / first * 100.0,
+                "n": (item_b.metrics.get(metric) or {}).get("n"),
+            }
+        rows.append({"key": key, "changes": changes})
+    return rows
+
+
+def _perf_diff_line(row: dict) -> str:
+    changes = row["changes"]
+    if not changes:
+        return f"{row['key']:<26} 两边都没有可比的数（吞吐列全是「—」？）"
+    parts = []
+    for metric, value in changes.items():
+        arrow = "→"
+        parts.append(f"{metric} {value['a']:.1f}{arrow}{value['b']:.1f} "
+                     f"({value['pct']:+.1f}%{', n<5' if (value['n'] or 0) < PERF_LOW_N else ''})")
+    return f"{row['key']:<26} " + " | ".join(parts)
+
+
+def _engine_version(provider: object) -> str:
+    """问引擎要版本；问不出来就是空串（**空串是"不知道"，不是"没有版本"**）。"""
+    info = getattr(provider, "info", None)
+    if not callable(info):
+        return ""
+    try:
+        return str(getattr(info(), "version", "") or "")
+    except Exception:  # noqa: BLE001 - 版本问不出来不该让整条命令失败
+        return ""
+
+
+def _model_quantization(provider: object, model: str) -> str:
+    listing = getattr(provider, "list_models", None)
+    if not callable(listing):
+        return ""
+    try:
+        for card in listing():
+            if model in {getattr(card, "name", ""), getattr(card, "model", "")}:
+                return str(getattr(card, "quantization", "") or "")
+    except Exception:  # noqa: BLE001 - 同上：拿不到就留空
+        return ""
+    return ""
 
 
 def _force_utf8_stdio() -> None:
