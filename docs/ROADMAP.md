@@ -201,9 +201,11 @@ BFCL 导入器、配对回归与矩阵，外加两条**跨任务**的门禁：
   预算用完留 `partial` + "欠哪几格"。真机第一条：qwen3.5:9b @ 0.35.1，decode 30.5–32.0 t/s，
   并发 2 时 TTFT 125ms → 1242/2248ms 而单请求 decode 几乎不掉 ⇒ "只看一个数"会把首字慢十倍读成吞吐没变
 - ⬜ i18n 抽取：挂在"是否对外发行"上（ROADMAP §3 的并行/裁剪建议里明确它可以长期搁置）
-- ⬜ **S37（S36 查出的缺陷结案）**：`usage.ttft_ms` 与 `trace.first_token_at` 从来没有写入方
-  （真机 2318 条 usage 全 NULL），修法是一个新的时序 visitor（不碰受保护内核），
-  并把 `test_gateway_live.py` 里那条恒真断言换成会响的。方案见 `IMPLEMENTATION.md` 的 S37
+- ✅ **S37（S36 查出的缺陷，已结案）**：`usage.ttft_ms` 与 `trace.first_token_at` 的写入方补上了
+  （新增 `obs/visitors/timing.py`，**没有改内核**：引擎早就把事件广播给所有 visitor）。
+  非流式的 `prompt_eval_duration` 代理值不充当测量，只记出处（`usage.extra.ttft_source`）。
+  接上之后还查出第二半：`FIRST_TOKEN` 原本是流结束时的补发事件，于是"时刻"记的是"我们想起要记"
+  而不是"首字到达" ⇒ 发射点移回首包，并用 `finished − first_token ≈ wall − ttft` 这条断言钉住
 
 **这条边界要说清，别让"e2e 全绿"被读成"界面没问题"**：本仓库没有浏览器驱动，
 所以渲染本身仍靠手工 `take_snapshot`。S34 覆盖的是"页面取的那份数据"，

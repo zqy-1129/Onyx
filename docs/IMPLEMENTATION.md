@@ -2966,7 +2966,7 @@ uv run ruff check . && uv run lint-imports                    # 全过 · 3 cont
 
 ---
 
-## S37 — TTFT 接上写入方（观测时序 visitor）
+## S37 — TTFT 接上写入方（观测时序 visitor）✅
 
 **为什么单独成步**：S36 查出"看板的 TTFT 恒为「—」"不是通道限制而是**没有写入方**
 （真机 2318 条 usage 行 `ttft_ms` 全 NULL、`trace.first_token_at` 全 NULL），
@@ -3028,6 +3028,44 @@ uv run ruff check . && uv run lint-imports && uv run python scripts/check_extens
 `test(obs): 事件→状态→落库三段与"注册被摘掉会红"的自检`
 `docs: TTFT 缺陷结案 —— 从"通道限制"改回"曾经没有写入方"`
 
+**实测（接上之后才发现"接上"只完成了一半）**
+真机流式那一发（`01M47XA2ZZRDTDV4NFRJ7NKW4G`，冷载入所以 ttft=8250ms）先给出了对的时长，
+但 `first_token_at` 落下来是 `finished_at` 前 2ms —— 因为 `FIRST_TOKEN` 一直是
+**流结束时由 `emit_final_events` 补发**的。事件墙钟时刻记的于是不是"第一个字什么时候到"，
+而是"我们什么时候想起要记"。⇒ 把发射点移回它发生的时刻（`llm/streaming.py` 的首包分支），
+`emit_final_events` 只在没人发过时才发（非流式那条代理路径不变），并加一条断言把语义钉住：
+`finished − first_token` 必须约等于 `wall − ttft`（旧行为下这条会差出整段生成时间）。
+纯逻辑侧也补了两条：一条首字事件、且它排在最后的文本增量之前（`test_streaming.py`）。
+
+真机三条读数（`.data` 里的新行，历史行**不回填**——那等于伪造当时没测到的数）：
+```
+01M47WXS8S5B…  stream=1  ttft_ms=7860.0   first_token_at=06:03:24.269   ttft_source=measured
+01M47WYYF0CQ…  stream=0  ttft_ms=NULL     first_token_at=NULL           ttft_source=proxy:prompt_eval_duration
+01M47VS1R1W97… stream=1  ttft_ms=NULL     first_token_at=NULL           ttft_source=NULL   ← 修复前的行，仍然是空
+```
+`onyx chat --model qwen3.5:9b --stream …` 的 TTFT 现在印 `7860.0ms` 而不是「—」，
+`prefill 模式 cold` 与 `COLD_LOAD` 异常同时在场（冷载入的 TTFT 里含模型载入，这一点由
+`prefill_mode`/`load_ms` 分列保证，不需要把数字改小）。
+`obs/visitors/timing.py` 分支覆盖 100%，`obs/state.py` 100%。
+
+**与计划的偏差（一条，值得记）**：计划里写"修法不动内核、只加一个 visitor"——**结论对，但过程不完整**。
+visitor 接上之后字段仍然记着错的时刻，真正的修法还要动事件的发射点。教训是：
+"谁写这个字段"问完之后还要问"它写的那一刻是不是它说的那一刻"，
+否则接上了一个来源本身就错的事件，只是把一个 NULL 换成了一个看起来合理的假数。
+
+**本机验证**
+```bash
+uv run pytest tests/unit/test_obs_timing.py tests/unit/test_streaming.py -q   # 全过（含摘掉注册会红那条）
+uv run pytest tests/integration/test_gateway_live.py -m live                  # 3 passed：非流式代理值不冒充 + 流式时刻与时长对齐
+uv run onyx chat --model qwen3.5:9b --stream "用一句话解释什么是 KV 缓存"       # TTFT 有数（7860ms，冷载入）
+uv run coverage run -m pytest -q && uv run coverage report                    # ≥85 地板，timing 100%
+uv run ruff check . && uv run lint-imports && uv run python scripts/check_extension_boundary.py --staged
+```
+**DoD 核对**：① 新流式行 `usage.ttft_ms` 与 `trace.first_token_at` 都非空 ✓；
+② CLI/看板的 TTFT 不再是「—」✓；③ 非流式留空且 `usage.extra.ttft_source` 说明为什么空 ✓；
+④ 摘掉 `builtin_visitors()` 里的 timing ⇒ 端到端那条红（测试里就带着这个注入） ✓；
+⑤ 五道门全绿 ✓。
+
 ---
 
 ## 附录 A — 每步自测速查
@@ -3071,6 +3109,7 @@ uv run ruff check . && uv run lint-imports && uv run python scripts/check_extens
 | 门禁 | `make coverage`（`coverage run -m pytest -q`） | 离线套件分支覆盖率 ≥ 85%（S17 落地时 88%，S21 后 89%，M10 后 90%，S30–S33 后 91%，S35 起地板抬到 85 / 实测 90%——第五列的参考 server 只在子进程里跑，48 句量不到且**不做 omit**） |
 | S35 | `uv run onyx tools contract` + `uv run pytest tests/unit/test_tools_mcp_stdio.py` | 5 列且 `mcp_stdio 通过 8 · 失败 0 · 不适用 0`（真子进程，连跑两次一致）；把 `mcp_stdio` 的样本换成起不来的命令 ⇒ 那一列变 `unavailable` 带原因而其余四列照旧；`_request` 去掉会话锁 ⇒ 并发那条测试 5 次里 4 次红 |
 | S36 | `uv run onyx perf run --model qwen3.5:9b --prompt-chars 600,2400 --target-tokens 64 --concurrency 1,2 --repeat 1 --device rtx4060ti-16g` + `onyx perf compare A B` + `uv run pytest -m live tests/integration/test_perf_live.py` | 基线落库且 `状态 done`、指纹可复现（同参数两次跑出同一个 `env_hash`）；换网格的第三条与第一条比 ⇒ **退出码 1 并逐字段列出 `grid`**，加 `--force` 才给差值且结果头上印警告；`--provider mock` 退出码 2；真机那条断言 `timing_source == engine_ns` 且每个数字点得回真 trace；把 `FINGERPRINT_FIELDS` 里删掉任一字段 ⇒ 契约测试点名那个字段红 |
+| S37 | `uv run pytest tests/unit/test_obs_timing.py tests/unit/test_streaming.py -q` + `uv run onyx chat --model … --stream …` + `uv run pytest tests/integration/test_gateway_live.py -m live` | 流式那一发：CLI 表里 TTFT 有数（不再是「—」）、库里 `usage.ttft_ms` 与 `trace.first_token_at` 同时非空且 `ttft_source=measured`、且 `finished − first_token ≈ wall − ttft`（旧行为差整段生成时间）；非流式那发留空但写明 `proxy:prompt_eval_duration`；把 `timing` 从注册表摘掉 ⇒ 落库那条必须变回空 |
 
 ## 附录 B — 架构自测（让"模块化"可验证，而非口号）
 

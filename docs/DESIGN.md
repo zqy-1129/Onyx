@@ -43,7 +43,7 @@
 ┌─ L6 呈现  api/(FastAPI+SSE)  web/(Vite+React+TS)  report/(md|csv|html 导出)
 ├─ L5 评测  eval/{task,datasets,tasks,graders,metrics,runner,compare}
 ├─ L4 工具  tools/{spec,registry,executors,sandbox,loop,contract}
-├─ L3 观测  obs/visitors/{token,tool,anomaly,gpu,cost}   probe/(能力与行为实测)
+├─ L3 观测  obs/visitors/{token,tool,anomaly,gpu,cost,timing}   probe/(能力与行为实测)
 ├─ L2 适配  llm/providers/{ollama,openai_compat,mock}     ← 唯一允许发 HTTP 的层
 ├─ L1 内核  llm/{gateway,request,response,params,streaming,measurement}  ← 稳定契约
 └─ L0 领域  core/{types,ids,clock,event,errors,content}   store/{db,migrations,repos,sinks}
@@ -80,7 +80,7 @@ Onyx/
           providers/base.py  providers/ollama/{client,native,openai_compat,lifecycle,tokenizer,template}.py
           providers/openai_compat.py  providers/mock.py
           measurement/{reconciler,fidelity,parts,heuristic,calibrate}.py
-    obs/  engine.py  visitors/{token,tool,anomaly,gpu,cost}.py  anomalies.py
+    obs/  engine.py  visitors/{token,tool,anomaly,gpu,cost,timing}.py  anomalies.py
     probe/ usage_fields.py  cache.py  stream_usage.py  think.py  tool_format.py  structured.py
     tools/ spec.py  registry.py  sandbox.py  loop.py  contract.py
           executors/{python_fn,http,mcp,ollama_builtin,mock_replay}.py
@@ -541,7 +541,7 @@ CONTRACT_VERSION = 1
 |---|---|---|
 | `trace_start` | kind, purpose, provider, model, params, messages_ref, tools_ref | gateway |
 | `model_load` | load_duration_ns, cold(bool) | adapter |
-| `first_token` | ttft_ms | streaming |
+| `first_token` | ttft_ms（非流式另带 `proxy`）| streaming —— **首包到达那一刻**发；非流式没有这个量，只发代理值并标注，消费方（visitors/timing）不得把它当测量 |
 | `text_delta` / `thinking_delta` | text, seq | streaming |
 | `tool_call_delta` | idx, name_fragment, args_fragment | streaming |
 | `generation_end` | finish_reason, output_ref, raw_ref | adapter |

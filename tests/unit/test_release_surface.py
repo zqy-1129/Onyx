@@ -104,6 +104,30 @@ def test_ci_does_not_claim_to_run_engine_dependent_tiers(workflow_text: str):
     assert "不在 CI 跑" in workflow_text, "要显式写出这两档为什么不在这里跑"
 
 
+def test_markdown_tables_have_one_line_per_row():
+    """GFM 的表格一行必须一行写完：不以 `|` 收尾的那一行会把整行截断成半张表。
+
+    这不是排版洁癖。S36 给 README 的 M12 行追加内容时把它撑成了 17 行，
+    于是"进度表"从那一行开始不再渲染成表——而 markdown 的差异在 diff 里完全看不出来，
+    预览里也只是"少了一行"，很容易被当成渲染器的怪事。
+    """
+    problems: list[str] = []
+    for name in ("README.md", "docs/STATUS.md", "docs/ROADMAP.md", "docs/DESIGN.md",
+                 "docs/IMPLEMENTATION.md", "CHANGELOG.md"):
+        text = (ROOT / name).read_text(encoding="utf-8")
+        inside_fence = False
+        for number, line in enumerate(text.split("\n"), start=1):
+            stripped = line.rstrip()
+            if stripped.startswith("```"):
+                inside_fence = not inside_fence   # 代码块里的 ASCII 表不受本条约束
+                continue
+            if inside_fence:
+                continue
+            if stripped.startswith("|") and not stripped.endswith("|"):
+                problems.append(f"{name}:{number}: 这一行以 `|` 开头但不以 `|` 收尾")
+    assert not problems, "表格行被换行拆断了：\n  " + "\n  ".join(problems[:8])
+
+
 def test_makefile_exposes_the_coverage_gate():
     make = (ROOT / "Makefile").read_text(encoding="utf-8")
 

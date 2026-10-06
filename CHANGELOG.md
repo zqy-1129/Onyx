@@ -20,7 +20,9 @@
 ## [Unreleased]
 
 M9（操作闭环）、M10（观测触达）与 **M11（评测资产，S30–S33 全部达成）**已完成，
-M12（防倒退）走完两步（S34 的 e2e、S35 的覆盖率地板 + 契约矩阵真 stdio 列），只剩 S36 的性能基线。
+M12（防倒退）走完四步：S34 的六页 e2e、S35 的覆盖率地板 + 契约矩阵真 stdio 列、
+S36 的 `onyx perf` 性能基线、S37 给 TTFT 接上写入方（S36 查出的缺陷）。
+G6 现在只剩真浏览器驱动（Playwright）与可长期搁置的 i18n。
 M9 的主线是"不发一句命令就能完成一次评测"，
 M10 的主线是"出事的时候它会主动找你"，M12 的第一步是"以上这些不会再被悄悄改回去"，
 M11 的主线是"新任务有一套固定的验收形状，而不是每次现编"——而且**考卷本身要能被测出自洽**，
@@ -257,15 +259,28 @@ M11 的主线是"新任务有一套固定的验收形状，而不是每次现编
 
 ### Fixed
 
-- **看板的 TTFT 一直是「—」，而原因不是"兼容通道没有分段时序"（S36 查出，缺陷本身已登记未修）**。
-  真机库里 **2318 条 usage 行的 `ttft_ms` 全是 NULL**，`trace.first_token_at` 同样全 NULL：
-  provider 确实算出了 TTFT（流式实测 218ms）并发出 `FIRST_TOKEN` 事件，
-  而观测层**没有任何 visitor 消费它**，于是 `TraceState.ttft_ms` 从来没有写入方，
-  `latency_summary()` 从状态里取到的永远是 None。STATUS 之前把「—」解释成
-  "非 ollama 通道才没有"，那是把缺陷读成了限制。
-  修法在受保护内核（`obs/engine.py` / token visitor），按边界纪律必须单独成步 ⇒ 已写进
-  STATUS 已知缺陷与 ROADMAP 待办。`onyx perf` 先取请求侧的原始值（`generation.ttft_ms`），
-  并留下一条会响的哨兵测试：观测层修好后两路都有值它仍过，谁把这一路改回"只信聚合视图"就红。
+- **TTFT 现在有写入方了：看板的「首字延迟」不再是恒空的「—」（S37）**。
+  `FIRST_TOKEN` 事件从项目第一天起就在发（`core/event.py` 的载荷契约里写着），provider 也算得出
+  首字时刻，gateway 也把它转进了观测——但**没有任何 visitor 接它**，于是 `usage.ttft_ms` 与
+  `trace.first_token_at` 从来没有被写过（真机 2318 条 usage 行全 NULL）。
+  更糟的是文档一直把这一栏的「—」解释成"兼容通道没有分段时序"，**把一个缺失的字段读成了引擎的限制**，
+  于是没有人再去追问。
+  修法是新增一个 `timing` visitor（engine 早就把每个事件发给所有 visitor 的 `on()`，
+  需要改内核才修得好本身就是抽象不够用的信号）。两条口径跟着定下：
+  **非流式请求不发放行证**——它的 `FIRST_TOKEN` 带的是 `prompt_eval_duration` 代理值，
+  那种请求根本没有"首字时间"这个量，所以 `ttft_ms` 保持空并把出处写进 `usage.extra.ttft_source`
+  （`measured` / `proxy:…` / `absent`），空着也能被说清为什么空；**只认第一次**，
+  重放与后续首包不得覆盖首个时刻。
+  同批换掉 `test_gateway_live.py` 里那句 `assert first_token_at is None or first_token_at`
+  ——恒成立的断言不是测试，并补了一条流式正向断言（时刻必须落在 trace 自己的窗口内）。
+  历史行仍是 NULL：回填它们等于伪造当时没测到的数。
+- **查清并纠正一句错话：TTFT 的「—」不是通道限制，而是没有人写它（S36 查出，S37 结案）**。
+  真机库里 **2318 条 usage 行的 `ttft_ms` 全是 NULL**，`trace.first_token_at` 同样全 NULL。
+  STATUS 原文把「—」解释成"非 ollama 通道才没有"，那是把一个缺失的字段读成了引擎的限制——
+  而"限制"是不用修的，这句话让这个问题又活了很久。
+  原本预估修法要动受保护内核（`obs/engine.py` / token visitor），实际发现**不需要**：
+  引擎早就把每个事件发给所有 visitor 的 `on()`，加一个 `timing` visitor 就够
+  （见上一条 S37）。如果真得改内核才修得好，那本身就是抽象不够用的信号——这条也写进了 S37 方案。
 - **同一个量有两处实现的地方收敛成一处（S36 前置）**：分位数（`eval/metrics._percentile` 与
   标定、基线要用的中位数与 P95）现在只在 `llm/measurement/stats.py` 有一份；
   "正文的 token 下限"（长上下文用它判截断、基线用它判引擎裁切）收进

@@ -46,9 +46,15 @@ WAL + 批量 sink（队列满丢样本但 `dropped` 计数可见）、
 - 流式与非流式共用同一个 assembler；OpenAI 兼容分支同时吃 `delta` 与 `message`
 
 ### L3 观测 `onyx/obs/`
-5 个内建 visitor（token / tool / gpu / cost / anomaly，**顺序即契约**）+ 外部插件 visitor；
+6 个内建 visitor（token / tool / gpu / **timing** / cost / anomaly，**顺序即契约**）+ 外部插件 visitor；
 23 种异常码统一码表（前端文案与 CLI 同源）；
 有界状态 + TRACE_END 缺失时按容量淘汰（宁可丢一条观测也不 OOM）。
+- **TTFT 有写入方了（S37）**：`FIRST_TOKEN` 事件从项目第一天就在发，却没有任何 visitor 接它
+  ⇒ `usage.ttft_ms` 与 `trace.first_token_at` 恒为 NULL（真机 2318 条 usage 全空），
+  而文档把「—」解释成"兼容通道没有分段时序"——**把缺失的字段读成了引擎的限制**。
+  现在 `timing` visitor 一次接两个表达（时长 + 时刻），并且**只认测出来的值**：
+  非流式请求那个 `prompt_eval_duration` 代理值不充当测量，只把出处写进 `usage.extra.ttft_source`
+  （measured / proxy:… / absent），于是空着的那一格也能被说清为什么空。
 - **告警 `obs/alerts/`（M10）**：`rules` 是纯函数（窗口 / 阈值 / cooldown / 计数下限），
   `channels` 把投递失败收成结果而不抛异常，`service` 是 serve 里的轮询线程。
   判据**读库**（`anomaly` + `alert_trigger`）而不是读进程内计数 ⇒ 重启不重复轰炸也不忘记已发；
@@ -221,9 +227,9 @@ WAL + 批量 sink（队列满丢样本但 `dropped` 计数可见）、
 ## 2. 质量门与规模
 
 ```
-uv run pytest            # 1745 passed, 1 skipped, 37 deselected（默认档就是离线套件，CI 用它量覆盖率。S32 三个文件 58 条 + S33 六个文件 60 条 + 样本重写与能力闸门 6 条；`test_task_contract.py` 41 → 49 条：多一个任务就多 8 条断言，一行任务专属逻辑都不用加。S33 只逼它泛化了一次——原来写死用 `Generation` 造样本，现在按任务自己 `build()` 的返回类型造。S35 加的 11 条：真 stdio 列的隔离/并发/迟到回答 +5（`test_tools_mcp_stdio.py` 7 → 12）、第五列（存在·出处·无豁免·起不来=未知）+3、覆盖率地板的钉子 +1、settle 与库里的顺序 +2。S36 加的 97 条：口径收敛 7、perf 的网格/语料/采集/落库 62、可比性契约 17、CLI 的"四条拒绝与三种读数" 11）
+uv run pytest            # 1760 passed, 1 skipped, 38 deselected（默认档就是离线套件，CI 用它量覆盖率。S32 三个文件 58 条 + S33 六个文件 60 条 + 样本重写与能力闸门 6 条；`test_task_contract.py` 41 → 49 条：多一个任务就多 8 条断言，一行任务专属逻辑都不用加。S33 只逼它泛化了一次——原来写死用 `Generation` 造样本，现在按任务自己 `build()` 的返回类型造。S35 加的 11 条：真 stdio 列的隔离/并发/迟到回答 +5（`test_tools_mcp_stdio.py` 7 → 12）、第五列（存在·出处·无豁免·起不来=未知）+3、覆盖率地板的钉子 +1、settle 与库里的顺序 +2。S36 加的 97 条：口径收敛 7、perf 的网格/语料/采集/落库 62、可比性契约 17、CLI 的"四条拒绝与三种读数" 11。S37 加的 16 条：`test_obs_timing.py` 13（事件→状态→落库，含"摘掉注册就会红"）+`test_streaming.py` 2（首字事件的发射时机与只发一次），外加一条文档结构检查（表格一行必须写完，S36 曾把 README 的进度表撑成 17 行）
 uv run pytest -m e2e     # 12 passed（S34：六页取数同源 10 条 + SSE 真 HTTP 消费与"断链自检"2 条。默认档把它 deselect 了，CI 里是独立一步）
-uv run pytest -m live     # 21 passed（真打 qwen3.5:9b，与评测共用机器级 GPU 锁。S36 加了一条真机最小网格：断言引擎真的回报纳秒分段，且每个基线数字点得回真 trace）
+uv run pytest -m live     # 22 passed（真打 qwen3.5:9b，与评测共用机器级 GPU 锁。S36 加了一条真机最小网格：断言引擎真的回报纳秒分段，且每个基线数字点得回真 trace；S37 加了一条流式的：`first_token_at` 与 `wall_ms − ttft_ms` 必须讲同一个故事，非流式那一发则断言代理值不冒充测量）
 uv run pytest -m probe     # 4 passed（P 系列实验的可重跑版本）
 uv run ruff check .         # All checks passed（`ruff format` 不是门禁）
 uv run lint-imports          # 3 contracts kept（网络例外 2 条：executors.http + sinks.otlp/alerts.webhook 合并在契约 2，每条写明是谁与为什么）
@@ -405,13 +411,13 @@ S23 在浏览器里真跑过：`--provider mock` 的 serve 上点「开始评测
 - 打分口径只有 gen-based（API-only 拿不到受约束 logprob），评测输出会固定写"不可与公开 leaderboard 直接比较"。
 - 兼容通道（vLLM / LM Studio / `/v1`）**没有分段时序** ⇒ TPS / prefill 一律「—」；
   `structured_output` / `stream_usage` 长期是 `?`（未实测）而不是 `✗`——探针套件目前依赖 Ollama 原生端点。
-- **但 TTFT 的「—」不是通道限制，是没接好**（S36 查出，尚未修）：真机库里 **2318 条 usage 行的
-  `ttft_ms` 全是 NULL**，`trace.first_token_at` 同样全 NULL。provider 算得出来（流式实测 218ms）、
-  `FIRST_TOKEN` 事件也真发出来了，而观测层**没有任何 visitor 消费它**，于是 `TraceState.ttft_ms`
-  从来没有写入方，`latency_summary()` 从状态里取到的永远是 None。
-  ⇒ 看板与 `onyx chat` 的 TTFT 恒为「—」，连原生通道也是。
-  修它要动受保护内核（`obs/engine.py` 或 token visitor），按边界纪律单独成步，不塞进 perf 的提交里。
-  `onyx perf` 暂时取请求侧原始值（`generation.ttft_ms`），并留了一条会响的哨兵测试。
+- ~~**看板的 TTFT 恒为「—」且被文档解释成通道限制**~~ **S37 已修**：真正的原因是 `FIRST_TOKEN`
+  没有任何 visitor 消费（provider 算得出、事件真发、gateway 真转发，中间没人接），
+  所以 `usage.ttft_ms` 与 `trace.first_token_at` 从来没有写入方。
+  修法是**新增一个时序 visitor** 而不是改引擎——`obs/engine.py` 早就把每个事件发给所有 visitor 的
+  `on()`，需要改内核才修得好本身就是抽象不够用的信号。同一批换掉了
+  `test_gateway_live.py` 里那句恒成立的断言（`x is None or x`），并补了一条流式正向断言
+  （时刻必须落在 trace 窗口内）。历史行仍然是 NULL——回填它们等于伪造当时没测到的数。
 - 非 ollama provider 的 `base_url` 目前仍记录 CLI `--url` 的默认值
   （修它要把散在 6 处的默认值提成常量并区分"用户没填"）。
 - `RECONCILED` 事件在契约与 `PAYLOAD_REQUIRED` 里存在、token visitor 也消费它，
@@ -448,7 +454,7 @@ S23 在浏览器里真跑过：`--provider mock` 的 serve 上点「开始评测
    真机第一条基线 `01M47V50M7HW…`：qwen3.5:9b @ ollama 0.35.1、decode 30.5-32.0 t/s、
    并发 2 时 TTFT 从 125ms 涨到 ~1.2-2.2s（单请求 decode 却几乎不掉 ⇒ 两个口径必须分开看）。
    **G6 还剩两条**：真浏览器驱动（Playwright，仍为 0）与 i18n 抽取（挂在"是否对外发行"上，可长期搁置）。
-   S36 查出但**尚未修**的缺陷：TTFT 在观测层从来没有写入方（见上"还欠什么"）。
+   S36 查出的缺陷也在同一步系列里结案：**TTFT 曾经没有写入方**（S37 接上，见 L3）。
    视觉任务仍等 U8/U9 的未决实测。
 4. **`token explain` + `report usage`**：都属于"每天都在用但入口缺失"。
 5. C 组三条一致性（`RECONCILED` 不发、`base_url` 默认值、兼容通道探针覆盖）适合凑成一次"口径一致性"清理。
