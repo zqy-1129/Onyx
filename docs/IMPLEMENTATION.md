@@ -2825,7 +2825,7 @@ cd onyx/web && npx tsc --noEmit && npx vitest run && npm run build   # 0 错 · 
 `chore(quality): 覆盖率地板 80 → 85，值、口径与理由一起被一条测试钉住`
 `docs(m12): S35 归档 —— 第五列抓到的两处只在慢机器上现形的缺陷`
 
-## S36 — 性能基线 `onyx perf`（M12 第三步）
+## S36 — 性能基线 `onyx perf`（M12 第三步）✅
 
 **为什么现在做**：G6 最后一格。"改版前后这台机器上这个模型有多快"目前靠人瞄 `eval run` 的墙钟，
 没有基线就没有"变慢了"这个判断——而本项目已经攒了 40+ 个版本的观测/评测代码，性能回归是唯二
@@ -2892,13 +2892,77 @@ uv run onyx --help && uv run onyx perf --help                       # 命令数�
 是「—」而不是 0，且开跑前就警告；④ `mock` 跑不出基线（退出码 2）；⑤ 预算截断留下 `partial` 与
 "欠哪几格"的清单；⑥ 五道门与前端三门全绿，覆盖率仍在地板之上。
 
-**提交**：
-`docs(m12): S36 方案 —— 基线为什么是指纹而不是自觉`
-`feat(perf): 网格/语料/采集器 + purpose=BENCH 第一次有写入方`
-`feat(store): perf_run + perf_cell（0008 迁移，条件指纹）`
-`feat(cli): onyx perf run/ls/show/compare`
-`test(perf): 指纹可比性与"拒绝 mock / 拒绝跨条件对比"的注入缺陷自检`
+**提交**（实际切法与计划略有不同：每个提交自带它的测试，这样每一步都能单独跑绿）
+`refactor(measurement): 分位数与汉字下限各只留一份实现`（含 7 条同一性测试）
+`feat(perf): onyx/perf —— 网格、语料、采集器与渲染，purpose=BENCH 第一次有写入方`（含 70 条）
+`feat(store): perf_run + perf_cell（0008 迁移，条件指纹随库走）`（含 9 条往返测试）
+`feat(cli): onyx perf run/ls/show/compare —— 条件不同就不给差值`（含 11 条 CLI + 1 条真机网格）
 `docs(m12): S36 归档 + G6 收口`
+> `onyx/core/meta.py`（版本锚点）跟着 CLI 提交走而不是与 `long_context` 同一个提交：
+> `onyx/core/` 是受保护内核，而 `onyx/eval/tasks/` 是实现侧前缀——两者同批会被自家边界门禁判死。
+
+**实测（这台机器上的第一条真基线）**
+```
+基线 01M47V50M7HW72EYGGSPZ1Z5HT｜指纹 5a7fea531de7｜6 发 14.8s｜ollama 0.35.1
+qwen3.5:9b Q4_K_M｜rtx4060ti-16g｜keep_alive 10m｜流式｜temperature 0｜timing_source engine_ns
+
+600c/64t/x1/warm    decode 30.5 t/s｜合计 28.6｜TTFT 125.0ms
+600c/64t/x2/warm    decode 30.4 t/s｜合计 28.5｜TTFT 1242.5 / 2248.2ms（并发把首字推迟了 ~10×）
+2400c/64t/x1/warm   decode 32.0 t/s｜合计 17.4｜TTFT 1687.0ms
+2400c/64t/x2/warm   decode 30.8 t/s｜合计 29.2｜TTFT 1234.0 / 2232.1ms
+```
+复跑第二条 `01M47V5SYRH0BX4D39GX0ZG9Q4` 得到**同一个指纹** ⇒ `perf compare` 给出带符号差值并逐格标
+`n<5`；换网格的第三条 `01M47V6GY015V5MHNV2NPBME6B` 与前一条相比被**拒绝**，输出直接点名
+`grid：甲=…|… / 乙=…`（`--force` 才会比，且结果头上印着这句话）。
+两个口径第一次跑就分叉，正好证明这一列值得单列：单请求 decode 在并发下几乎不掉（30.4→30.8），
+而 TTFT 掉了十倍——只看一个数就会把"体验变差"读成"吞吐没变"。
+
+冷启动那一格（`01M47VS2SW3MYTABEBSR6Z4F5D --cold`）把三条设计同时验了一遍：
+```
+600c/32t/x1/cold   TTFT 8297ms｜load_ms 7913ms（单列，没混进 prefill）｜prefill_tps_cold 1309｜warm 列 null
+600c/32t/x1/warm   TTFT  109ms｜load_ms    3.2ms｜prefill_tps_warm 4764｜cold 列 null
+```
+⇒ 冷与热真的分列了（合并的话这一格会被稳态那一档稀释成一个谁都不代表的数）；
+⇒ 引擎回报 `prompt_tokens=475`，对应声明的 600 个汉字（这台机器 0.79 tok/汉字），
+高于汉字下限 300 ⇒ 没被裁，格子才记分——**x 轴取引擎回报值而不是自称值**就是为了让这条判据可执行；
+⇒ `traces_still_present=2`，基线上的每个数字都点得回真 trace。
+
+**这一步顶出来的观测缺陷（不在计划里，已登记而不是顺手修）**
+`latency_summary()` 里的 `ttft_ms` 永远来自 `TraceState.ttft_ms`，而**那个字段从来没有写入方**：
+真机库里 **2318 条 usage 行，`ttft_ms` 全为 NULL**，`trace.first_token_at` 同样全 NULL；
+`FIRST_TOKEN` 事件在 `core/event.py` 的载荷契约里存在、provider 也确实发（流式实测 `gen.ttft_ms=218ms`），
+但观测层没有任何 visitor 消费它。后果不是崩溃而是**看板与 `onyx chat` 的 TTFT 恒为「—」**，
+而 STATUS 原先把「—」解释成"兼容通道没有分段时序才显示「—」"——那句话今天被证明是错的。
+修法在受保护内核（`obs/engine.py` 或 token visitor），按边界纪律必须单独成步，不能塞进 perf 的提交里；
+已写进 STATUS 的已知缺陷与 ROADMAP 的待办。`onyx perf` 因此取的是**请求侧的原始值**
+（`generation.ttft_ms`），并把这一路的选择写成一条带原因的注释 + 一条会响的测试
+（`test_ttft_comes_from_the_request_side_because_the_observer_still_drops_it`）。
+
+**与计划的偏差（三条，都记在这里而不是悄悄改掉）**
+- `tests/live/test_perf_live.py` 实际落在 `tests/integration/`：live 档的 session 级 GPU 锁由该目录的
+  conftest 统一持有，这是 S14 之后定下的形状。
+- 计划写的"layers 契约里加 `onyx.perf`"没有执行——`pyproject` 里其实**没有** layers 契约
+  （附录 B 那张层表是设想），实际存在的三条是 core-stdlib 与两条网络例外；`onyx.perf` 不碰网络，
+  也没有实现前缀，所以不需要登记。
+- 多了两个计划外的文件：`llm/measurement/stats.py`（分位数只留一份）与 `core/meta.py`（版本锚点），
+  两者都是为了让 perf 不复述已有口径。
+
+**本机验证**
+```bash
+uv run onyx perf run --model qwen3.5:9b --prompt-chars 600,2400 --target-tokens 64 \
+  --concurrency 1,2 --repeat 1 --device rtx4060ti-16g      # 6 发 14.8s，done，指纹可复现
+uv run onyx perf compare A B                                 # 同指纹 ⇒ 带符号差值 + n<5
+uv run onyx perf compare A C                                 # 换网格 ⇒ 退出码 1 并逐字段列出
+uv run pytest tests/integration/test_perf_live.py -m live     # 真机最小网格 1 passed
+uv run pytest -q                                              # 全绿（新增 90 条）
+uv run coverage run -m pytest -q && uv run coverage report    # ≥ 85 地板
+uv run ruff check . && uv run lint-imports                    # 全过 · 3 contracts kept
+```
+**DoD 核对**：① 真机基线可落库、读回、每格数字点得回真 trace（live 测试断言 `TraceRepo.get`）✓；
+② 换模型/换 ctx/换网格 ⇒ compare **拒绝并逐字段**说清（不是"条件不同"四个字）✓；
+③ 兼容通道的吞吐列是「—」而不是 0，且开跑前就印出那句话 ✓（`timing_source` 由实测定，不是声明）；
+④ `mock` 跑不出基线（退出码 2，并给出路）✓；⑤ 预算截断留 `partial` + "欠哪几格"清单 ✓；
+⑥ 五道门全绿 ✓。
 
 ---
 
@@ -2942,6 +3006,7 @@ uv run onyx --help && uv run onyx perf --help                       # 命令数�
 | S33 | `onyx eval run --task semantic_similarity --model qwen3-embedding:0.6b --seed 42` + 同任务换 `--model qwen3.5:9b` | 前者 `score 0.833`、`anti_first_rate 0.167`、`dimension 1024`、`requests 12`（一条 case 一个请求）、grade 12/12 能反查样本与 kind=embed 的 trace；后者**必须整场 SKIPPED 且一条请求都不发**（模型级能力判定，不是 provider 级）；三条考卷自检（同义句抄原句 / 反义句丢否定 / 无关项含全部实体）都要在注入缺陷时点名那一道题 |
 | 门禁 | `make coverage`（`coverage run -m pytest -q`） | 离线套件分支覆盖率 ≥ 85%（S17 落地时 88%，S21 后 89%，M10 后 90%，S30–S33 后 91%，S35 起地板抬到 85 / 实测 90%——第五列的参考 server 只在子进程里跑，48 句量不到且**不做 omit**） |
 | S35 | `uv run onyx tools contract` + `uv run pytest tests/unit/test_tools_mcp_stdio.py` | 5 列且 `mcp_stdio 通过 8 · 失败 0 · 不适用 0`（真子进程，连跑两次一致）；把 `mcp_stdio` 的样本换成起不来的命令 ⇒ 那一列变 `unavailable` 带原因而其余四列照旧；`_request` 去掉会话锁 ⇒ 并发那条测试 5 次里 4 次红 |
+| S36 | `uv run onyx perf run --model qwen3.5:9b --prompt-chars 600,2400 --target-tokens 64 --concurrency 1,2 --repeat 1 --device rtx4060ti-16g` + `onyx perf compare A B` + `uv run pytest -m live tests/integration/test_perf_live.py` | 基线落库且 `状态 done`、指纹可复现（同参数两次跑出同一个 `env_hash`）；换网格的第三条与第一条比 ⇒ **退出码 1 并逐字段列出 `grid`**，加 `--force` 才给差值且结果头上印警告；`--provider mock` 退出码 2；真机那条断言 `timing_source == engine_ns` 且每个数字点得回真 trace；把 `FINGERPRINT_FIELDS` 里删掉任一字段 ⇒ 契约测试点名那个字段红 |
 
 ## 附录 B — 架构自测（让"模块化"可验证，而非口号）
 

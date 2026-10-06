@@ -23,8 +23,9 @@ S33 语义检索与第一条 embedding 通路）之后
 sha256 内容寻址的 blob 存储、单调钟 + 墙钟双时间、事件契约带必填键校验（`strict=True` 会拒绝缺键事件）。
 
 ### L1 存储 `onyx/store/`
-19 张表、schema v7（迁移可重复执行、`0005` 回灌了数据集来历、`0006` 是保留策略的留痕表、
-`0007` 是告警触发历史 `alert_trigger`——审计表，永不参与清理）、
+21 张表、schema v8（迁移可重复执行、`0005` 回灌了数据集来历、`0006` 是保留策略的留痕表、
+`0007` 是告警触发历史 `alert_trigger`、`0008` 是性能基线 `perf_run` + `perf_cell`——两张都是
+"结论不是数据"，永不参与清理）、
 WAL + 批量 sink（队列满丢样本但 `dropped` 计数可见）、
 三种事件 sink：`jsonl` / `null` / `otlp`（OTLP/HTTP JSON 编码）、
 **数据生命周期 `store/retention.py`**：摘重引用 / 删无主 blob / 每次运行落 `retention_run`、
@@ -150,11 +151,28 @@ WAL + 批量 sink（队列满丢样本但 `dropped` 计数可见）、
   `load_dataset(..., db=)` 按"内置 → file: → 库里"解析，CLI 与界面同一个顺序；
   `register_dataset` 是唯一的落库口，覆盖旧 revision / 条数变化会返回警告（CLI 打印、API 一起回给界面）
 
+### L5.5 性能基线 `onyx/perf/`（S36）
+- **一条基线 = 条件 + 每格的数**：`perf_run` 存条件（provider / 引擎版本 / 模型与量化 / 设备 /
+  `num_ctx` / `keep_alive` / 流式位 / `timing_source` / 温度 / 种子 / 网格）并取一个 `env_hash`；
+  `perf_cell` 存每格的 `median/p95/n/min/max` 与"没测到"的原因。数字**抄进表里**，
+  所以保留策略摘走 trace 之后基线仍然成立（trace 只用于下钻）
+- **`compare` 的第一问题不是"差多少"而是"这两个数是同一个实验吗"**：指纹不同 ⇒ 拒绝并
+  **逐字段列出**（换模型 / 换 ctx / 换网格各是不同的修法，"条件不同"四个字没有可操作性）；
+  `--force` 才比且结果头上印警告。`app_version` / `git_rev` **不在指纹里**——换代码正是要比的东西
+- **两个吞吐口径分开报**：`per_request_tps`（各路引擎自报）与 `aggregate_tps`（该批 token 合计 / 该批墙钟）。
+  真机第一次跑就分叉：并发 2 时单请求 decode 30.4→30.8 几乎不掉，而 TTFT 从 125ms 涨到 1242/2248ms
+- **长度档按汉字声明，实际长度取引擎回报值**，且**引擎裁过正文的格子不作数**（判据与长上下文评测
+  共用 `heuristic.min_prompt_tokens()`，同一件事只有一处实现）
+- **三条硬拒**：`--provider mock`（假延迟存成基线会污染以后每次对比）、没有卸载接口时的"假冷启动"、
+  以及引擎身份认不全时的"声称可比"（`comparable=0`）
+- **预算用完是"没测到"**：`status=partial` + `perf show` 列出欠哪几格；默认网格刻意小（≤24 发）
+
 ### L6 接口
-- **CLI 43 条命令**：顶层 7（`chat` / `serve` / `doctor` / `plugins` / `version` / `calibrate` / `rotate`）
-  + 分组 36（`db 5` / `probe 4` / `models 4` / `traces 3` / `tools 9` / `eval 8` / `config 1` / `alerts 2`）
+- **CLI 47 条命令**：顶层 7（`chat` / `serve` / `doctor` / `plugins` / `version` / `calibrate` / `rotate`）
+  + 分组 40（`db 5` / `probe 4` / `perf 4` / `models 4` / `traces 3` / `tools 9` / `eval 8` / `config 1` / `alerts 2`）
   ——`models pull|rm` 是 S26 补的出口（且 `sync`/`ls` 一起补上 `--provider`：
-  pull/rm 能指到别的通道而它们不能，就会出现「拉得下来、同步不上」），`alerts ls|test` 是 S27 补的
+  pull/rm 能指到别的通道而它们不能，就会出现「拉得下来、同步不上」），`alerts ls|test` 是 S27 补的，
+  `perf run|ls|show|compare` 是 S36 补的
 - **部署配置 `onyx.toml`**（S20）：provider / GPU 锁 / 保留窗口 / sandbox / serve 绑定 / **告警** 收在一处。
   优先级只有一条规则 **flag > 环境 > 文件 > 默认**；`onyx config show` 逐项标出它来自哪一层，
   `onyx doctor` 把"写了不生效"的未知键与坏类型报成红项（模板见 `onyx.example.toml`）。
@@ -203,9 +221,9 @@ WAL + 批量 sink（队列满丢样本但 `dropped` 计数可见）、
 ## 2. 质量门与规模
 
 ```
-uv run pytest            # 1648 passed, 1 skipped, 36 deselected（默认档就是离线套件，CI 用它量覆盖率。S32 三个文件 58 条 + S33 六个文件 60 条 + 样本重写与能力闸门 6 条；`test_task_contract.py` 41 → 49 条：多一个任务就多 8 条断言，一行任务专属逻辑都不用加。S33 只逼它泛化了一次——原来写死用 `Generation` 造样本，现在按任务自己 `build()` 的返回类型造。S35 加的 11 条：真 stdio 列的隔离/并发/迟到回答 +5（`test_tools_mcp_stdio.py` 7 → 12）、第五列（存在·出处·无豁免·起不来=未知）+3、覆盖率地板的钉子 +1、settle 与库里的顺序 +2）
+uv run pytest            # 1745 passed, 1 skipped, 37 deselected（默认档就是离线套件，CI 用它量覆盖率。S32 三个文件 58 条 + S33 六个文件 60 条 + 样本重写与能力闸门 6 条；`test_task_contract.py` 41 → 49 条：多一个任务就多 8 条断言，一行任务专属逻辑都不用加。S33 只逼它泛化了一次——原来写死用 `Generation` 造样本，现在按任务自己 `build()` 的返回类型造。S35 加的 11 条：真 stdio 列的隔离/并发/迟到回答 +5（`test_tools_mcp_stdio.py` 7 → 12）、第五列（存在·出处·无豁免·起不来=未知）+3、覆盖率地板的钉子 +1、settle 与库里的顺序 +2。S36 加的 97 条：口径收敛 7、perf 的网格/语料/采集/落库 62、可比性契约 17、CLI 的"四条拒绝与三种读数" 11）
 uv run pytest -m e2e     # 12 passed（S34：六页取数同源 10 条 + SSE 真 HTTP 消费与"断链自检"2 条。默认档把它 deselect 了，CI 里是独立一步）
-uv run pytest -m live     # 20 passed（真打 qwen3.5:9b，与评测共用机器级 GPU 锁）
+uv run pytest -m live     # 21 passed（真打 qwen3.5:9b，与评测共用机器级 GPU 锁。S36 加了一条真机最小网格：断言引擎真的回报纳秒分段，且每个基线数字点得回真 trace）
 uv run pytest -m probe     # 4 passed（P 系列实验的可重跑版本）
 uv run ruff check .         # All checks passed（`ruff format` 不是门禁）
 uv run lint-imports          # 3 contracts kept（网络例外 2 条：executors.http + sinks.otlp/alerts.webhook 合并在契约 2，每条写明是谁与为什么）
@@ -385,8 +403,15 @@ S23 在浏览器里真跑过：`--provider mock` 的 serve 上点「开始评测
   没被任何 grade 引用过的（`prune_stale_cases`）。读法：`n_cases` 是**当前这份考卷几条**，
   `list_cases` 里多出来的是历史；不是数字对不上。
 - 打分口径只有 gen-based（API-only 拿不到受约束 logprob），评测输出会固定写"不可与公开 leaderboard 直接比较"。
-- 兼容通道（vLLM / LM Studio / `/v1`）**没有分段时序** ⇒ TTFT/TPS 一律「—」；
+- 兼容通道（vLLM / LM Studio / `/v1`）**没有分段时序** ⇒ TPS / prefill 一律「—」；
   `structured_output` / `stream_usage` 长期是 `?`（未实测）而不是 `✗`——探针套件目前依赖 Ollama 原生端点。
+- **但 TTFT 的「—」不是通道限制，是没接好**（S36 查出，尚未修）：真机库里 **2318 条 usage 行的
+  `ttft_ms` 全是 NULL**，`trace.first_token_at` 同样全 NULL。provider 算得出来（流式实测 218ms）、
+  `FIRST_TOKEN` 事件也真发出来了，而观测层**没有任何 visitor 消费它**，于是 `TraceState.ttft_ms`
+  从来没有写入方，`latency_summary()` 从状态里取到的永远是 None。
+  ⇒ 看板与 `onyx chat` 的 TTFT 恒为「—」，连原生通道也是。
+  修它要动受保护内核（`obs/engine.py` 或 token visitor），按边界纪律单独成步，不塞进 perf 的提交里。
+  `onyx perf` 暂时取请求侧原始值（`generation.ttft_ms`），并留了一条会响的哨兵测试。
 - 非 ollama provider 的 `base_url` 目前仍记录 CLI `--url` 的默认值
   （修它要把散在 6 处的默认值提成常量并区分"用户没填"）。
 - `RECONCILED` 事件在契约与 `PAYLOAD_REQUIRED` 里存在、token visitor 也消费它，
@@ -416,10 +441,15 @@ S23 在浏览器里真跑过：`--provider mock` 的 serve 上点「开始评测
    `instruction_following` 39 条 / 10 种可机械检查的约束（`0.920 / 0.916 / 0.641` 三口径分叉）、
    `long_context` 9 条三档长文 + 干扰项（`1.000`，负控制 `--num-ctx 4096` 整场 `score —`）、
    `semantic_similarity` 12 题排序（`0.833`，`anti_first_rate 0.167`，并新建了整条 embedding 通路）。
-   矩阵现在 **6 列**。M12 还剩一项：**S36**（`onyx perf` 吞吐/延迟基线，条件必须一起落库）。
-   ~~S35~~ **已交付**：契约矩阵长出第五列 `mcp_stdio`（真子进程 + 真管道，8/8 无豁免），
-   覆盖率地板 80 → 85 并被一条测试与 CI 文案同时钉住；顺带挖出两处"只在慢机器上现形"的真缺陷
-   （MCP 一条管道两个读者、`settle()` 比库里先说"跑完了"）；视觉任务仍等 U8/U9 的未决实测。
+   矩阵现在 **6 列**。M12 的三步 **S34 / S35 / S36 全部交付**：
+   ① 六页取数 e2e + SSE 真连接（S34）；② 契约矩阵第五列 `mcp_stdio`（真子进程 + 真管道，8/8 零豁免）
+   与覆盖率地板 80→85（S35）；③ `onyx perf` 四条命令 + `perf_run`/`perf_cell`——条件指纹、
+   `compare` 拒绝跨条件并逐字段说清、两个吞吐口径分开报、`mock` 直接拒（S36）。
+   真机第一条基线 `01M47V50M7HW…`：qwen3.5:9b @ ollama 0.35.1、decode 30.5-32.0 t/s、
+   并发 2 时 TTFT 从 125ms 涨到 ~1.2-2.2s（单请求 decode 却几乎不掉 ⇒ 两个口径必须分开看）。
+   **G6 还剩两条**：真浏览器驱动（Playwright，仍为 0）与 i18n 抽取（挂在"是否对外发行"上，可长期搁置）。
+   S36 查出但**尚未修**的缺陷：TTFT 在观测层从来没有写入方（见上"还欠什么"）。
+   视觉任务仍等 U8/U9 的未决实测。
 4. **`token explain` + `report usage`**：都属于"每天都在用但入口缺失"。
 5. C 组三条一致性（`RECONCILED` 不发、`base_url` 默认值、兼容通道探针覆盖）适合凑成一次"口径一致性"清理。
 

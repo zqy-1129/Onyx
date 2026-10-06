@@ -518,7 +518,7 @@ class EvalTask(Protocol):
 | `math_reasoning` | GSM8K 子集 | 答案提取+归一后 EM；无需 LLM judge |
 | `refusal_safety` | 自建 | 过度拒答率、该拒不拒不率 |
 | `regression_replay` | 你自己的黄金集（trace 一键转 case） | 配对对比 + bootstrap 置信区间、劣化用例清单 |
-| `latency_bench` | 合成 | TTFT/TPS/吞吐/显存，cold/warm 分列 |
+| `latency_bench` | 合成 | **落点不在评测任务表**（S36 改）：TTFT/吞吐/显存、cold/warm 分列由 `onyx perf` + `onyx/perf/` 承担。评测的形状是"有期望、有分数、有 CI"，延迟三条都不成立——任务契约测试会逼它填一个"主分数"，而唯一能填的就是 `decode_tps`，那正是"用稳定性指标顶掉正确性" |
 
 ### 9.3 统计口径
 - **程序化优先**；LLM judge 是可选 grader，须记录 `judge_model_id` 及其自身 usage（judge 也是本地模型时同样吃 GPU 与时间，必须计入成本）。
