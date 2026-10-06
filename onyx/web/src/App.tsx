@@ -236,7 +236,7 @@ function EngineStatus({
       >
         <StatusDot ok={reachable} />
         <span className="rail-label">引擎状态</span>
-        <span className="rail-engine-verdict">{verdict}</span>
+        <span className="rail-engine-verdict">· {verdict}</span>
         <span className="rail-engine-caret" aria-hidden="true">{open ? '▾' : '▸'}</span>
       </button>
       {open ? (
