@@ -2825,11 +2825,80 @@ cd onyx/web && npx tsc --noEmit && npx vitest run && npm run build   # 0 错 · 
 `chore(quality): 覆盖率地板 80 → 85，值、口径与理由一起被一条测试钉住`
 `docs(m12): S35 归档 —— 第五列抓到的两处只在慢机器上现形的缺陷`
 
-## S36 — 性能基线（M12 第三步）
+## S36 — 性能基线 `onyx perf`（M12 第三步）
 
-`onyx perf`（或 probe 套件的一条）留一组吞吐/延迟基线，改版能对比。
-前提：基线的**出处与条件**必须一起落库（引擎版本、模型、并发度、是否冷启动），
-否则下一次对比就是在比两个不同的东西。
+**为什么现在做**：G6 最后一格。"改版前后这台机器上这个模型有多快"目前靠人瞄 `eval run` 的墙钟，
+没有基线就没有"变慢了"这个判断——而本项目已经攒了 40+ 个版本的观测/评测代码，性能回归是唯二
+还没有门禁的退化通道（另一条是覆盖率，S35 刚补上）。
+
+**产出文件（计划）**
+```
+onyx/perf/spec.py         # 格子定义（prompt 档 × 生成长度 × 并发 × 冷热）+ 预算 + 默认小网格
+onyx/perf/corpus.py       # 确定性 prompt 语料：按目标长度构造，**实际长度以引擎回报为准**
+onyx/perf/bench.py        # 采集器：经 gateway、purpose=BENCH、并发、冷热、汇总成 cell
+onyx/perf/report.py       # CLI 的人类输出与 --json 共用同一份形状（口径不分叉）
+onyx/store/migrations/0008_perf.sql   # perf_run + perf_cell
+onyx/store/records.py     # PerfRunRecord / PerfCellRecord
+onyx/store/repos/perf_repo.py + repos/__init__.py
+onyx/cli.py               # perf run / ls / show / compare
+pyproject.toml            # layers 契约：`onyx.perf` 挂在 obs|probe 那一层
+docs/DESIGN.md            # §9.2 里 `latency_bench` 那一行的落点改写（见决定 1）
+tests/unit/test_perf_spec.py / test_perf_corpus.py / test_perf_bench.py / test_perf_repo.py
+tests/unit/test_cli_perf.py · tests/contract/test_perf_comparability.py · tests/live/test_perf_live.py
+```
+
+**五条设计决定**
+1. **不做成 eval 任务**（DESIGN §9.2 原本把 `latency_bench` 列在评测任务表里，`expect_json` 与
+   `loader.py` 还为它留过"可空期望"的注释）。eval 的形状是"有期望、有分数、有 CI"，延迟测量三条都不成立：
+   `tests/contract/test_task_contract.py` 会逼一个没有对错的任务交出"主分数"，而唯一能填的就是
+   `decode_tps` ——那正是 S30 明令禁止的"稳定性指标顶掉正确性"。⇒ 落点改成 `onyx/perf/`
+   （与 `obs|probe` 同层，不新增层），DESIGN 那一行同步改写并把理由留在原处，免得下一个人再列一遍。
+2. **可比性靠指纹，不靠人记得改条件**：`perf_run.env_hash = sha256(` 会改变数字含义的那组字段：
+   `provider_id / engine_version / 模型名与量化 / context_length / keep_alive / timing_source /
+   网格 / 参数快照 / --device`）。**`app_version` 与 `git_rev` 刻意不进 hash**——换代码正是要对比的对象，
+   compare 把它当成"差异"显示而不是当成"不可比"。`perf compare A B`：env_hash 不同 ⇒ **拒绝给 delta**
+   并逐字段列出差在哪（"这两次比的是不同的东西"必须说得出口）；相同 ⇒ 每格给绝对与相对变化，n<5 标低置信。
+   这条是"靠人自律的判据要换成结构上不可能被忘的断言"（S32 那条教训）在性能侧的第一次应用。
+3. **每条数字要么有出处要么是「—」**：吞吐只从**引擎回报**的 token 数与纳秒分段算，
+   且**复用现成口径**（`EngineLatency` / `measurement.reconciler.latency_summary()` / `prefill_mode()`），
+   不新写第二个算法——两处口径不同就会被问"该信谁"。兼容通道没有 ns 分段 ⇒ `timing_source="wall_only"`，
+   `ttft/prefill_tps/decode_tps` 存 **None**，并在**开跑之前**就把这句话讲明（不许跑完 4 分钟才发现一整列是空的）。
+   **`--provider mock` 直接拒绝**（退出码 2 并说清为什么）：假延迟存成基线比没有基线更坏——
+   它会参与未来每一次 compare。离线测试因此打的是采集器的假 provider 对象，不写库里的"基线"。
+4. **并发是真并发，且两个口径分开报**：`--concurrency 1,2,4` 用线程池同时打 N 路（每路一条独立 trace，
+   全部经 gateway 这一咽喉点）。每格同时报 `per_request_tps`（各路自己的 ns 自报）与
+   `aggregate_tps`（该批 out_tokens 合计 / 该批墙钟）。单请求 TPS 在并发下会掉，
+   只报一个数字就把"batching 到底赚不赚"这个真问题糊掉了——这也是这一格为什么值得单独测。
+5. **预算用完是"没测到"，不是 0**：默认网格刻意小（3 个 prompt 档 × 2 个生成长度 × 并发 1 × 重复 2，
+   约 12 发，`--budget-s` 上限默认 300）；中途用完 ⇒ 剩余格子**不写行**，run 状态 `partial`，
+   `perf show` 列出"还欠哪几格"。冷启动只在 `--cold` 时做一次（先 `unload` 再一发），
+   且**载入时间单列**（`load_ms`），不混进 prefill——混进去的那个数既不是吞吐也不是延迟，是最容易被误读的数。
+
+**与界面的关系（刻意不做）**：S36 只交付 CLI + 落库 + 指纹对比。`/api/perf` 与第 10 个页面等到
+"真的会盯着它看"的时候再做——半张面板和一个没人读的面板一样坏（S25 那条"有表没写入方"的反面教训）。
+
+**自测**
+```bash
+uv run pytest tests/unit/test_perf_*.py tests/unit/test_cli_perf.py tests/contract/test_perf_comparability.py
+uv run onyx perf run --model qwen3.5:9b --cold --budget-s 240      # 真机，落一条基线并打印 env_hash 前缀
+uv run onyx perf show <id>                                          # 每格带 n、来源、trace 点得回去
+uv run onyx perf compare <id1> <id2>                                # 同 env_hash 才给 delta
+uv run onyx perf compare <id1> <id2> --model 换过的第二条            # 必须逐字段拒绝
+uv run pytest -m live -k perf                                       # 真机最小网格那条
+uv run onyx --help && uv run onyx perf --help                       # 命令数与 docs/STATUS.md 一起改
+```
+**DoD**：① 一条真机基线可落库、可读回、每格数字都能点回真实 trace；② 换模型/换引擎版本后
+`compare` **拒绝**并逐字段说清差在哪（不是打印一句"条件不同"）；③ 兼容通道跑出来的 TTFT/TPS
+是「—」而不是 0，且开跑前就警告；④ `mock` 跑不出基线（退出码 2）；⑤ 预算截断留下 `partial` 与
+"欠哪几格"的清单；⑥ 五道门与前端三门全绿，覆盖率仍在地板之上。
+
+**提交**：
+`docs(m12): S36 方案 —— 基线为什么是指纹而不是自觉`
+`feat(perf): 网格/语料/采集器 + purpose=BENCH 第一次有写入方`
+`feat(store): perf_run + perf_cell（0008 迁移，条件指纹）`
+`feat(cli): onyx perf run/ls/show/compare`
+`test(perf): 指纹可比性与"拒绝 mock / 拒绝跨条件对比"的注入缺陷自检`
+`docs(m12): S36 归档 + G6 收口`
 
 ---
 
