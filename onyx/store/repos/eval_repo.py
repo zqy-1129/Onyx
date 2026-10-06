@@ -102,6 +102,11 @@ class EvalRepo:
                                 (dataset_id,))
         return int(row["n"]) if row else 0
 
+    def case_ids(self, dataset_id: str) -> set[str]:
+        """这份数据集在库里已有的样本 id 集合（含为历史 grade 保留的旧版行）。"""
+        rows = self.db.query("SELECT id FROM eval_case WHERE dataset_id=?", (dataset_id,))
+        return {str(row["id"]) for row in rows}
+
     def prune_stale_cases(self, dataset_id: str, keep_ids: Iterable[str]) -> int:
         """删掉这份数据集里既不属于当前样本集、也**没有被任何 grade 引用**的旧行。
 

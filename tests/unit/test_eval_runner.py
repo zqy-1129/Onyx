@@ -707,3 +707,55 @@ def test_explicit_caps_skip_the_engine_probe(tmp_path):
     finally:
         sink.close()
         db.close()
+
+
+def test_revising_the_generator_without_bumping_revision_still_repairs_the_store(tmp_path):
+    """忘了改 revision 也要能自修：判据是"要考的每条 id 都在库里"，不是"人记得改版本"。
+
+    S33 真机就是这样：改了框里一个词（"B 区货架"→"B 号货架"）而 revision 串没动，
+    于是"revision 变了才重写"安静地没响，那轮 12 条里有 3 条 grade 点不到自己的样本。
+    """
+    from onyx.core.clock import FakeClock
+    from onyx.core.content import FileBlobStore
+    from onyx.llm.gateway import Gateway
+    from onyx.obs.engine import ObserverEngine
+    from onyx.store.db import Database
+    from onyx.store.repos import EvalRepo
+    from onyx.store.sinks import SqliteRecordSink
+
+    def _same_id_other_content(revision: str, prefix: str) -> Dataset:
+        cases = [
+            {"id": f"{prefix}{i}", "ord": i,
+             "input": {"instruction": f"内容 {i}：转账"}, "expect": {"label": "转账"},
+             "tags": [], "kind": "single"}
+            for i in range(4)
+        ]
+        return Dataset(id="tiny", cases=tuple(cases), upstream="test", revision=revision)
+
+    db = Database(tmp_path / "drift.sqlite")
+    sink = SqliteRecordSink(db, batch_size=16, idle_wait=0.005)
+    try:
+        repo = EvalRepo(db)
+
+        def _runner_for(dataset: Dataset):
+            gateway = Gateway(MockProvider(scripts={MODEL: _scripts("转账")}, models=(MODEL,)),
+                              observer=ObserverEngine(record_sink=sink),
+                              blobs=FileBlobStore(tmp_path / "blobs"), clock=FakeClock())
+            return EvalRunner(gateway, repo, IntentClassification(dataset, model=MODEL),
+                              dataset=dataset, clock=FakeClock())
+
+        first = _runner_for(_same_id_other_content("same", "a")).run(RunConfig(model=MODEL, limit=1))
+        assert {r.id for r in repo.list_cases("tiny")} == {"a0", "a1", "a2", "a3"}
+
+        # 同一 dataset_id、**同一 revision 串**，但内容（因此 id）全变了
+        second = _runner_for(_same_id_other_content("same", "b")).run(RunConfig(model=MODEL))
+        stored = {r.id for r in repo.list_cases("tiny")}
+        assert {"b0", "b1", "b2", "b3"} <= stored, f"新内容没被写进库：{stored}"
+        for grade in repo.list_grades(second.run_id):
+            assert grade.case_id in stored, f"{grade.case_id} 点不回样本"
+        # a0 被第一条 run 的 grade 引用过 ⇒ 留着；a1–a3 没历史 ⇒ 作为陈旧行被清掉
+        assert stored == {"a0", "b0", "b1", "b2", "b3"}
+        assert first.run_id != second.run_id
+    finally:
+        sink.close()
+        db.close()

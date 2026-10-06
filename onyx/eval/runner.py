@@ -423,16 +423,19 @@ class EvalRunner:
         dataset = self.dataset
         if dataset is not None:
             dataset_record, cases = dataset.to_records()
+            ids = {str(rec.id) for rec in cases}
             existing = self.repo.get_dataset(dataset.id)
             # 只在"库里没有"时写是不够的：case id 是内容哈希，生成器一改就是一批新 id，
-            # 而 dataset_id 不变。真机踩过——S32 给长上下文加干扰项之后，那轮 9 条 grade
-            # 有一条都点不回自己的样本，`dataset.revision` 还停在旧串。
-            # revision 变了就必须重写；旧样本只删掉**没被任何 grade 引用过**的那些，
-            # 因为历史分数还要靠它们回答"当时考的是哪一份"。
-            if existing is None or existing.revision != dataset.revision:
+            # 而 dataset_id 不变。真机踩过两次：S32 加干扰项后那轮 9 条 grade 有一条都点不
+            # 回自己的样本；S33 改了框里一个词但**忘了改 revision**，于是"revision 变了才重写"
+            # 这条判据安静地没响，12 条里又有 3 条点不回去。所以判据加上第二条：
+            # **这次要考的每条 id 都必须在库里**——这才是"分数能反查样本"的真正不变式，
+            # 而且它不依赖人记得改 revision。旧样本只删没被任何 grade 引用过的那些。
+            if (existing is None or existing.revision != dataset.revision
+                    or not ids <= self.repo.case_ids(dataset.id)):
                 self.repo.upsert_dataset(dataset_record)
                 self.repo.upsert_cases(cases)
-                self.repo.prune_stale_cases(dataset.id, [rec.id for rec in cases])
+                self.repo.prune_stale_cases(dataset.id, ids)
         self.repo.upsert_task(TaskRecord(
             id=self.task.id, name=getattr(self.task, "name", self.task.id),
             metrics=tuple(getattr(self.task, "metric_names", ())),
