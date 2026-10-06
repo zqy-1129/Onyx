@@ -2966,6 +2966,70 @@ uv run ruff check . && uv run lint-imports                    # 全过 · 3 cont
 
 ---
 
+## S37 — TTFT 接上写入方（观测时序 visitor）
+
+**为什么单独成步**：S36 查出"看板的 TTFT 恒为「—」"不是通道限制而是**没有写入方**
+（真机 2318 条 usage 行 `ttft_ms` 全 NULL、`trace.first_token_at` 全 NULL），
+并且文档一直把它解释成"兼容通道没有分段时序才这样"——把一个缺失字段读成了引擎的限制。
+这类缺陷顺手修进别的提交里就会被埋掉（review 时看不出它为什么在场），所以单独一步。
+
+**证据链（已核实，不是推测）**
+- provider 真的算得出：流式实测 `gen.ttft_ms=218ms`（`llm/streaming.py:367-368` 取首包时刻）
+- 事件真的发出来：`FIRST_TOKEN` 在 `core/event.py:48` 的载荷契约里，`emit_final_events` 发它
+- gateway 真的转发：`_forward` 把 provider 事件原样进观测（`llm/gateway.py:427-429`）
+- **中间没有人接**：`grep mark_first_token` 只有 sink/repo 的定义与 `test_repos` 的直调；
+  `TraceState.ttft_ms`/`first_token_at` 两个字段没有任何赋值点 ⇒ `to_trace_record`/usage 落库永远带 None
+
+**产出文件（计划）**
+```
+onyx/obs/visitors/timing.py         # 新 visitor：FIRST_TOKEN → state.ttft_ms + state.first_token_at
+onyx/obs/visitors/__init__.py       # 注册点（边界门禁豁免文件），顺序放在 gpu 之后 cost 之前
+onyx/store/sinks/sqlite.py          # 不改：mark_first_token 已存在且是"只认第一次"的 SQL
+tests/unit/test_obs_timing.py       # 事件→状态→落库三段 + proxy 不写 + 幂等 + 注册被摘掉会红
+tests/unit/test_engine.py           # 补一条"经观测引擎后 usage 带 ttft"
+tests/integration/test_gateway_live.py  # 把恒真断言换成会响的
+docs/STATUS.md docs/ROADMAP.md CHANGELOG.md README.md  # 已知缺陷条目改为已修
+```
+
+**四条设计决定**
+1. **不碰受保护内核就能修好它**：`obs/engine.py` 对每个事件调用所有 visitor 的 `on()`，
+   所以修法是**新增一个 visitor**，而不是改 engine/state。这不是偷懒，是检验抽象：
+   如果修一个内建观测字段必须改引擎，那说明 visitor 契约不够用（那才是要单独记 issue 的事）。
+2. **只认测出来的 TTFT，代理值不当数**：非流式请求的 `FIRST_TOKEN` 带 `proxy: prompt_eval_duration`
+   （`streaming.py:293-299`）——那种情况下"首字时间"这个量根本不存在（没有逐字交付）。
+   ⇒ `ttft_ms` 保持 None（看板显示「—」），出处仍写进 `usage.extra["ttft_source"]="proxy:…"`；
+   存一个代理值会让人把 prefill 时长读成交付延迟，那正是本项目反复要避免的"两个相反的说法混成一个"。
+3. **同一个事实不留两处实现，但保留两种表达**：`trace.first_token_at`（时刻）与
+   `usage.ttft_ms`（时长）由**同一个事件、同一个 visitor** 写；"只认第一次"的语义在 SQL
+   （`WHERE first_token_at IS NULL`）和 visitor 内各守一处，幂等由测试钉住
+   （重复事件不得覆盖首个时刻）。
+4. **测试装置不许撒谎**：`tests/integration/test_gateway_live.py:75` 现在是
+   `assert record.first_token_at is None or record.first_token_at` ——**恒成立**，
+   看起来在检查其实什么都没检查（这就是"有测试等于有覆盖"的反例）。
+   换成：流式请求 ⇒ `first_token_at` 非空且落在 `started_at` 与 `finished_at` 之间。
+
+**自测**
+```bash
+uv run pytest tests/unit/test_obs_timing.py tests/unit/test_engine.py -q
+uv run pytest -m live tests/integration/test_gateway_live.py -q      # 真机流式：时刻落在窗口内
+uv run onyx chat --stream "用一句话说清什么是 KV 缓存"                 # TTFT 不再是「—」
+uv run python -c "from onyx.store.db import Database; d=Database('.data/onyx.sqlite'); print(d.query('SELECT ttft_ms, first_token_at FROM trace JOIN usage USING(trace_id) ORDER BY started_at DESC LIMIT 3'))"
+uv run coverage run -m pytest -q && uv run coverage report           # ≥85 地板
+uv run ruff check . && uv run lint-imports && uv run python scripts/check_extension_boundary.py --staged
+```
+**DoD**：① 新写的流式 trace 在库里 `usage.ttft_ms` 非 NULL 且 `trace.first_token_at` 非 NULL；
+② `onyx chat --stream` 与 `onyx traces show` 的 TTFT 有数（真机截图/文本为证，不是推断）；
+③ 非流式请求的 TTFT 仍是「—」，而 `usage.extra` 里能看到它是 proxy 出处；
+④ 摘掉 `builtin_visitors()` 里的注册 ⇒ 端到端那条测试必须红（注入缺陷自检）；
+⑤ 五道门全绿；STATUS/ROADMAP 把这条从"已知缺陷"移到"已修"。
+
+**提交**：
+`feat(obs): 时序 visitor —— FIRST_TOKEN 终于有人接`
+`test(obs): 事件→状态→落库三段与"注册被摘掉会红"的自检`
+`docs: TTFT 缺陷结案 —— 从"通道限制"改回"曾经没有写入方"`
+
+---
+
 ## 附录 A — 每步自测速查
 
 | 步 | 命令 | 绿的条件 |
