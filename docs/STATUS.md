@@ -467,7 +467,8 @@ S23 在浏览器里真跑过：`--provider mock` 的 serve 上点「开始评测
    S29 Fleet 可见性 + doctor「告警」项 + **一进程一引擎定案**，**全部达成**）。
 2. ~~`-m e2e` 用例~~（**S34 已交付数据通路那一半**：六页取数互相核对 + SSE 在真 HTTP 连接上被读到
    + "摘掉 broker 就会红"的自检 + CI 独立一步并钉进门禁清单）。
-   剩下的部分是**真浏览器驱动**（Playwright 起 vite + serve），它仍欠着——见上表那一行。
+   剩下的部分是**真浏览器驱动**：**S40 方案已定**（八条用例 + 新 marker `-m browser` + 独立 CI job），
+   驱动方式已实测可用（`playwright` 以 `channel="msedge"` 直接吃系统 Edge，本机不下载浏览器）。
 3. ~~M11 评测资产（S30–S33）~~ **全部达成**：`structured_extraction` 45 条（真机 `score 0.893`）、
    `instruction_following` 39 条 / 10 种可机械检查的约束（`0.920 / 0.916 / 0.641` 三口径分叉）、
    `long_context` 9 条三档长文 + 干扰项（`1.000`，负控制 `--num-ctx 4096` 整场 `score —`）、

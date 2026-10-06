@@ -3385,6 +3385,98 @@ Ledger 的 warm 那一行在没有数据的桶上不再掉出 0 的折线，改�
 
 ---
 
+## S40 — 真浏览器 e2e：把"只有点浏览器才发现的缺陷"变成会红的测试
+
+**为什么是这一步**：G6 的出口判据里只剩这一条功能项（另一条 i18n 可长期搁置）。
+这不是补覆盖率——S23–S29 期间**八处真实缺陷全部只能靠手工点浏览器发现**
+（SSE 静默失效、`[object Object]` 顶掉整列、子页没有导航、判定筛选项漏 `partial`、
+锁文件句柄把 `os.replace` 顶成死锁、rail 裁字、按钮文字竖排、空面板被读成"没人试过"），
+而 S34 补的那 12 条明确写着边界：**"本仓库没有任何浏览器驱动，所以渲染本身不在这里测"**。
+`docs/STATUS.md` §4 至今把这条边界挂在"真浏览器驱动仍为 0"。
+
+**可行性已经当场实测（两条驱动都过，且不下载浏览器）**
+```
+# 本机浏览器：Edge 154.0.4253... 在 C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe
+npm install --no-save @playwright/test            # 3 packages / 5s
+chromium.launch({ channel: 'msedge', headless: true })
+  → 渲染 #/usage（main 文本 590 字）、#/traces/<clamp 那条>：
+     「仅未 clamp 时成立」True、「计数器高估」True            # node 侧
+
+uv pip install playwright                        # python 侧同一个 driver
+sync_playwright().chromium.launch(channel="msedge", headless=True)
+  → PY_DRIVER_OK main_len=590 | 缺数据的速率列显示「—」 | clamp 徽标可见 | edge version 154.0.4258.53
+```
+⇒ **本机不需要 `playwright install`**（`channel="msedge"` 直接吃系统浏览器）；
+CI 的 ubuntu 上没有 Edge，那一步要真的下载 chromium——这条写进 CI 与门禁，不假装它免费。
+
+**四条设计决定**
+1. **用 pytest 档，不引入 node 测试运行器**。种数据只能走生产路径（`tests/e2e/conftest.py` 的规矩：
+   gateway / EvalRunner / AlertService 造数据，不手写 SQL），后端与数据都在 python 侧；
+   换 node runner 就得让 node 去 spawn python 造栈，多一套进程编排还丢掉 marker/CI 的一致性。
+   代价是 python 侧多一个 `playwright` 依赖（进 `dev` extra，实测装得动）。
+2. **新 marker `-m browser`，且 `addopts` 加 `not browser`**。它**不**复用 `e2e`——
+   后端那个 CI job 里没有 node，把浏览器测试塞进 `-m e2e` 会让那一步必红。
+   默认档（量覆盖率那一档）必须继续排除它，否则覆盖率数字会随浏览器抖动。
+   `pyproject` 的 markers 列表与 `test_release_surface.py` 的门禁清单要一起改（那条测试就是防止
+   "有人在 CI 里悄悄删掉一步"的）。
+3. **进程编排由 fixture 全权负责，绝不假设有人在跑服务**：
+   ① 真 uvicorn 在**线程**里跑（复用 `tests/e2e/test_sse.py` 那套 `uvicorn.Server` + 随机端口），
+   provider 一律 **mock**（不碰 GPU、不抢机器级锁）；② `vite --host 127.0.0.1 --port <free> --strictPort`
+   带 `ONYX_API=http://127.0.0.1:<后端口>`（代理默认打 8787，撞车就是假绿）；
+   ③ teardown 必须把两个子进程收干净并**按端口复核**——本机已经实测过 `TaskStop` 报成功而
+   `node.exe` 仍占着 5173，所以"进程句柄还在不在 + 端口还听不听"才是验收判据，不是工具返回值。
+4. **反 flake 的写死规矩**：只用 `get_by_role` / 文本定位 + `wait_for_selector` 之类的**条件等待**，
+   禁止用固定 sleep 断言成败（首次渲染冷启动慢是 dev server 的特性不是应用的）；
+   一个 session 级 browser + 每条测试独立 context；断言只挑"错了就一定是缺陷"的字符串，
+   不锁像素、不做视觉回归（那需要基线图库，是另一件事）。
+
+**测什么（按"只有浏览器能看见"筛，8 条）**
+| # | 断言 | 为什么只有浏览器能看见 |
+|---|---|---|
+| 1 | 六个页面各自渲染出**真数据**（不是 skeleton、不是空面板），且关键数字与它自己打的 API 同源 | 空面板被读成"没人试过"（S25 那次） |
+| 2 | Ledger 的空桶速率列显示「—」而不是 0，折线在此**断线** | S39 那半条正是 SQL 的 0 掉进折线；接口层看是 null，渲染层才看得出有没有被 `?? 0` 顶掉 |
+| 3 | TraceDetail 的 clamp 那条同时出现「仅未 clamp 时成立」「计数器高估（差 N）」「onyx calibrate --model <真名>」 | 结构断言只能证明字符串在代码里，证明不了它被渲染出来 |
+| 4 | Playground 发一发 mock 请求 ⇒ 页面在浏览器里**真的更新**（SSE 帧被消费） | **这就是当年那个静默失效**：TestClient 会缓冲，python 侧只能证明 HTTP 层有帧 |
+| 5 | 侧栏开合状态改变后刷新页面仍保持（localStorage 持久） | 用户实际感知的是这个，vitest 测的是纯函数 |
+| 6 | 布局体检：`scrollWidth <= clientWidth`（无横向溢出）在 1280 与 1600 两档都成立 | 9b97ae1 那次的"贴边框/裁字"就是靠肉眼 |
+| 7 | 关键按钮与标签的文字不是竖排（单个按钮的宽高比异常即红），单位标签 `nowrap` 生效 | 69e32da 修的那个"t/s 一字竖排" |
+| 8 | **断链自检**：把 broker 从 EventFanout 摘掉 ⇒ 第 4 条必须红 | S34 的教训——守断链的测试要连"检测器可用"一起断言 |
+
+**产出文件（计划）**
+```
+pyproject.toml                          # dev extra += playwright；markers 加 browser；addopts 排除
+onyx/web/src/pages/Playground.tsx       # 只在缺少可及名称时补 aria-label（改动最小化，单独提交）
+tests/e2e/browser_stack.py              # 后端线程 + vite 子进程 + 端口复核的 fixture 模块
+tests/e2e/test_pages_browser.py         # 上面 8 条
+tests/unit/test_release_surface.py      # 钉住 addopts 的排除项与 CI 的浏览器 job（含 playwright install）
+.github/workflows/ci.yml                # 新 job：uv sync + npm ci + playwright install chromium + pytest -m browser
+docs/STATUS.md / docs/ROADMAP.md / README.md / docs/IMPLEMENTATION.md / CHANGELOG.md
+```
+
+**自测**
+```bash
+uv run pytest -m browser                          # 本机用 channel=msedge，不下载浏览器
+uv run pytest -q                                  # 默认档必须**不含**浏览器用例（条数不变）
+uv run coverage run -m pytest -q && uv run coverage report   # 90% 不受新档影响
+# 注入自检：把 broker 从 fanout 摘掉 ⇒ 第 4 条红；把 Usage.tsx 的 rate() 改回 ?? 0 ⇒ 第 2 条红
+netstat -ano | grep -E ":(5173|51[0-9]{3})\s+.*LISTENING"   # 跑完之后端口必须干净
+```
+**DoD**：① `uv run pytest -m browser` 本机全绿，**且不依赖任何手工先起的服务**（自己起端口随机的两套）；
+② 摘掉 broker ⇒ 第 4 条必须红（注入缺陷自检，写进归档）；
+③ 默认档条数与覆盖率地板不动（`addopts` 已排除，并由门禁测试钉住）；
+④ CI 有独立浏览器 job，`test_release_surface.py` 要求那一步与 `playwright install` 都在；
+⑤ STATUS §4 与 README/ROADMAP 把"真浏览器仍为 0"改成实际条数，G6 只剩 i18n 一条；
+⑥ 五道门全绿。
+
+**提交**：
+`docs(m12): S40 方案 —— 真浏览器 e2e（可行性已用系统 Edge 实测）`
+`test(e2e): 浏览器栈的进程编排 —— 自己起、按端口收，绝不假设有人在跑服务`
+`test(e2e): 八条浏览器用例 —— 渲染真数据、「—」不变成 0、SSE 在页面里活着、布局不裁字`
+`chore(ci)+gate: 浏览器 job 与 addopts 的排除项一起被钉住`（+ 必要时单独一提 `fix(web): Playground 的可及名称`）
+`docs(m12): S40 归档 + 把"本仓库没有浏览器驱动"这条边界从文档里删掉`
+
+---
+
 ## 附录 A — 每步自测速查
 
 | 步 | 命令 | 绿的条件 |
