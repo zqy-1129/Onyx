@@ -2178,7 +2178,7 @@ uv run pytest                # 1346 passed（S29 新增 11 条 Python：repos 2 
 
 ---
 
-# M11 评测资产（G5）—— S30–S32 已达成，S33 待做
+# M11 评测资产（G5）—— S30–S33 全部达成（视觉与多轮仍按未决实测推迟）
 
 判据（ROADMAP G5）：每个新任务都要求**三条同源断言全绿**（声明的指标 == 产出的指标、
 CI 的分母同源、分数能下钻到真实 trace）；真机跑一次带分母与 CI；
@@ -2503,7 +2503,7 @@ uv run ruff check . · uv run lint-imports（3 kept）· check_extension_boundar
 `docs(m11): S32 档案`
 
 
-## S33 — embedding 任务（M11 收口）
+## S33 — embedding 任务（M11 收口）✅
 
 能力位 `Cap.EMBED` 从 S3 起就存在，但**没有任何消费点**：没有 embed 调用路径、
 `TraceKind.EMBED` 这个枚举位自诞生起零写入方（实测 grep 零命中）。
@@ -2582,16 +2582,85 @@ tests/unit/test_embedding_dataset.py · test_semantic_similarity_grade.py · tes
   反义=受控反义词表替换，无关=跨话题采样），数据集测试要能查出
   "反义替换其实没换极性"与"候选池里 gold 不唯一"。
 
+**落地时新增的一条设计约束（计划里没有）**
+排名判据必须写死**并列裁决**：同分时按池内序号小者优先。不写死的话，
+"同一份数据、同一个模型"两次能跑出不同名次——而 embedding 的输出确实会抖
+（实测重复调用同一条文本，向量之间 cos 有 ≤3e-4 的差），并列不是罕见情况而是常态。
+
+**顺带挖出的三处真缺陷**（都在"分数能不能回答它是哪份数据考出来的"这条前提上）
+1. **能力闸门问错了对象**（`aa4b94b`）：`EvalRunner` 读 `provider.capabilities()`，
+   对 Ollama 那是**通道基线**（chat/tools/structured/stream/admin），而 embedding 是模型级事实。
+   真机第一次跑就被挡下：`SKIPPED … 需要能力 ('embed',)`，而同一时刻 `/api/embed` 正常出向量。
+   这个 skip 的读法恰好最坏——看起来像"这个模型不行"。现在判据是
+   provider 级 ∪ **该模型自报**（`/api/show` 实测：qwen3-embedding 报 `embedding`、
+   qwen3.5:9b 不报，所以正向能跑、负向真 skip）；显式传入的 caps 优先且不去问引擎；
+   `show_model` 失败退回 provider 级并 warn，探测失败不该把整轮判死也不能静默。
+2. **`onyx models pull` 的成败判据恒为 false**（`507f02c`）：按 `last["done"]` 判，
+   而 0.35.1 的收尾是 `{"status":"success"}`，没有 `done`。S33 的第一步就是被它挡住的
+   （"拉取失败"但其实已经在盘上）。
+3. **样本重写的触发条件依赖人的自律**（`37c70b3`）：S32 那次修的是"库里没有就不写"，
+   但触发仍然只看 `revision`。这次改了语义框里一个词而 revision 串没动 ⇒ 判据安静地没响，
+   12 条 grade 里 3 条又点不到样本。现在条件加上第三条：**本次要考的每条 id 都必须在库里**——
+   这才是"分数能反查样本"的真正不变式。
+
+**契约测试随协议泛化**（这一步真正想验的东西）
+`tests/contract/test_task_contract.py` 原来写死用 `Generation` 造样本，
+于是它隐含宣布"只有生成式任务能通过验收"。现在 `_shapes` 先看任务自己的 `build()` 返回类型，
+按类型造 `Generation` 或 `Embedding`；`build` 那条断言也改成"必须是这两种请求之一"，
+因为 runner 是靠类型分派的——写死任一种，下一个任务族就得改内核。
+
 **自测**
 ```bash
-uv run pytest tests/unit/test_embedding_dataset.py tests/unit/test_semantic_similarity_grade.py
-uv run pytest tests/contract            # EmbeddingProvider 缺位时必须明确 unsupported
-uv run onyx eval run --task semantic_similarity --model qwen3-embedding:0.6b   # 真机
-uv run onyx eval run --task semantic_similarity --model qwen3.5:9b             # 能力闸门：整场 skip + 原因
+uv run pytest tests/unit/test_embeddings_zh_dataset.py tests/unit/test_semantic_similarity_grade.py \
+              tests/unit/test_semantic_similarity_run.py tests/unit/test_embedding_path.py \
+              tests/unit/test_embedding_gateway.py tests/unit/test_eval_runner_embed.py
+uv run pytest tests/contract     # 143 条：EmbeddingProvider 缺位时必须明确 unsupported，
+                                 # 有 embed 的签名必须收 trace_id/on_event（4 个实现各跑一遍）
+uv run onyx eval run --task semantic_similarity --model qwen3-embedding:0.6b --seed 42   # 真机正向
+uv run onyx eval run --task semantic_similarity --model qwen3.5:9b                        # 真机负向：整场 skip
 ```
-**DoD**：三条同源对新任务全绿（矩阵第 6 列）；`recall@1` / `mrr` / `antonym_first_rate` 各自带分母；
-无 EMBED 能力的模型走 skip 且原因可行动；真机一次留下维度、批次数、load/compute 分界
-与"反义抢占"的具体条数；`TraceKind.EMBED` 从"有枚举无写入方"变成有写入方且有断言守着。
+**本机验证**
+```bash
+uv run onyx eval tasks      # 6 个任务：指标数按 id 序 22 / 22 / 29 / 28 / 26 / 29（semantic_similarity=28）
+uv run onyx eval run --task semantic_similarity --model qwen3-embedding:0.6b --seed 42
+  ⇒ run 01M47MYTYE1MAB2N28171DV3YR（git_rev 37c70b3，12/12 done，1.39s 热态 / 18.0s 含首次载入，444 in tok）
+     score 0.833 [95% CI 0.583–1.000]（n=12 case）· recall@1 0.833 · recall@k 1.000（top_k=3）· mrr 0.917
+     anti_first_rate 0.167 · anti_above_gold_rate 0.167 · 判定 correct 10 / partial 2
+     mean_gold_sim 0.9659 · mean_antonym_sim 0.9200 · mean_unrelated_sim 0.3567 · sim_gap 0.0459
+     dimension 1024 · requests 12（一条 case 一个请求）· inputs_total 60 · reported_in_tokens 12/12
+     by_topic 每格带 cases：仓储 0.5 / 安全 0.5（各 2 条，掉分都在这两格），其余四格 1.0
+     ⇒ **掉的那两条正是"反义抢占"**：`密封圈没有转入B 号货架` 与 `无关人员没有进入配电间`
+       排在了真正的同义句之前。这一列有区分度，且区分的是 embedding 模型的真短板
+  负向 ⇒ run（qwen3.5:9b）`SKIPPED · 需要能力 ('embed',)`，一条请求都不发（`/api/show` 确实不报 embedding）
+uv run pytest                # 1637 passed, 1 skipped, 36 deselected · 覆盖率 90%
+uv run pytest -m e2e         # 12 passed（矩阵现在 6 列）
+uv run ruff check . · uv run lint-imports（3 kept）· check_extension_boundary
+#   S33 被门禁切成四个提交，正是它设计的用途：内核（types / gateway+协议 / runner 分派 / 能力闸门）
+#   与实现（providers、任务）不许同批提交 ⇒ `onyx eval runner.py` 与 `llm/gateway.py` 各成一次改动
+前端无改动（tsc / vitest 106 / build 复用 S30 的结果；矩阵与看板是通用渲染，新任务自动出现）
+```
+新增测试：数据集 14 · 判分与聚合 13 · mock 真跑 8 · provider 通路 9 · gateway 通路 8 ·
+runner 分派 4 · 能力闸门 3 · 契约（可选协议形状）4。
+
+**DoD**
+- ✅ 三条同源对新任务全绿，且**契约测试只改了"按请求类型造样本"这一处泛化**，没为任务开特例
+- ✅ 矩阵第 6 列出现（`qwen3.5:9b` 行 0.920 / 0.991 / 1.000 / 0.893 / 0.639 + 新任务的 0.833）
+- ✅ 无 EMBED 能力的模型整场 skip 且原因可行动（真机验过正例与负例两端）
+- ✅ `TraceKind.EMBED` 从"有枚举位、无写入方"变成有写入方，并有断言守着（`kind` 由入口决定）
+- ✅ 真机留下维度 1024、每 case 一个请求、444 tok、load 与 compute 的分界（18.0s → 1.39s）
+- ✅ 这一列**有区分度**：0.833 而不是 1.000，掉的两条能指名道姓归因到"反义抢占"
+
+**提交**：
+`feat(core): L0 加 EmbedRequest / Embedding（9387254）` ·
+`feat(llm): gateway.embed 入口 + EmbeddingProvider 可选协议（15866f6）` ·
+`feat(llm): /api/embed 实现 + mock 确定性向量（8b4da59）` ·
+`fix(llm): /api/pull 的成败判据按实测形状改（507f02c）` ·
+`fix(scripts): 受保护的内核文件不许充当"接入实现"（13107b2）` ·
+`feat(eval): EvalTask 协议认得多种请求，runner 按类型分派（5f44551）` ·
+`fix(eval): 能力闸门要问"这个模型"（aa4b94b）` ·
+`feat(eval): semantic_similarity 中文同义/反义排序（014f948）` ·
+`fix(eval): 样本重写的触发条件加上"要考的每条 id 都在库里"（37c70b3）` ·
+`docs(m11): S33 档案`
 
 
 ---
@@ -2717,7 +2786,8 @@ uv run python scripts/check_extension_boundary.py  # 无新增扩展点实现
 | S31 | `onyx eval run --task instruction_following --model qwen3.5:9b --seed 42` + `pytest tests/unit/test_instructions_zh_dataset.py` | 39 条题的 `unsatisfiable()` 为空，而**收紧某题字数上限时它必须点名那道题**；三个口径同时出且互不相等（0.920 / 0.916 / 0.641）；`by_kind` 每种带分母且未考的类型不出现；空正文的 run 得 0 分而不是「没考到」 |
 | S34 | `uv run pytest -m e2e`（默认套件把它 deselect 了，必须显式跑） | 六页取数互相核对得上；每条 grade 的 trace_id 查得到真实 trace；真 uvicorn + 真 httpx 能读到 `hello → trace_start → trace_end`；把 broker 摘掉后**只剩 hello**（断链会被发现） |
 | S32 | `onyx eval run --task long_context --model qwen3.5:9b --seed 42 --num-ctx 20480` + 同参数改 `--split 16k --num-ctx 4096` | 前者 9/9 全对且 `by_position` 三个位置各 n=9、`max_ctx_util 0.8201`、`reported_in_tokens 9/9`；后者**必须整场 `score —` 而不是 0.000**（每条 grade 自带"引擎只回报 2050 tok，下限至少 13525 tok"这句话）；`digits_only_in_needles` / `value_string_collisions` / `ambiguous_questions` 三条考卷自检在注入缺陷时都要响 |
-| 门禁 | `make coverage`（`coverage run -m pytest -q`） | 离线套件分支覆盖率 ≥ 80%（S17 落地时 88%，S21 后 89%，S23/S26 后仍 89%，M10 后 90%，S30–S32 后仍 90%） |
+| S33 | `onyx eval run --task semantic_similarity --model qwen3-embedding:0.6b --seed 42` + 同任务换 `--model qwen3.5:9b` | 前者 `score 0.833`、`anti_first_rate 0.167`、`dimension 1024`、`requests 12`（一条 case 一个请求）、grade 12/12 能反查样本与 kind=embed 的 trace；后者**必须整场 SKIPPED 且一条请求都不发**（模型级能力判定，不是 provider 级）；三条考卷自检（同义句抄原句 / 反义句丢否定 / 无关项含全部实体）都要在注入缺陷时点名那一道题 |
+| 门禁 | `make coverage`（`coverage run -m pytest -q`） | 离线套件分支覆盖率 ≥ 80%（S17 落地时 88%，S21 后 89%，S23/S26 后仍 89%，M10 后 90%，S30–S33 后仍 90%） |
 
 ## 附录 B — 架构自测（让"模块化"可验证，而非口号）
 
