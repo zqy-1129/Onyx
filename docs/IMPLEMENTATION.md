@@ -3067,7 +3067,7 @@ uv run ruff check . && uv run lint-imports && uv run python scripts/check_extens
 ④ 摘掉 `builtin_visitors()` 里的 timing ⇒ 端到端那条红（测试里就带着这个注入） ✓；
 ⑤ 五道门全绿 ✓。
 
-## S38 — 两个欠着的入口：`onyx token explain` 与 `onyx report usage`
+## S38 — 两个欠着的入口：`onyx token explain` 与 `onyx report usage` ✅
 
 **为什么是这一步**：STATUS §4 把它定性为"每天都在用但入口缺失"。今天要看一次
 "这条 trace 的 token 数为什么是这个数"，只能人脑里跑一遍对账；要看跨模型的用量汇总，只有看板有
@@ -3129,6 +3129,86 @@ uv run onyx --help && uv run onyx token --help && uv run onyx report --help
 
 ---
 
+## S38 ✅ 实测：`token explain` 第一次跑就把它自己判成缺陷，`report usage` 第一次跑就查出一个静默空表
+
+**四问答上了（真机 bench trace `01M47VS1R1W97BYHSX0TVW3WPR`）**
+```
+采信：engine 置信度 high 漂移 31.58%
+engine  采信        in=475  out=32
+heuristic 有数（未采信） in=625  out=24     → Δin +150 (+31.6%)
+fitted  没报数（n=0，需≥30）
+分段闭合（Σ非 output 分段 vs 采信 in）：✗ 不闭合｜求和 621 vs 采信 475，差 +146 tok   ← 退出码 1
+```
+退出码在真机上确认为 1（`--json` 同样 1，`closure={checked:True, closed:False, sum:621, reported:475, delta:146}`）。
+
+**闭合不是"偶尔不闭合"，是几乎从不闭合**。拿最新 200 条统计：
+```
+有分段归因的 163 条里：闭合 2 条｜不闭合 161 条（未判定 37 条）
+不闭合的形状：bench 621 vs 475（+30.7%）×9、2490 vs 1903（+30.8%）×6、
+             eval 286 vs 245、119 vs 97、281 vs 241 …
+闭合的那 2 条都是 in=17 的一元 chat（分段只有一个 messages，没什么可错）
+```
+⇒ **`traces show` 那张表的标题「Σ分段 + template_ctl = 引擎计数」目前是宣称一个不成立的等式**。
+不闭合的比例与 prompt 长度大致成固定比（bench 两档都恰好 +30.7%/+30.8%），
+所以它不是噪声，是归因路径上一个随长度线性放大的固定多算——但**这一步不去修它**：
+修它要动 `obs/visitors/token.py` 与 reconciler（内核），而 S38 的产出是两个只读入口。
+已登记为 **S39**，判据用这里的真实数字（见 ROADMAP 待办与 STATUS §3）。
+
+内核其实**早就在报这件事**：161 条不闭合的 trace **全部**带 `ATTRIBUTION_CLAMPED`
+（"分段计数之和超过引擎计数 ⇒ 归因不可信"；全库这个码有 485 行），
+闭合的那 2 条一条都没有。⇒ `token explain` 的闭合检查与内核异常判据在真机上完全同向——
+这说明缺的从来不是检测，是**一个把它讲给人听、并且退出码会响的入口**。
+
+**`--since 7d`：用自己的命令一次就撞出来的静默空表**
+第一反应就是写 `--since 7d`——它不报错，它给出 `traces=0` 加一行
+"（这个范围里没有 trace —— 不是 0 花费，是没有任何请求）"。原因很机械：库里的
+`started_at` 全是 `2026-10-06T06:03:37.824526+00:00` 这一个形状，过滤是**字典序**比较，
+而 `'7' > '2'`，所以 `7d` 比所有行都大。⇒ `report/usage_report.normalize_since()`：
+只认 `YYYY-MM-DD` 与 ISO 时间，naive 按 UTC 理解，带时区的先折成 UTC
+（`2026-10-01T00:00:00+08:00` → `2026-09-30T16:00:00+00:00`——不折算的话边界前那一发会被静默丢掉，
+这条有专门的测试同时断言"折了收 1 条"与"不折收 0 条"）；`2026-13-45` 这种形状对、日子不存在的也要拦。
+校验放在 `build_overview()` 里（CLI 与 API 都过它），CLI 侧再提前校验一次是为了
+**不把库里抛的 ValueError 报成"--since 写错了"**。现在：终端 exit 2、HTTP 400，
+消息里给出今天与"最近 7 天该写哪一天"（日期由代码算，不写死）。
+
+**与计划的偏差（三条）**
+1. 计划说"顺手把路由里手写的 p50 与 0.10 换成共享实现"——换完之后发现两边不止常量相同、
+   **判据本身不同**：汇总里的"超阈条数"只看相对差，而 `TOKEN_DRIFT` 异常还要求绝对差 ≥ 24 tok。
+   真机 2298 个样本里相对差超阈 721 条、异常 711 条——**只差 10 条也是两个量**（被挡掉的那几条
+   是 `in=120, pct=0.15` 这种：绝对差 16~18 tok，短 prompt 上两个门槛分得很开）。
+   **没有把它统一成一条判据**（那是改口径、要另一步论证），而是让汇总自己说清用的是哪条：
+   `drift.rule` + `drift.min_tokens_for_anomaly` 随数字一起出，`--fmt` 三种渲染都带上。
+2. 计划没预计要改 `--since`；它是"入口补齐"这一步的固有产物——**入口被人用一次，
+   静默失败就当场变成错误结论**。这一类（形状对但值不存在、能过正则过不了日历）已进 creed。
+3. 计划也没预计要动"0 与「—」"：写渲染层的浮点分支时才发现 `UsageRepo.timeseries` 用
+   `COALESCE(AVG(...),0)`，于是**"这一格没测到延迟"与"测到 0 t/s"在数据里是同一个值**，
+   而三种渲染只有一半认得（纯文本表走 `_num` 显示「—」、markdown 显示 `0`、CSV 写 `0.0000`
+   ——最后那种会让下游脚本把一个 0 平均进吞吐里）。这一步只做**渲染层对齐**：
+   `RATE_COLUMNS` 那一组列的 0 一律「—」/空，**而 token 数的 0 照写 0**（空输出是真的 0，
+   不是没测；这条不对称也断言了，否则"统一成「—」"看起来更像修好了）。
+   根因（SQL 的 COALESCE + 看板 `Number(x ?? 0)` 两处）留在 S39 那一步连前端一起收。
+
+**本机验证**
+```bash
+uv run pytest tests/unit/test_measurement_explain.py tests/unit/test_report_usage.py \
+              tests/unit/test_cli_token_report.py -q                 # 41 passed（10 + 21 + 10）
+uv run onyx token explain 01M47VS1R1W97BYHSX0TVW3WPR; echo $?       # 1（不闭合会响）
+uv run onyx report usage --since 2026-10-01                          # 2335 条，rule 行照印
+uv run onyx report usage --since 7d; echo $?                         # 2 + 能用的写法（以前是 0 + 空表）
+# CLI 与看板同源：同一份库、同一时刻，`--fmt json` 与 /api/usage/summary?bucket_minutes=360 逐字段 ==
+#   → 12 个字段全等（traces=2335，13 个时间桶），?since=7d 在真 HTTP 上是 400
+uv run coverage run -m pytest -q && uv run coverage report           # 1801 passed + 1 skipped，90% ≥ 85
+                                                                     #   （14,942 句 / 3,728 分支；usage_report 100%）
+uv run ruff check . && uv run lint-imports                           # All checks passed / 3 contracts kept
+uv run python scripts/check_extension_boundary.py                    # 无新增扩展点实现（这一步没碰扩展面）
+```
+**把校验摘掉会不会红**（注入缺陷自检，真的跑过）：把 `build_overview()` 里的
+`since = normalize_since(since)` 删掉 ⇒ **9 条红**（6 种坏写法各自红、"不折 UTC 就丢边界那一发"红、
+API 那条不再 400、`--since` 归一化红）。CLI 那条 `exit 2` 不跟着红——因为 CLI 自己还校验了一次，
+**两处校验各自独立被守住**，这正是要的形状（少一处还有另一处，两处都在才谈得上同源）。
+
+---
+
 ## 附录 A — 每步自测速查
 
 | 步 | 命令 | 绿的条件 |
@@ -3171,7 +3251,7 @@ uv run onyx --help && uv run onyx token --help && uv run onyx report --help
 | S35 | `uv run onyx tools contract` + `uv run pytest tests/unit/test_tools_mcp_stdio.py` | 5 列且 `mcp_stdio 通过 8 · 失败 0 · 不适用 0`（真子进程，连跑两次一致）；把 `mcp_stdio` 的样本换成起不来的命令 ⇒ 那一列变 `unavailable` 带原因而其余四列照旧；`_request` 去掉会话锁 ⇒ 并发那条测试 5 次里 4 次红 |
 | S36 | `uv run onyx perf run --model qwen3.5:9b --prompt-chars 600,2400 --target-tokens 64 --concurrency 1,2 --repeat 1 --device rtx4060ti-16g` + `onyx perf compare A B` + `uv run pytest -m live tests/integration/test_perf_live.py` | 基线落库且 `状态 done`、指纹可复现（同参数两次跑出同一个 `env_hash`）；换网格的第三条与第一条比 ⇒ **退出码 1 并逐字段列出 `grid`**，加 `--force` 才给差值且结果头上印警告；`--provider mock` 退出码 2；真机那条断言 `timing_source == engine_ns` 且每个数字点得回真 trace；把 `FINGERPRINT_FIELDS` 里删掉任一字段 ⇒ 契约测试点名那个字段红 |
 | S37 | `uv run pytest tests/unit/test_obs_timing.py tests/unit/test_streaming.py -q` + `uv run onyx chat --model … --stream …` + `uv run pytest tests/integration/test_gateway_live.py -m live` | 流式那一发：CLI 表里 TTFT 有数（不再是「—」）、库里 `usage.ttft_ms` 与 `trace.first_token_at` 同时非空且 `ttft_source=measured`、且 `finished − first_token ≈ wall − ttft`（旧行为差整段生成时间）；非流式那发留空但写明 `proxy:prompt_eval_duration`；把 `timing` 从注册表摘掉 ⇒ 落库那条必须变回空 |
-| S38 | `uv run onyx token explain <trace_id>` + `uv run onyx report usage --fmt csv` | 四问齐答（采信为何落这档 / 各来源差值 / 分段是否闭合 / 离标定还差几个样本），且 CLI 与 `/api/usage/summary` 逐字段相等（同一份库同一时刻）；把一个 part 的 tokens 改大 ⇒ `token explain` 退出码 1 并印出差值；时间桶没 trace ⇒ 不产生 0 行 |
+| S38 | `uv run onyx token explain <trace_id>` + `uv run onyx report usage --fmt csv` + `uv run onyx report usage --since 7d` | 四问齐答（采信为何落这档 / 各来源差值 / 分段是否闭合 / 离标定还差几个样本），且 CLI 与 `/api/usage/summary` 逐字段相等（同一份库同一时刻：实测 12 字段全等）；把一个 part 的 tokens 改大 ⇒ `token explain` 退出码 1 并印出差值（真机 bench 那条本来就差 +146 tok，同样是 1）；时间桶没 trace ⇒ 不产生 0 行；`--since` 写不成 ISO ⇒ 退出码 2/HTTP 400，**不是**一张看起来像"没跑过"的空表 |
 
 ## 附录 B — 架构自测（让"模块化"可验证，而非口号）
 

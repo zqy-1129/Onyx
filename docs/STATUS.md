@@ -174,11 +174,14 @@ WAL + 批量 sink（队列满丢样本但 `dropped` 计数可见）、
 - **预算用完是"没测到"**：`status=partial` + `perf show` 列出欠哪几格；默认网格刻意小（≤24 发）
 
 ### L6 接口
-- **CLI 47 条命令**：顶层 7（`chat` / `serve` / `doctor` / `plugins` / `version` / `calibrate` / `rotate`）
-  + 分组 40（`db 5` / `probe 4` / `perf 4` / `models 4` / `traces 3` / `tools 9` / `eval 8` / `config 1` / `alerts 2`）
+- **CLI 49 条命令**：顶层 7（`chat` / `serve` / `doctor` / `plugins` / `version` / `calibrate` / `rotate`）
+  + 分组 42（`db 5` / `probe 4` / `perf 4` / `token 1` / `report 1` / `models 4` / `traces 3` /
+  `tools 9` / `eval 8` / `config 1` / `alerts 2`）
   ——`models pull|rm` 是 S26 补的出口（且 `sync`/`ls` 一起补上 `--provider`：
   pull/rm 能指到别的通道而它们不能，就会出现「拉得下来、同步不上」），`alerts ls|test` 是 S27 补的，
-  `perf run|ls|show|compare` 是 S36 补的
+  `perf run|ls|show|compare` 是 S36 补的，
+  **`token explain` / `report usage` 是 S38 补的**（多源对账与用量汇总此前只有看板有，CLI 与脚本没有）
+
 - **部署配置 `onyx.toml`**（S20）：provider / GPU 锁 / 保留窗口 / sandbox / serve 绑定 / **告警** 收在一处。
   优先级只有一条规则 **flag > 环境 > 文件 > 默认**；`onyx config show` 逐项标出它来自哪一层，
   `onyx doctor` 把"写了不生效"的未知键与坏类型报成红项（模板见 `onyx.example.toml`）。
@@ -227,18 +230,18 @@ WAL + 批量 sink（队列满丢样本但 `dropped` 计数可见）、
 ## 2. 质量门与规模
 
 ```
-uv run pytest            # 1760 passed, 1 skipped, 38 deselected（默认档就是离线套件，CI 用它量覆盖率。S32 三个文件 58 条 + S33 六个文件 60 条 + 样本重写与能力闸门 6 条；`test_task_contract.py` 41 → 49 条：多一个任务就多 8 条断言，一行任务专属逻辑都不用加。S33 只逼它泛化了一次——原来写死用 `Generation` 造样本，现在按任务自己 `build()` 的返回类型造。S35 加的 11 条：真 stdio 列的隔离/并发/迟到回答 +5（`test_tools_mcp_stdio.py` 7 → 12）、第五列（存在·出处·无豁免·起不来=未知）+3、覆盖率地板的钉子 +1、settle 与库里的顺序 +2。S36 加的 97 条：口径收敛 7、perf 的网格/语料/采集/落库 62、可比性契约 17、CLI 的"四条拒绝与三种读数" 11。S37 加的 16 条：`test_obs_timing.py` 13（事件→状态→落库，含"摘掉注册就会红"）+`test_streaming.py` 2（首字事件的发射时机与只发一次），外加一条文档结构检查（表格一行必须写完，S36 曾把 README 的进度表撑成 17 行）
+uv run pytest            # 1801 passed, 1 skipped, 38 deselected（默认档就是离线套件，CI 用它量覆盖率。S32 三个文件 58 条 + S33 六个文件 60 条 + 样本重写与能力闸门 6 条；`test_task_contract.py` 41 → 49 条：多一个任务就多 8 条断言，一行任务专属逻辑都不用加。S33 只逼它泛化了一次——原来写死用 `Generation` 造样本，现在按任务自己 `build()` 的返回类型造。S35 加的 11 条：真 stdio 列的隔离/并发/迟到回答 +5（`test_tools_mcp_stdio.py` 7 → 12）、第五列（存在·出处·无豁免·起不来=未知）+3、覆盖率地板的钉子 +1、settle 与库里的顺序 +2。S36 加的 97 条：口径收敛 7、perf 的网格/语料/采集/落库 62、可比性契约 17、CLI 的"四条拒绝与三种读数" 11。S37 加的 16 条：`test_obs_timing.py` 13（事件→状态→落库，含"摘掉注册就会红"）+`test_streaming.py` 2（首字事件的发射时机与只发一次），外加一条文档结构检查（表格一行必须写完，S36 曾把 README 的进度表撑成 17 行）。S38 加的 41 条：`test_measurement_explain.py` 10（阶梯逐档状态/差值符号/闭合判定/标定还差几个样本）、`test_report_usage.py` 21（p50 只用唯一那份定义 + 阈值只用 `reconciler` 那一个常量 + CLI/API 同数 + `--since` 的 6 种坏写法与"不折 UTC 就丢边界那一发"的对照 + 三种渲染的数据行与「—」规则）、`test_cli_token_report.py` 10（退出码：不闭合 1、`--since 7d` 2、未知 trace 2 且给出下一步）
 uv run pytest -m e2e     # 12 passed（S34：六页取数同源 10 条 + SSE 真 HTTP 消费与"断链自检"2 条。默认档把它 deselect 了，CI 里是独立一步）
 uv run pytest -m live     # 22 passed（真打 qwen3.5:9b，与评测共用机器级 GPU 锁。S36 加了一条真机最小网格：断言引擎真的回报纳秒分段，且每个基线数字点得回真 trace；S37 加了一条流式的：`first_token_at` 与 `wall_ms − ttft_ms` 必须讲同一个故事，非流式那一发则断言代理值不冒充测量）
 uv run pytest -m probe     # 4 passed（P 系列实验的可重跑版本）
 uv run ruff check .         # All checks passed（`ruff format` 不是门禁）
 uv run lint-imports          # 3 contracts kept（网络例外 2 条：executors.http + sinks.otlp/alerts.webhook 合并在契约 2，每条写明是谁与为什么）
-uv run coverage run -m pytest -q && uv run coverage report   # 90% ≥ 85%（分支覆盖，离线套件，13,905 句 / 3,432 分支。**地板 S35 从 80 抬到 85**：80 配 90 的实测意味着一次 -10 个点的真实退化会全绿通过，而"门禁在守"看起来照样成立。比 S33 那次少 1 个点主要是 `tools/reference_mcp_server.py` 进了包——57 句里 48 句只在**子进程**里跑，父进程量不到；没有 omit 它，让"这里量不到"留在数字里比藏起来好）
+uv run coverage run -m pytest -q && uv run coverage report   # 90% ≥ 85%（分支覆盖，离线套件，14,942 句 / 3,728 分支；S38 新文件里 `usage_report.py` 100%（95 句 / 26 分支全中）、`explain.py` 96%。**地板 S35 从 80 抬到 85**：80 配 90 的实测意味着一次 -10 个点的真实退化会全绿通过，而"门禁在守"看起来照样成立。比 S33 那次少 1 个点主要是 `tools/reference_mcp_server.py` 进了包——57 句里 48 句只在**子进程**里跑，父进程量不到；没有 omit 它，让"这里量不到"留在数字里比藏起来好）
 uv run python scripts/check_extension_boundary.py   # 接入实现未触碰受保护内核文件（S30 因此把 RunReport 那条修复单独成一个提交）
 uv run onyx doctor            # 9 项体检（带网络 10 项）：配置 / Python / 可写 / 磁盘 / 迁移 / blob / 档位 / 告警 / 插件
 uv run onyx config show       # 每一项生效值标出来自 flag/环境/文件/默认哪一层（token 与 webhook URL 只报"已设置"）
 uv build && uv tool install --from dist/*.whl …  # 干净环境装起来：version / db init / chat(mock) / doctor 全通
-前端：tsc --noEmit / vitest 106 / vite build（235.89KB js）+ 浏览器 take_snapshot
+前端：tsc --noEmit / vitest 109（10 个文件）/ vite build（237.95KB js，gzip 77.55KB）+ 浏览器 take_snapshot
 API：openapi 32 paths / 34 operations（含 `GET /api/stream` SSE）
 CI：.github/workflows/ci.yml 跑上面这些（本机已验证命令本身可跑通；仓库尚无远端 ⇒ 还没真跑过一次）
 ```
@@ -418,6 +421,14 @@ S23 在浏览器里真跑过：`--provider mock` 的 serve 上点「开始评测
   `on()`，需要改内核才修得好本身就是抽象不够用的信号。同一批换掉了
   `test_gateway_live.py` 里那句恒成立的断言（`x is None or x`），并补了一条流式正向断言
   （时刻必须落在 trace 窗口内）。历史行仍然是 NULL——回填它们等于伪造当时没测到的数。
+- **`Σ分段 + template_ctl = 引擎计数` 目前几乎不成立**（S38 的 `token explain` 第一次跑就查出来的）：
+  最新 200 条里有分段归因的 163 条**只有 2 条闭合**（那 2 条是 in=17 的一元 chat，没什么可错）。
+  形状很稳定：bench 两档分别 +30.7%（621 vs 475）与 +30.8%（2490 vs 1903），eval 各条 +16~23%
+  ⇒ 不是噪声，是归因路径上一个随 prompt 长度放大的固定多算（这 161 条**全部**带着
+  `ATTRIBUTION_CLAMPED` 异常，闭合的那 2 条一条都没有 ⇒ 检测一直有，缺的是把它讲给人听的入口）。
+  影响面：**`traces show` 那张分段表的标题是一个等式**，而未拟合模型上它只是"各段各自估的数"。
+  未修的原因不是不重要，是它要动内核（`obs/visitors/token.py` 与 reconciler 的归因口径），
+  而 S38 的产出是两个只读入口——已登记为 **S39**（见 §4 第 5 条）。
 - 非 ollama provider 的 `base_url` 目前仍记录 CLI `--url` 的默认值
   （修它要把散在 6 处的默认值提成常量并区分"用户没填"）。
 - `RECONCILED` 事件在契约与 `PAYLOAD_REQUIRED` 里存在、token visitor 也消费它，
@@ -456,8 +467,14 @@ S23 在浏览器里真跑过：`--provider mock` 的 serve 上点「开始评测
    **G6 还剩两条**：真浏览器驱动（Playwright，仍为 0）与 i18n 抽取（挂在"是否对外发行"上，可长期搁置）。
    S36 查出的缺陷也在同一步系列里结案：**TTFT 曾经没有写入方**（S37 接上，见 L3）。
    视觉任务仍等 U8/U9 的未决实测。
-4. **`token explain` + `report usage`**：都属于"每天都在用但入口缺失"。
-5. C 组三条一致性（`RECONCILED` 不发、`base_url` 默认值、兼容通道探针覆盖）适合凑成一次"口径一致性"清理。
+4. ~~**`token explain` + `report usage`**：都属于"每天都在用但入口缺失"~~（**S38 已交付**：
+   两个入口 + 一个 `report/usage_report.py` 的共同实现，CLI 与 `/api/usage/summary` 逐字段相等；
+   `--since` 写错格式从"静默空表"改成退出码 2 / HTTP 400）。
+5. **S39：分段归因不闭合**——`onyx token explain` 第一次跑就把自己判成缺陷：最新 200 条里
+   有分段的 163 条**只有 2 条闭合**（bench 恒定 +30.7%、eval +16~23%）。要么按采信总数缩放分段，
+   要么把 `traces show` 那张表的标题从等式改成"参考"。**它要动内核（`obs/visitors/token.py` +
+   reconciler），所以单独成一个提交**，不与只读入口混在一起。
+6. C 组三条一致性（`RECONCILED` 不发、`base_url` 默认值、兼容通道探针覆盖）适合凑成一次"口径一致性"清理。
 
 核对方式（本文数字的来源）：
 
