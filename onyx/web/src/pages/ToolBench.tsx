@@ -210,9 +210,11 @@ function MatrixPanel() {
       {!matrix && !error ? (
         <EmptyState
           title="还没跑过"
-          hint="这一格会真的在离线样本上跑一遍各执行器（http 用 MockTransport、MCP 用假连接），"
+          hint="这一格会真的跑一遍各执行器（http 用 MockTransport、mcp 用假连接、"
           >
-          <div className="empty-hint">所以它由人点一次，不轮询。</div>
+          <div className="empty-hint">
+            mcp_stdio 起一个真子进程走真管道，所以是秒级；全程零真实网络，但仍由人点一次，不轮询。
+          </div>
         </EmptyState>
       ) : null}
       {matrix ? (

@@ -17,6 +17,9 @@
    （管道满），把它丢掉会丢诊断。这里持续排空 stderr 并只保留尾部若干行。
 4. **超时要真的能退出。** `run_with_deadline` 到点只放弃等待，线程杀不掉；
    所以读循环本身带超时，并且超时后**立刻关掉子进程**，否则僵尸 server 会攒成句柄泄漏。
+   被放弃的那一笔仍在读管道，所以一条管道**只允许一个读者**：stdout 由一条常驻线程
+   排空进队列，整个"写请求→等回答"在会话锁内串行，超时过的连接当场作废（见 `McpPool.discard`）。
+   三条合起来才保证"一次慢调用不会让下一个调用莫名其妙拿到空答案"。
 
 协议版本：优先 `2025-06-18`，服务器可以回它支持的版本；不支持的版本不做兼容猜测，
 直接报错并说明——"能跑但语义不同"比"跑不了"更难查。
@@ -157,6 +160,9 @@ class StdioTransport:
         )
         self.stderr_tail: list[str] = []
         self._drain_stderr()
+        #: stdout 也交给常驻线程排空，`read()` 只从队列取（见 `_pump_stdout`）
+        self._lines: queue.Queue[Any] = queue.Queue()
+        self._pump_stdout()
 
     def _drain_stderr(self) -> None:
         """持续排空 stderr。不排空会在管道满时死锁——现象是 server 卡住而不是报错。"""
@@ -176,6 +182,31 @@ class StdioTransport:
                 return
 
         threading.Thread(target=pump, daemon=True, name=f"mcp-stderr-{self.spec.name}").start()
+
+    def _pump_stdout(self) -> None:
+        """一条常驻线程把 stdout 逐行塞进队列，`read()` 只负责取。
+
+        不能"每次 read 起一个线程然后超时就不管它"：那次读超时之后，线程仍阻塞在
+        `readline()` 上，它会把**下一笔调用**的回答读进一个没人看的队列里。现象是
+        后续调用拿到空结果或"没有响应"，而那次超时的调用早已返回——被污染的连接
+        看起来是新问题。常驻队列保证管道里到达的每一行都按顺序进同一个地方。
+
+        读结束时放一个 `None`：正在等的 `read()` 立刻知道是 EOF，而不是傻等到超时。
+        """
+
+        def pump() -> None:
+            handle = self.process.stdout
+            if handle is None:
+                self._lines.put(None)
+                return
+            try:
+                for raw in handle:
+                    self._lines.put(raw)
+            except (ValueError, OSError):
+                pass    # close() 关掉管道：与 stderr 线程同一条理由，正常关闭不是故障
+            self._lines.put(None)
+
+        threading.Thread(target=pump, daemon=True, name=f"mcp-stdout-{self.spec.name}").start()
 
     def write(self, payload: dict[str, Any]) -> None:
         if self.process.poll() is not None:
@@ -199,33 +230,15 @@ class StdioTransport:
             ) from exc
 
     def read(self, timeout: float) -> dict[str, Any] | None:
-        """读一行 JSON，带超时。解析不出来的行返回 None（跳过并继续读）。"""
-        box: queue.Queue[Any] = queue.Queue(maxsize=1)
-
-        def worker() -> None:
-            stdout = self.process.stdout
-            if stdout is None:
-                box.put(("eof", None))
-                return
-            try:
-                box.put(("line", stdout.readline()))
-            except Exception as exc:  # noqa: BLE001 - 读线程不能死，否则整个会话挂死
-                box.put(("error", f"{type(exc).__name__}: {exc}"))
-
-        threading.Thread(target=worker, daemon=True).start()
+        """从队列取一行 JSON，带超时。解析不出来的行返回 None（跳过并继续读）。"""
         try:
-            kind, raw = box.get(timeout=timeout)
+            raw = self._lines.get(timeout=timeout)
         except queue.Empty as exc:
             raise ToolTimeout(
                 f"MCP server {self.spec.name} 在 {timeout:.1f}s 内没有响应",
                 detail={"timeout_s": timeout, "stderr": self.stderr_tail[-5:]},
             ) from exc
-        if kind == "error":
-            raise ToolRuntime(
-                f"读取 MCP server {self.spec.name} 的 stdout 失败: {raw}",
-                detail={"kind": "stdout_read_error"},
-            )
-        if kind == "eof" or not raw:
+        if raw is None:
             raise ToolRuntime(
                 f"MCP server {self.spec.name} 关闭了 stdout（进程 code={self.process.poll()}）",
                 detail={"stderr": self.stderr_tail[-5:]},
@@ -269,33 +282,39 @@ class McpSession:
 
     def _request(self, method: str, params: dict[str, Any] | None = None,
                  *, timeout: float | None = None, expect_result: bool = True) -> Any:
-        self._next_id += 1
-        rid = self._next_id
-        message: dict[str, Any] = {"jsonrpc": "2.0", "id": rid, "method": method}
-        if params is not None:
-            message["params"] = params
         budget = timeout if timeout is not None else self.spec.timeout_s
-        self.transport.write(message)
-        deadline = time.monotonic() + budget
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise ToolTimeout(f"MCP {method} 超时（{budget:.1f}s）",
-                                  detail={"method": method})
-            received = self.transport.read(remaining)
-            if received is None:
-                continue
-            if received.get("method") and "id" not in received:
-                continue  # 服务器发来的通知（notifications/*），不是对本次请求的回答
-            if received.get("id") != rid:
-                continue  # 迟到的回答：丢弃并继续找自己的那条
-            if "error" in received:
-                err = received.get("error") or {}
-                raise McpError(
-                    f"MCP {method} 返回错误: {err.get('message', err)}",
-                    code=err.get("code"), data=err.get("data"),
-                )
-            return received.get("result") if expect_result else None
+        # 整个"写请求 → 等回答"必须在锁内：stdin/stdout 是**同一对**管道，两个线程并发
+        # 读写会互相吃掉对方的回答。这条不是理论担忧——真子进程契约列第一次跑就撞上，
+        # 现象是"下一次调用拿到空结果"，而报错写的是"server 没有响应"。
+        # 代价是被 deadline 放弃的那个线程会继续占着锁读完自己那一笔，下一笔得等它；
+        # 等待上界是它自己的 budget（调用方给的 deadline），且超时后执行器会隔离整条连接。
+        with self._lock:
+            self._next_id += 1
+            rid = self._next_id
+            message: dict[str, Any] = {"jsonrpc": "2.0", "id": rid, "method": method}
+            if params is not None:
+                message["params"] = params
+            self.transport.write(message)
+            deadline = time.monotonic() + budget
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ToolTimeout(f"MCP {method} 超时（{budget:.1f}s）",
+                                      detail={"method": method})
+                received = self.transport.read(remaining)
+                if received is None:
+                    continue
+                if received.get("method") and "id" not in received:
+                    continue  # 服务器发来的通知（notifications/*），不是对本次请求的回答
+                if received.get("id") != rid:
+                    continue  # 迟到的回答：丢弃并继续找自己的那条
+                if "error" in received:
+                    err = received.get("error") or {}
+                    raise McpError(
+                        f"MCP {method} 返回错误: {err.get('message', err)}",
+                        code=err.get("code"), data=err.get("data"),
+                    )
+                return received.get("result") if expect_result else None
 
     def initialize(self, *, timeout: float | None = None) -> dict[str, Any]:
         result = self._request("initialize", {
@@ -313,7 +332,8 @@ class McpSession:
         self.protocol_version = version
         self.server_info = dict(result.get("serverInfo") or {})
         # initialized 是通知（没有 id）：协议规定服务器收到后才会开始正常工作
-        self.transport.write({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        with self._lock:
+            self.transport.write({"jsonrpc": "2.0", "method": "notifications/initialized"})
         return result
 
     def list_tools(self) -> list[dict[str, Any]]:
@@ -367,6 +387,26 @@ class McpPool:
             self._sessions[name] = session
             self.started.append(name)
             return session
+
+    def discard(self, name: str, *, only_if_is: Any | None = None) -> bool:
+        """丢掉一个会话并关掉它的子进程。返回是否真有一个被丢掉。
+
+        用途是**隔离**，不是清理：一次调用超时后，被放弃的那个线程仍在读管道，
+        它会把下一次调用的回答读走（`sandbox.run_with_deadline` 杀不掉线程，这是 Python 的限制）。
+        所以"超时过"的连接不能再复用——否则一次慢调用会污染同一个 server 上的后续调用，
+        现象是别的答案莫名其妙变成空，而没人会怀疑到那笔已经超时返回的调用上。
+        """
+        with self._lock:
+            current = self._sessions.get(name)
+            if current is None or (only_if_is is not None and current is not only_if_is):
+                # 身份不符 ⇒ 这条连接已经被换过一次。按名字关会关掉**别人**的会话：
+                # 超时是在工作线程里发现的，等它来关时主线程可能已经建好了一条新会话，
+                # 于是下一次调用读到的是"刚被关掉的管道"（真机就是这样第一次调用报 closed file）。
+                return False
+            session = self._sessions.pop(name)
+        with contextlib.suppress(Exception):
+            session.close()   # 锁外关：wait() 可能阻塞，别把整个池子卡住
+        return True
 
     def close(self) -> None:
         with self._lock:

@@ -29,7 +29,9 @@ def echo_def():
 
 def test_matrix_covers_every_implemented_column(echo_def):
     matrix = build_matrix(echo_def, source="builtin")
-    assert set(matrix.columns) == {"python_fn", "mock", "http", "mcp"}
+    #: `mcp_stdio` 是 S35 加的第五列：真子进程 + 真管道。它的存在本身就是要被断言的——
+    #: "只有离线假连接"这件事曾经被写成 ROADMAP 里的缺口，因为矩阵不会为它红。
+    assert set(matrix.columns) == {"python_fn", "mock", "http", "mcp", "mcp_stdio"}
     assert matrix.failed == 0, [row for row in matrix.failures()]
     # 每列都要有全部 8 条断言的结果，缺一条就是"看起来全过"
     for column in matrix.columns:
@@ -83,6 +85,60 @@ def test_unknown_definition_lists_the_builtin_options():
     assert "找不到工具" in exc.value.message
     assert "echo" in exc.value.message, "报错要给出可选项"
     assert exc.value.code == "TOOL_UNKNOWN"
+
+
+def test_stdio_column_is_hermetic_and_its_source_is_stated(echo_def):
+    """这一列必须自己说清"我起的是真进程"，否则读矩阵的人会以为它和 mcp 列是同一件事。"""
+    matrix = build_matrix(echo_def, source="builtin")
+    column = matrix.results["mcp_stdio"]
+    assert all(item.passed for item in column.values()), [
+        (name, item.detail) for name, item in column.items() if not item.passed]
+    #: 这一列一条豁免都不许有。豁免在这本项目里是"结构上做不到"的意思，
+    #: 而真子进程做得到——给它加 n/a 就是把它降格成"另一份假连接"，还是起了进程的那种。
+    assert not [name for name, item in column.items() if not item.applicable], \
+        "真 stdio 列出现不适用格子：要么是真缺陷，要么是在用豁免遮"
+    assert matrix.samples["mcp_stdio"] == "reference__weather", "样本该来自真发现，不是手写定义"
+    assert matrix.as_dict()["sample_notes"]["mcp_stdio"] == "（真子进程 + 真管道）"
+    assert SAMPLE_SOURCE_NOTE["mcp_stdio"] == "（真子进程 + 真管道）"
+
+
+def test_a_stdio_server_that_cannot_start_is_unknown_not_passed(echo_def, monkeypatch):
+    """起不来就是"未知"：矩阵不许因为环境问题崩掉，也不许把没测过的格子留成 ✓。
+
+    这一列跑的是真子进程，所以在只读沙箱、没有可写 temp、或打包成 single-file 的环境里
+    都可能起不来。那些情况下**其余四列仍然要能给出结论**，而这一列必须写明为什么没测。
+    """
+    import onyx.tools.matrix as matrix_module
+
+    def _boom():
+        raise OSError("[WinError 2] 系统找不到指定的文件")
+
+    monkeypatch.setattr(matrix_module, "stdio_contract_target", _boom)
+    matrix = build_matrix(echo_def, source="builtin")
+    assert "mcp_stdio" not in matrix.columns
+    assert "mcp_stdio" in matrix.unavailable
+    reason = matrix.unavailable["mcp_stdio"]
+    assert "未知，不是通过" in reason and "WinError" in reason
+    assert set(matrix.columns) == {"python_fn", "mock", "http", "mcp"}, "其余列不许被牵连"
+
+
+def test_a_timed_out_stdio_call_does_not_poison_the_next_one(echo_def):
+    """真进程列曾经抓到的东西：一笔超时之后，被放弃的线程还在读管道，会偷走下一笔的回答。
+
+    离线假连接测不到这件事（它同步回答），所以这条断言在第五列出现前是**空白**。
+    """
+    import onyx.tools.matrix as matrix_module
+
+    sample, factory, args, synth, close = matrix_module.stdio_contract_target()
+    from onyx.tools.contract import run_contracts
+    try:
+        results = {item.name: item for item in run_contracts(factory, sample, valid_args=args,
+                                                            synth=synth)}
+    finally:
+        close()
+    assert results["timeout_is_reported"].passed, "慢工具必须先真的超时"
+    assert results["read_is_idempotent"].passed, (
+        f"超时之后的调用被污染了：{results['read_is_idempotent'].detail}")
 
 
 def test_missing_httpx_is_unknown_not_passed(echo_def, monkeypatch):

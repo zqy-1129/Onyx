@@ -1,9 +1,20 @@
 """一个最小但**真实**的 MCP server（stdio + JSON-RPC 2.0，只用 stdlib）。
 
-它存在的目的是让 `tests/integration/test_mcp_stdio.py` 验证"过 OS 管道"这件事本身：
-伪造传输能测协议语义，但测不到**帧**（换行分隔、缓冲区、stderr 管道满时死锁）。
+它存在的目的是验证"过 OS 管道"这件事本身：伪造传输能测协议语义，
+但测不到**帧**（换行分隔、缓冲区、stderr 管道满时死锁）。两个消费方：
 
-它刻意模仿真实 server 的三种坏毛病，每一种都会被断言：
+- `tests/unit/test_tools_mcp_stdio.py` —— 协议与进程生命周期的形态表；
+- `onyx tools contract` 的 `mcp_stdio` 列 —— 同一套执行器契约断言跑在真子进程上，
+  这样"换 MCP SDK / 换 server 实现"会让矩阵变红，而不是只让某个测试文件变红。
+
+**为什么这个文件在 `onyx/tools/` 里而不是 `tests/fixtures/`**：契约矩阵要从 CLI 起进程，
+而 CLI 不经过 conftest 的 sys.path 注入。留在 tests 下就得复制一份，
+两份的漂移表现成"测试绿、矩阵红"（或相反），那时候没人能说出哪一份是假的。
+**它刻意不 import onyx**：这样父进程可以用 `(sys.executable, 本文件的绝对路径)` 直接跑它，
+不依赖包是否可导入、PYTHONPATH 指向哪里——一次环境问题的现象与一次真故障一模一样，
+值得为这点 separability 付代价。
+
+它模仿真实 server 的三种坏毛病，每一种都会被断言：
 - 往 stdout 打日志（非 JSON 行必须被跳过，而不是当成回答）；
 - 往 stderr 打很多行（客户端不持续排空就会在管道满时死锁，现象是"卡住"而不是报错）；
 - 有一个慢工具和一个 `isError` 工具（超时与失败的归因要走对档位）。

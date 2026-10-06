@@ -31,6 +31,7 @@ __all__ = [
     "default_pool",
     "parse_impl_ref",
     "reset_pools",
+    "stdio_contract_target",
 ]
 
 ENV_CONFIG = "ONYX_MCP_CONFIG"
@@ -115,6 +116,9 @@ class McpExecutor:
         self._config_path = config_path
         self.real_calls = 0
         self.started_servers = 0
+        #: 最近一次真正用到的 `(server, session)`。隔离必须按**身份**丢弃：
+        #: 超时是在被放弃的工作线程里发现的，等它来关时主线程可能已建好新会话。
+        self._last: tuple[str, Any] | None = None
 
     def spec(self) -> ToolDef:
         return self.definition
@@ -126,8 +130,14 @@ class McpExecutor:
                 ok=False, error_kind="unknown_tool",
                 error=f"MCP 执行器绑定的是 {self.definition.name!r}，收到 {name!r}",
             )
-        return guarded_call(self.definition, args, ctx,
-                            lambda clean: self._invoke(clean, ctx), name=name)
+        result = guarded_call(self.definition, args, ctx,
+                              lambda clean: self._invoke(clean, ctx), name=name)
+        if result.error_kind == "timeout":
+            # 超时之后这条连接就不可以再用了：那个被放弃的线程还在读管道，会把下一笔
+            # 调用的回答读走。在这里（而不是 `_invoke` 的 except 里）隔离才靠得住——
+            # `run_with_deadline` 先于内部超时报错时，`_invoke` 那条路径根本不会执行。
+            self._quarantine()
+        return result
 
     # ── 实际调用 ──────────────────────────────────────────────────
     def _pool_or_default(self) -> McpPool:
@@ -151,6 +161,7 @@ class McpExecutor:
         else:
             # 注入的 session 不经池 ⇒ 永远没有子进程被起（离线契约测试就靠这条）
             session.started_processes = 0
+        self._last = (server, session)
 
         budget = session.spec.timeout_s
         for candidate in (
@@ -168,6 +179,19 @@ class McpExecutor:
         self.real_calls += 1
         raw = session.call_tool(tool, clean, timeout=budget)
         return payload_from_mcp(raw)
+
+    # ── 隔离 ──────────────────────────────────────────────────────
+    def _quarantine(self) -> None:
+        """超时的调用不许留下可复用的连接：当场丢掉那条会话（→ 子进程被回收）。
+
+        不隔离的后果是**污染下一个调用**：Python 杀不掉线程，被放弃的那笔仍在读管道，
+        它会把下一笔的回答读进一个没人看的地方。真子进程契约列第一次跑就是这样——
+        报的是"weather 返回了空"，而罪在上一笔 slow 调用，最难归因的一类。
+        """
+        if self._session is not None or self._last is None:
+            return          # 注入 session 的离线列没有池，也没什么可隔离
+        server, session = self._last
+        self._pool_or_default().discard(server, only_if_is=session)
 
 
 # ── 离线契约样本 ─────────────────────────────────────────────────
@@ -233,3 +257,61 @@ def contract_target():
         raise ValueError(f"未知的合成角色: {role!r}（可选 slow / write）")
 
     return sample, factory, {"text": "hello"}, synth
+
+
+# ── 真子进程契约样本（S35：矩阵的第五列）───────────────────────────
+def stdio_contract_target():
+    """`onyx tools contract` 的 **mcp_stdio** 列：真子进程 + 真 OS 管道。
+
+    与上面那个离线列的分工是刻意的：假连接测"我们对协议的理解"，
+    真进程测**帧本身**——换行分隔、stdout 上的非 JSON 日志行、stderr 排空、进程回收。
+    换 MCP 协议版本、换 server 实现、或 server 开始乱打 stdout，只有这一列会红；
+    而那正是 G6 要的保护（"契约矩阵 4 列但 mcp 用假连接"在 ROADMAP 里被记成缺口）。
+
+    返回 `(样本定义, 工厂, 合法参数, 合成器, teardown)`。
+    样本与两个合成角色都来自**真发现**（`tools/list`），不是手写定义——
+    手写的那份与 server 漂移时，矩阵会通过一个现实中不存在的契约。
+    起不来时照常抛错，由 matrix 记成 `unavailable`（未知），不是"通过"。
+    """
+    import sys
+
+    from onyx.tools import reference_mcp_server
+    from onyx.tools.contract import text_schema
+    from onyx.tools.mcp import McpPool, ServerSpec, tooldefs_from_mcp
+    from onyx.tools.spec import SideEffect
+
+    pool = McpPool({"reference": ServerSpec(
+        name="reference",
+        command=(sys.executable, str(Path(reference_mcp_server.__file__).resolve())),
+        env=("PATH",), timeout_s=10.0,
+    )})
+    try:
+        discovered = {str(d.extra["mcp_tool"]): d for d in tooldefs_from_mcp(pool, "reference")}
+        sample = discovered["weather"]
+    except Exception:
+        pool.close()
+        raise
+
+    def make_def(name: str, impl_tool: str, effect: SideEffect) -> ToolDef:
+        #: 合成定义**只用于断言本身**（慢工具与写工具）：参数按契约要求的 `text` 声明，
+        #: 因为断言固定传 `{"text": ...}`。用 server 的真实 schema 反而会让断言在
+        #: "缺少必填参数"这一层就失败，测不到它要测的超时与策略拒绝。
+        #: 样本定义（weather）仍是真发现来的那份——它带的是 server 自己的 schema。
+        return ToolDef(
+            name=name, description="契约矩阵的真 stdio 列：验证超时与副作用拒绝",
+            parameters=text_schema(), kind=ToolKind.MCP, side_effect=effect,
+            impl_ref=f"mcp:reference:{impl_tool}",
+            extra={"mcp_server": "reference", "mcp_tool": impl_tool},
+        )
+
+    def factory(definition: ToolDef) -> McpExecutor:
+        return McpExecutor(definition, pool=pool)
+
+    def synth(name: str, role: str) -> ToolDef:
+        if role == "slow":
+            return make_def(name, "slow", SideEffect.READ)
+        if role == "write":
+            return make_def(name, "send_email", SideEffect.WRITE)
+        raise ValueError(f"未知的合成角色: {role!r}（可选 slow / write）")
+
+    return sample, factory, {"city": "北京"}, synth, pool.close

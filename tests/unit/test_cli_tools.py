@@ -69,10 +69,11 @@ def test_builtin_definitions_pass_audit():
 def test_contract_matrix_covers_every_implemented_executor():
     result = _run("tools", "contract")
     assert result.exit_code == 0, result.output
-    for implemented in ("python_fn", "mock", "http"):
+    # 五列都是"已实现"：S35 之前 mcp 只有离线假连接，真管道那一列不存在
+    for implemented in ("python_fn", "mock", "http", "mcp", "mcp_stdio"):
         assert implemented in result.output
     # 未实现的执行器必须**显式列出**并写明落地里程碑，不能悄悄从矩阵里消失
-    for pending in ("mcp", "ollama_builtin"):
+    for pending in ("ollama_builtin",):
         assert pending in result.output
     assert "S16" in result.output
     assert "失败 0" in result.output
@@ -149,7 +150,7 @@ def test_contract_json_output_is_machine_readable():
     payload = json.loads(result.output)
     assert payload["tool"] == "echo"
     assert payload["source"] == "builtin"
-    assert set(payload["executors"]) == {"python_fn", "mock", "http", "mcp"}
+    assert set(payload["executors"]) == {"python_fn", "mock", "http", "mcp", "mcp_stdio"}
     assert len(payload["assertions"]) == 8
     assert payload["summary"]["python_fn"] == {"passed": 7, "failed": 0, "not_applicable": 1}
     # http 列有自己的离线样本，8 条断言全部适用
@@ -159,6 +160,12 @@ def test_contract_json_output_is_machine_readable():
     # 否则这条命令变成"装了东西才跑得动"，就没人经常跑了
     assert payload["samples"]["mcp"] == "contract_mcp"
     assert payload["summary"]["mcp"] == {"passed": 8, "failed": 0, "not_applicable": 0}
+    #: S35 的第五列：真子进程 + 真管道。样本来自**真发现**，所以名字带 server 前缀；
+    #: 出处必须写在 sample_notes 里，否则这一列与 mcp 列在界面上看起来是同一件事。
+    assert payload["samples"]["mcp_stdio"] == "reference__weather"
+    assert payload["summary"]["mcp_stdio"] == {"passed": 8, "failed": 0, "not_applicable": 0}
+    assert payload["sample_notes"]["mcp_stdio"] == "（真子进程 + 真管道）"
+    assert payload["sample_notes"]["mcp"] == "（离线假连接，不起子进程）"
 
 
 def test_pending_kinds_are_derived_not_hardcoded():

@@ -159,7 +159,9 @@ def test_matrix_shape_matches_the_cli_json(app):
     assert body["tool"] == "echo"
     assert body["source"] in ("registry", "builtin")
     assert len(body["assertions"]) == 8
-    assert set(body["executors"]) == {"python_fn", "mock", "http", "mcp"}
+    #: 端点与 CLI 必须是同一张矩阵（含 S35 的真子进程第五列）——两处列数不同，
+    #: 就说明有人给界面单独搭了一套"更容易通过"的样本。
+    assert set(body["executors"]) == {"python_fn", "mock", "http", "mcp", "mcp_stdio"}
     assert body["samples"]["http"] == "contract_http", "每列测的定义要报得出出处"
     assert body["sample_notes"]["http"]
     assert body["failed"] == 0, body["executors"]

@@ -5,9 +5,11 @@
 "工具库上下文开销"就会有两个版本——而它正是要拿去和 trace 归因的 `part=tool_defs`
 对齐的那个量（P17：只报 JSON 大小会把优化方向引错）。
 
-`GET /api/tools/matrix` 是 GET 但**不该轮询**：它会在离线样本上真跑一遍各执行器
-（python_fn 走 AST 白名单、http 用 MockTransport、mcp 用假连接，零真实网络），
-几十毫秒的成本值得让人点一下，而不是每次打开页面就替人跑一次。
+`GET /api/tools/matrix` 是 GET 但**不该轮询**：它会真跑一遍各执行器
+（python_fn 走 AST 白名单、http 用 MockTransport、mcp 用假连接、
+`mcp_stdio` 起一个真子进程走真管道，S35），全程零真实网络。
+第五列要起进程，所以整张矩阵是**秒级**而不是几十毫秒——正因为如此它才只该由人点一下，
+而不是每次打开页面就替人跑一次。
 """
 
 from __future__ import annotations
@@ -24,7 +26,7 @@ from onyx.tools.matrix import build_matrix
 
 router = APIRouter(prefix="/api/tools", tags=["tools"])
 
-#: 一次矩阵请求最多允许跑几条断言之类的事——矩阵本身是固定 8×4，
+#: 一次矩阵请求最多允许跑几条断言之类的事——矩阵本身是固定 8 断言 × 5 列，
 #: 这里的上限防的是"参数 JSON 里塞个巨型对象"
 MAX_ARGS_CHARS = 8_000
 
