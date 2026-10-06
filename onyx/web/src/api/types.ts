@@ -17,6 +17,10 @@ export interface HealthView {
   schema_version: number
   provider_reachable: boolean
   engine_version: string
+  /** 通道身份，侧边栏引擎状态块常驻用（空串 = 该通道没报，界面显示「—」） */
+  provider_id: string
+  provider_kind: string
+  base_url: string
 }
 
 export interface LoadedModelView {

@@ -56,6 +56,10 @@ def test_health(client):
     assert body["ok"] is True and body["provider_reachable"] is True
     assert body["schema_version"] >= 2
     assert body["version"]
+    # 侧边栏的引擎状态块常驻，靠这三个字段报出通道身份；缺一个界面就得轮询 /api/fleet 才凑得齐
+    assert (body["provider_id"], body["provider_kind"], body["base_url"]) == (
+        "mock-local", "mock", "mock://",
+    )
 
 
 def test_fleet_shape(client):

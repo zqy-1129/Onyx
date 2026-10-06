@@ -110,6 +110,7 @@ def health(state: AppState = Depends(get_state)) -> HealthView:
         ok=info.reachable, version=__version__,
         schema_version=state.runtime.db.version(),
         provider_reachable=info.reachable, engine_version=info.version,
+        provider_id=info.id, provider_kind=str(info.kind), base_url=info.base_url,
     )
 
 

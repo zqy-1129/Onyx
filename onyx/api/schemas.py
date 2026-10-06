@@ -221,3 +221,8 @@ class HealthView(BaseModel):
     schema_version: int
     provider_reachable: bool
     engine_version: str = ""
+    #: 通道身份。侧边栏的引擎状态块常驻，但它不该为此每 15s 轮一遍 /api/fleet
+    #: （那边要聚合近 1h 指标、异常与告警运行时，会和 Fleet 页自己的 10s 轮询抢同一个库）
+    provider_id: str = ""
+    provider_kind: str = ""
+    base_url: str = ""
