@@ -2736,10 +2736,46 @@ uv run python scripts/check_extension_boundary.py  # 无新增扩展点实现
 
 ## S35 — 覆盖率基线 + 契约矩阵的真 stdio 变体（M12 第二步）
 
-- 覆盖率从"floor 80（基线 90，留 10 个点）"改成 **floor 85（留 5 个点）**并写明理由：
-  门禁的目的是防跌，而 10 个点的余量足够让一次真实的退化悄悄通过。
-- 契约矩阵增加"真 stdio"一列：现在 `mcp` 列是离线假连接，真子进程路径只在
-  `tests/unit/test_tools_mcp_stdio.py`，换 MCP SDK 或换 server 时矩阵不会红。
+**为什么这两件事算同一步**：它们都是"门禁看起来在守，其实守不住"。
+`fail_under=80` 配 91% 的实测 ⇒ 一次真实的 -10 个点退化会全绿通过；
+`mcp` 列用离线假连接 ⇒ 换 MCP SDK 或换 server 时矩阵不会红。
+共同的修法是**把门禁挪到会真的红的地方**，而不是"下次记得注意"。
+
+**产出文件（计划）**
+```
+onyx/tools/reference_mcp_server.py        # 从 tests/fixtures 搬进包：stdlib-only，可被 sys.executable 直接跑
+onyx/tools/executors/mcp.py               # stdio_contract_target()：真子进程 + 真管道，带 teardown
+onyx/tools/matrix.py                      # 第 5 列 mcp_stdio；列定义加第 8 位 teardown，列循环 try/finally 关池
+tests/unit/test_tools_mcp_stdio.py        # 改指新模块（同一份 server，不留两份会漂移的副本）
+tests/unit/test_tools_matrix_contract.py  # 新列存在且 8/8；起不来时是 unavailable 而不是"通过"
+pyproject.toml                            # fail_under 80 → 85，理由写在原地
+tests/unit/test_release_surface.py        # 钉住地板值本身（防止被悄悄调回 80）
+```
+
+**四条设计决定**
+1. **server 搬进 `onyx/tools/`，不留两份**：这一列必须能被 `onyx tools contract` 跑，
+   而 CLI 不经过 conftest 的 sys.path 注入。留在 tests/fixtures 就得复制一份，
+   而两份的漂移表现为"测试绿、矩阵红"（或相反），谁都说不清是哪个假。
+2. **用 `(sys.executable, <该模块文件的绝对路径>)` 起进程，不用 `-m onyx.tools.…`**：
+   这个 server 只用 stdlib，按文件跑就不依赖 PYTHONPATH/venv 的可导入性。
+   按 `-m` 跑会在"从别的目录调 CLI"时因为 import 不到包而失败，
+   而那种失败会被读成"MCP 执行器坏了"——一次环境问题的现象和一次真故障一模一样。
+3. **列的生命周期由 targets 的第 8 位 `teardown` 承担**（现有列传 None），矩阵的列循环 try/finally 关池：
+   僵尸 server 是句柄泄漏，而 `onyx tools contract` 正是人在排查工具问题时第一个跑的命令，
+   它自己不能制造第二个问题。
+4. **地板 80 → 85（实测 91，留 6 个点）**并写明理由：地板的目的不是"让我们通过"，
+   是"让退化被挡住"。10 个点的余量足够让一次真实退化悄悄通过——留多少才够是判断，
+   所以判断要写在配置旁边，而不是写在某人的记忆里。
+
+**自测**
+```bash
+uv run onyx tools contract                      # 5 列；mcp_stdio 那一列是真子进程
+uv run onyx tools contract --json               # sample_notes 必须写着"真子进程 + 真管道"
+uv run coverage run -m pytest -q && uv run coverage report   # 地板 85，实测仍 ~91
+```
+**DoD**：矩阵 5 列且 `mcp_stdio` 8/8 通过；server 换成本起不来的形状时那一列是
+`unavailable` 且带原因（不是"通过"，也不是整张矩阵崩掉）；覆盖率地板抬到 85 并被
+CI 配置与一条测试同时钉住；G6 的"契约矩阵增加真 stdio 变体一列"达成。
 
 ## S36 — 性能基线（M12 第三步）
 
