@@ -62,9 +62,14 @@ WAL + 批量 sink（队列满丢样本但 `dropped` 计数可见）、
 ### L4 工具子系统 `onyx/tools/`
 - 注册表：内容 hash 版本化、契约审计（每条规则对应一个可行动修法）、上下文开销核算（与 trace 的 `part=tool_defs` 同源）
 - 4 种执行器：`python_fn`（AST 白名单，不用 eval）/ `http`（URL 只来自人工审核定义，不做通用 fetch）/ `mcp`（stdio + JSON-RPC，纯 stdlib）/ `fixture`（评测零副作用通道）
-- **8 条契约断言 × 4 列执行器矩阵**（`onyx tools contract`，离线零网络）：
+- **8 条契约断言 × 5 列执行器矩阵**（`onyx tools contract`，零真实网络）：
+  `python_fn` / `mock` / `http`（MockTransport）/ `mcp`（离线假连接）/ **`mcp_stdio`（S35：真子进程 + 真 OS 管道）**。
   失败强制分成 `arg_error / rejected / timeout / unknown_tool / skipped / error` 六种，
-  每个 n/a 必须写明原因（静默跳过等于让最关键的保证消失）
+  每个 n/a 必须写明原因（静默跳过等于让最关键的保证消失）；第五列**一条豁免都没有**，
+  并被测试钉住"出现不适用格子就是缺陷"
+- **一条管道只许一个读者（S35）**：stdout 由常驻线程排空进队列，整个"写请求→等回答"在会话锁内串行，
+  超时过的连接当场作废（`McpPool.discard`，按会话身份而非名字）。这三条合起来才让"一次慢调用
+  不会把下一个调用的答案读走"成立——那条真管道列第一次跑就撞上了这件事，而假连接列永远测不出
 - 客户端工具循环：预算 / 熔断 / 孤儿补齐 / fire-and-verify 六种判定
 - 沙箱：副作用白名单、dry-run、审批回调、`impl_ref` 白名单、deadline 传到 socket（P22）
 - **契约矩阵的构建处只有一个（`tools/matrix.py`，S25）**：CLI 的 `--json` 与
@@ -198,13 +203,13 @@ WAL + 批量 sink（队列满丢样本但 `dropped` 计数可见）、
 ## 2. 质量门与规模
 
 ```
-uv run pytest            # 1637 passed, 1 skipped, 36 deselected（默认档就是离线套件，CI 用它量覆盖率。S32 三个文件 58 条 + S33 六个文件 60 条 + 样本重写与能力闸门 6 条；`test_task_contract.py` 41 → 49 条：多一个任务就多 8 条断言，一行任务专属逻辑都不用加。S33 只逼它泛化了一次——原来写死用 `Generation` 造样本，现在按任务自己 `build()` 的返回类型造）
+uv run pytest            # 1648 passed, 1 skipped, 36 deselected（默认档就是离线套件，CI 用它量覆盖率。S32 三个文件 58 条 + S33 六个文件 60 条 + 样本重写与能力闸门 6 条；`test_task_contract.py` 41 → 49 条：多一个任务就多 8 条断言，一行任务专属逻辑都不用加。S33 只逼它泛化了一次——原来写死用 `Generation` 造样本，现在按任务自己 `build()` 的返回类型造。S35 加的 11 条：真 stdio 列的隔离/并发/迟到回答 +5（`test_tools_mcp_stdio.py` 7 → 12）、第五列（存在·出处·无豁免·起不来=未知）+3、覆盖率地板的钉子 +1、settle 与库里的顺序 +2）
 uv run pytest -m e2e     # 12 passed（S34：六页取数同源 10 条 + SSE 真 HTTP 消费与"断链自检"2 条。默认档把它 deselect 了，CI 里是独立一步）
 uv run pytest -m live     # 20 passed（真打 qwen3.5:9b，与评测共用机器级 GPU 锁）
 uv run pytest -m probe     # 4 passed（P 系列实验的可重跑版本）
 uv run ruff check .         # All checks passed（`ruff format` 不是门禁）
 uv run lint-imports          # 3 contracts kept（网络例外 2 条：executors.http + sinks.otlp/alerts.webhook 合并在契约 2，每条写明是谁与为什么）
-uv run coverage run -m pytest -q && uv run coverage report   # 91% ≥ 80%（分支覆盖，离线套件，13,785 句；S33 新代码：任务 94% / 数据生成器 89%，S32 那两个仍 99% / 100%）
+uv run coverage run -m pytest -q && uv run coverage report   # 90% ≥ 85%（分支覆盖，离线套件，13,905 句 / 3,432 分支。**地板 S35 从 80 抬到 85**：80 配 90 的实测意味着一次 -10 个点的真实退化会全绿通过，而"门禁在守"看起来照样成立。比 S33 那次少 1 个点主要是 `tools/reference_mcp_server.py` 进了包——57 句里 48 句只在**子进程**里跑，父进程量不到；没有 omit 它，让"这里量不到"留在数字里比藏起来好）
 uv run python scripts/check_extension_boundary.py   # 接入实现未触碰受保护内核文件（S30 因此把 RunReport 那条修复单独成一个提交）
 uv run onyx doctor            # 9 项体检（带网络 10 项）：配置 / Python / 可写 / 磁盘 / 迁移 / blob / 档位 / 告警 / 插件
 uv run onyx config show       # 每一项生效值标出来自 flag/环境/文件/默认哪一层（token 与 webhook URL 只报"已设置"）
@@ -411,8 +416,10 @@ S23 在浏览器里真跑过：`--provider mock` 的 serve 上点「开始评测
    `instruction_following` 39 条 / 10 种可机械检查的约束（`0.920 / 0.916 / 0.641` 三口径分叉）、
    `long_context` 9 条三档长文 + 干扰项（`1.000`，负控制 `--num-ctx 4096` 整场 `score —`）、
    `semantic_similarity` 12 题排序（`0.833`，`anti_first_rate 0.167`，并新建了整条 embedding 通路）。
-   矩阵现在 **6 列**。剩下的两项都在 M12：**S35**（覆盖率"只防跌"基线 + 契约矩阵真 stdio 列）、
-   **S36**（`onyx perf` 基线）；视觉任务仍等 U8/U9 的未决实测。
+   矩阵现在 **6 列**。M12 还剩一项：**S36**（`onyx perf` 吞吐/延迟基线，条件必须一起落库）。
+   ~~S35~~ **已交付**：契约矩阵长出第五列 `mcp_stdio`（真子进程 + 真管道，8/8 无豁免），
+   覆盖率地板 80 → 85 并被一条测试与 CI 文案同时钉住；顺带挖出两处"只在慢机器上现形"的真缺陷
+   （MCP 一条管道两个读者、`settle()` 比库里先说"跑完了"）；视觉任务仍等 U8/U9 的未决实测。
 4. **`token explain` + `report usage`**：都属于"每天都在用但入口缺失"。
 5. C 组三条一致性（`RECONCILED` 不发、`base_url` 默认值、兼容通道探针覆盖）适合凑成一次"口径一致性"清理。
 

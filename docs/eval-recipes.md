@@ -69,7 +69,7 @@ case 里没预置桩时该次调用记 `skipped`，不会退回真跑（那样"�
 $EDITOR .data/mcp.json                 # {"mcpServers": {"demo": {"command": ["python","server.py"]}}}
 onyx tools mcp-ls                      # 看副作用与"为什么这么定"
 onyx tools mcp-import                  # 注册为 kind=mcp，名字 demo__<tool>
-onyx tools contract                    # 四列矩阵：mcp 列也要 8/8
+onyx tools contract                    # 五列矩阵：mcp（假连接）与 mcp_stdio（真子进程）都要 8/8
 onyx eval run --task tool_selection --model … --k 3     # 评测期照旧走桩
 ```
 

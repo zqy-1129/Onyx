@@ -2734,7 +2734,7 @@ uv run python scripts/check_extension_boundary.py  # 无新增扩展点实现
 `test(e2e): SSE 在真 HTTP 连接上被读到 + "断链会被发现"的自检（S34 第二步）`
 `ci: e2e 进 CI 作为独立一步，并被钉进门禁清单（S34 第三步）`
 
-## S35 — 覆盖率基线 + 契约矩阵的真 stdio 变体（M12 第二步）
+## S35 — 覆盖率基线 + 契约矩阵的真 stdio 变体（M12 第二步）✅
 
 **为什么这两件事算同一步**：它们都是"门禁看起来在守，其实守不住"。
 `fail_under=80` 配 91% 的实测 ⇒ 一次真实的 -10 个点退化会全绿通过；
@@ -2776,6 +2776,54 @@ uv run coverage run -m pytest -q && uv run coverage report   # 地板 85，实�
 **DoD**：矩阵 5 列且 `mcp_stdio` 8/8 通过；server 换成本起不来的形状时那一列是
 `unavailable` 且带原因（不是"通过"，也不是整张矩阵崩掉）；覆盖率地板抬到 85 并被
 CI 配置与一条测试同时钉住；G6 的"契约矩阵增加真 stdio 变体一列"达成。
+
+**实测（第五列第一次跑就抓到的东西，比这一列本身更值钱）**
+- 计划里写的"这一列会红"兑现了，但红的不是协议而是**客户端自己**：`read_is_idempotent` 六次里失败四次，
+  报的是 `first=None second='北京：晴，21 度'`——weather 没问题，罪在上一笔 `slow` 调用。两处根因：
+  1. **一条管道两个读者**。`StdioTransport.read()` 原来是"每次调用起一个线程读一行，超时就不管它"，
+     那个线程仍阻塞在 `readline()` 上，会把**后到**的回答读进一个没人看的队列；
+     `McpSession` 的文档一直写着"读循环在锁内串行"，而 `_request` 从没真的加过锁。
+     现在：stdout 由**一条常驻线程**排空进队列（迟到行按 JSON-RPC id 丢弃，不丢整条连接的状态），
+     整个"写请求→等回答"在会话锁内串行。
+  2. **隔离挂错了线程**。超时由 `run_with_deadline` 报出时，主线程已经拿到"超时"这个结果，
+     而 `_invoke` 里那条 `except ToolTimeout → discard` 可能根本没执行；下一笔调用于是可能
+     复用到一条**正在被关掉**的连接（真机报的就是 `I/O operation on closed file`）。
+     现在隔离挪到 `call()` 里，按 `error_kind == "timeout"` 触发 ⇒ 与返回给调用方在同一个线程、同一个顺序里完成。
+- 注入缺陷自检（这一条是照惯例做的，不是顺手）：把 `with self._lock` 换成 `with threading.Lock()`
+  （等于去掉串行），`test_concurrent_calls_on_one_server_never_steal_each_others_answers` 五次里失败四次，
+  失败形状是"有四个城市根本没拿到答案"——正是那条测试要守的东西。恢复后 10 次连跑 `run_contracts`
+  对真 stdio 目标 **全部 8/8**，`.tmp/s35_stability.json` 记着这 10 次。
+- 覆盖率这一步自己也是一个门禁失效的例子：`fail_under=80` 配 90% 的实测 ⇒ 一次 -10 个点的退化全绿。
+  抬到 85 之后，`reference_mcp_server.py` 进了包这件事就立刻显形（57 句里 48 句只在子进程跑，父进程量不到，
+  于是数字从 91% 变成 90%）——**没有 omit 它**：把量不到的地方留在数字里比藏起来好，理由写在配置旁边。
+- **顺带挖出的第二处缺陷（不在计划里，但同一类）**：覆盖率那一遍跑出了一个偶发失败的
+  `test_worker_crash_gives_the_run_row_a_terminal_status`。查下去是 `EvalService._fail` **先改内存后写库**，
+  而 `settle()` 只看内存里的 `job.live` ⇒ 存在"settle 说没有活了、库里还是 running"的窗口
+  （快机器上微秒级，覆盖率追踪慢 5–10 倍时它现形）；更糟的是写库失败会把异常抛回 worker 的 `except`，
+  二次 `_fail` 再抛 ⇒ **worker 线程死掉，之后每条界面发起的评测永远停在 queued**。
+  现在库里那份在前、内存那份在后，写库失败只在 `job.error` 里明说"重启后由 reclaim 兜底"。
+  两条新测试各自配了注入缺陷（换回原顺序 / 去掉 try）来证明会咬。
+
+**本机验证**
+```bash
+uv run onyx tools contract            # 5 列全绿：mcp_stdio 通过 8 · 失败 0 · 不适用 0（连跑两次一致）
+uv run coverage run -m pytest -q && uv run coverage report   # 1648 passed / 1 skipped · 90% ≥ 85%
+uv run pytest -m e2e                  # 12 passed（`/api/tools/matrix` 现在含真子进程那一列）
+uv run ruff check . && uv run lint-imports           # 全过 · 3 contracts kept
+uv run python scripts/check_extension_boundary.py   # 接入实现未触碰受保护内核
+cd onyx/web && npx tsc --noEmit && npx vitest run && npm run build   # 0 错 · 106 passed · build ✓
+```
+**DoD 核对**：① 5 列且 `mcp_stdio` 8/8 ✓；② server 起不来 ⇒ `unavailable` 带原因且不牵连其余四列 ✓
+（`test_a_stdio_server_that_cannot_start_is_unknown_not_passed`）；③ 地板 85 被 `pyproject` +
+`Makefile` + `ci.yml` 文案 + 一条测试同时钉住 ✓；④ G6 的"契约矩阵增加真 stdio 变体一列"达成 ✓。
+一处与计划的偏差：`tests/unit/test_tools_matrix_contract.py` 没有单独建文件，第五列的断言并进了
+既有 `test_tools_matrix.py`（同一张矩阵的两类断言分在两个文件里，改矩阵的人会只看见其中一半）。
+
+**提交**：
+`feat(tools): 契约矩阵第五列 mcp_stdio —— 真子进程 + 真管道，顺带修掉一条管道两个读者`
+`fix(eval): _fail 先落库再改内存 —— settle 不许比库里先说"跑完了"`
+`chore(quality): 覆盖率地板 80 → 85，值、口径与理由一起被一条测试钉住`
+`docs(m12): S35 归档 —— 第五列抓到的两处只在慢机器上现形的缺陷`
 
 ## S36 — 性能基线（M12 第三步）
 
@@ -2823,7 +2871,8 @@ CI 配置与一条测试同时钉住；G6 的"契约矩阵增加真 stdio 变体
 | S34 | `uv run pytest -m e2e`（默认套件把它 deselect 了，必须显式跑） | 六页取数互相核对得上；每条 grade 的 trace_id 查得到真实 trace；真 uvicorn + 真 httpx 能读到 `hello → trace_start → trace_end`；把 broker 摘掉后**只剩 hello**（断链会被发现） |
 | S32 | `onyx eval run --task long_context --model qwen3.5:9b --seed 42 --num-ctx 20480` + 同参数改 `--split 16k --num-ctx 4096` | 前者 9/9 全对且 `by_position` 三个位置各 n=9、`max_ctx_util 0.8201`、`reported_in_tokens 9/9`；后者**必须整场 `score —` 而不是 0.000**（每条 grade 自带"引擎只回报 2050 tok，下限至少 13525 tok"这句话）；`digits_only_in_needles` / `value_string_collisions` / `ambiguous_questions` 三条考卷自检在注入缺陷时都要响 |
 | S33 | `onyx eval run --task semantic_similarity --model qwen3-embedding:0.6b --seed 42` + 同任务换 `--model qwen3.5:9b` | 前者 `score 0.833`、`anti_first_rate 0.167`、`dimension 1024`、`requests 12`（一条 case 一个请求）、grade 12/12 能反查样本与 kind=embed 的 trace；后者**必须整场 SKIPPED 且一条请求都不发**（模型级能力判定，不是 provider 级）；三条考卷自检（同义句抄原句 / 反义句丢否定 / 无关项含全部实体）都要在注入缺陷时点名那一道题 |
-| 门禁 | `make coverage`（`coverage run -m pytest -q`） | 离线套件分支覆盖率 ≥ 80%（S17 落地时 88%，S21 后 89%，S23/S26 后仍 89%，M10 后 90%，S30–S33 后仍 90%） |
+| 门禁 | `make coverage`（`coverage run -m pytest -q`） | 离线套件分支覆盖率 ≥ 85%（S17 落地时 88%，S21 后 89%，M10 后 90%，S30–S33 后 91%，S35 起地板抬到 85 / 实测 90%——第五列的参考 server 只在子进程里跑，48 句量不到且**不做 omit**） |
+| S35 | `uv run onyx tools contract` + `uv run pytest tests/unit/test_tools_mcp_stdio.py` | 5 列且 `mcp_stdio 通过 8 · 失败 0 · 不适用 0`（真子进程，连跑两次一致）；把 `mcp_stdio` 的样本换成起不来的命令 ⇒ 那一列变 `unavailable` 带原因而其余四列照旧；`_request` 去掉会话锁 ⇒ 并发那条测试 5 次里 4 次红 |
 
 ## 附录 B — 架构自测（让"模块化"可验证，而非口号）
 
