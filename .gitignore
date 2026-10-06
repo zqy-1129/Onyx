@@ -17,3 +17,6 @@ dist/
 *.tsbuildinfo
 .DS_Store
 uv.lock.bak
+# Qoder 生成的项目知识库导出（2.1MB 产物，可由知识生成功能重建）；
+# .qoder/skills/ 里是手写的本地技能，不进 ignore——要不要提交是另一件事
+.qoder/repowiki/
