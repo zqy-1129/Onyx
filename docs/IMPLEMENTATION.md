@@ -3023,10 +3023,11 @@ uv run ruff check . && uv run lint-imports && uv run python scripts/check_extens
 ④ 摘掉 `builtin_visitors()` 里的注册 ⇒ 端到端那条测试必须红（注入缺陷自检）；
 ⑤ 五道门全绿；STATUS/ROADMAP 把这条从"已知缺陷"移到"已修"。
 
-**提交**：
-`feat(obs): 时序 visitor —— FIRST_TOKEN 终于有人接`
-`test(obs): 事件→状态→落库三段与"注册被摘掉会红"的自检`
-`docs: TTFT 缺陷结案 —— 从"通道限制"改回"曾经没有写入方"`
+**提交**（实际切法：测试跟着它守的那段代码走，这样每个提交自己就是可验证的）
+`docs(m12): S37 方案 —— 给 TTFT 接上写入方，而不是继续把它当限制`
+`feat(obs): 时序 visitor —— FIRST_TOKEN 终于有人接`（含 15 条：事件→状态→落库三段、摘掉注册会红、
+首包发射时机与只发一次、live 的恒真断言换成会响的）
+`docs(m12): S37 归档 + 一条文档结构门禁`
 
 **实测（接上之后才发现"接上"只完成了一半）**
 真机流式那一发（`01M47XA2ZZRDTDV4NFRJ7NKW4G`，冷载入所以 ttft=8250ms）先给出了对的时长，
