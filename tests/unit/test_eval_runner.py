@@ -626,3 +626,84 @@ def test_prune_stale_cases_never_touches_a_referenced_row(env):
     assert stored == {"a0", "a1", "a3"}, "被 grade 引用的 a1 必须活着"
     for grade in repo.list_grades(report.run_id):
         assert grade.case_id in stored
+
+
+class _ModelCapsProvider:
+    """provider 级只报 CHAT，模型级才报 embedding——真实 Ollama 就是这个形状。"""
+
+    id = "model-caps"
+
+    def __init__(self, *, fail_show: bool = False) -> None:
+        self.fail_show = fail_show
+        self.asks: list[str] = []
+
+    def capabilities(self) -> frozenset:
+        return frozenset({Cap.CHAT})
+
+    def show_model(self, name: str):
+        from onyx.core.types import ModelDetail
+
+        self.asks.append(name)
+        if self.fail_show:
+            raise RuntimeError("engine unreachable")
+        return ModelDetail(name=name, capabilities=("completion", "embedding"))
+
+    def generate(self, req, **kw):  # pragma: no cover - 本用例只问能力
+        raise AssertionError
+
+
+def test_model_level_capabilities_unlock_a_task_the_provider_cannot_answer(tmp_path):
+    """能力闸门必须问**这个模型**，不能只问 provider。
+
+    真实形状：Ollama 的 provider 级能力是通道基线（chat/tools/…），
+    而 embedding 是模型级事实。只看 provider 级时 `semantic_similarity` 在真机上
+    永远 skip——看起来像"这个模型不行"，其实是判据问错了对象。
+    """
+    db = Database(tmp_path / "caps.sqlite")
+    sink = SqliteRecordSink(db, batch_size=16, idle_wait=0.005)
+    try:
+        provider = _ModelCapsProvider()
+        gateway = Gateway(provider, observer=ObserverEngine(record_sink=sink),
+                          blobs=FileBlobStore(tmp_path / "blobs"), clock=FakeClock())
+        data = _dataset()
+        runner = EvalRunner(gateway, EvalRepo(db), IntentClassification(data, model="m-embed"),
+                            dataset=data, clock=FakeClock())
+        assert Cap.EMBED not in runner.capabilities, "前提：provider 级没有 embedding"
+        assert Cap.EMBED in runner.capabilities_for("m-embed")
+        assert provider.asks == ["m-embed"]
+    finally:
+        sink.close()
+        db.close()
+
+
+def test_unanswerable_model_caps_fall_back_to_provider_caps(tmp_path):
+    """问不到模型能力就退回 provider 级：不许因为一次探测失败就把整轮判死。"""
+    db = Database(tmp_path / "caps2.sqlite")
+    sink = SqliteRecordSink(db, batch_size=16, idle_wait=0.005)
+    try:
+        gateway = Gateway(_ModelCapsProvider(fail_show=True),
+                          observer=ObserverEngine(record_sink=sink),
+                          blobs=FileBlobStore(tmp_path / "blobs"), clock=FakeClock())
+        runner = EvalRunner(gateway, EvalRepo(db), IntentClassification(_dataset(), model="m"),
+                            dataset=_dataset(), clock=FakeClock())
+        assert runner.capabilities_for("m") == frozenset({Cap.CHAT})
+    finally:
+        sink.close()
+        db.close()
+
+
+def test_explicit_caps_skip_the_engine_probe(tmp_path):
+    """显式传入的 caps（服务侧与测试）优先，并且不去问引擎——多一次阻塞调用是没必要的。"""
+    db = Database(tmp_path / "caps3.sqlite")
+    sink = SqliteRecordSink(db, batch_size=16, idle_wait=0.005)
+    try:
+        provider = _ModelCapsProvider()
+        gateway = Gateway(provider, observer=ObserverEngine(record_sink=sink),
+                          blobs=FileBlobStore(tmp_path / "blobs"), clock=FakeClock())
+        runner = EvalRunner(gateway, EvalRepo(db), IntentClassification(_dataset(), model="m"),
+                            dataset=_dataset(), clock=FakeClock(), caps=frozenset({Cap.TOOLS}))
+        assert runner.capabilities_for("m") == frozenset({Cap.TOOLS})
+        assert provider.asks == []
+    finally:
+        sink.close()
+        db.close()

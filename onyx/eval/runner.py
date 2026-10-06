@@ -15,6 +15,7 @@ runner 刻意很薄。它不做任何计量、不发任何 HTTP、不解释任�
 
 from __future__ import annotations
 
+import logging
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field, replace
@@ -28,6 +29,7 @@ from onyx.eval.datasets.loader import Dataset
 from onyx.eval.gpu_lock import GpuLock
 from onyx.eval.metrics import jsonable
 from onyx.eval.task import EvalTask, Grade, Skip, Verdict, check_capabilities
+from onyx.llm.caps import ENGINE_CAP_MAP
 from onyx.llm.gateway import Gateway
 from onyx.store.records import GradeRecord, RunRecord, TaskRecord
 from onyx.store.repos.eval_repo import EvalRepo
@@ -125,6 +127,32 @@ class EvalRunner:
         caps = getattr(self.gateway.provider, "capabilities", None)
         return frozenset(caps()) if callable(caps) else frozenset()
 
+    def capabilities_for(self, model: str) -> frozenset[Cap]:
+        """provider 级能力 ∪ **这个模型自报**的能力。
+
+        只看 provider 是不够的：Ollama 的 provider 级能力是**通道基线**，
+        而 embedding 是模型级事实（对 qwen3.5:9b 调 `/api/embed` 会被引擎拒掉，
+        对 qwen3-embedding:0.6b 就正常）。用 provider 级判，向量任务在真实 Ollama 上
+        永远 skip——而这看起来像"这个模型不行"。
+        显式传入的 `caps`（测试与服务侧）优先，不再问引擎。
+        """
+        base = self.capabilities
+        if self._caps is not None or not model:
+            return base
+        show = getattr(self.gateway.provider, "show_model", None)
+        if not callable(show):
+            return base
+        try:
+            detail = show(model)
+        except Exception as exc:  # noqa: BLE001 - 问不到模型能力就用 provider 级，但要说出来
+            logging.getLogger("onyx.eval").warning(
+                "取模型 %s 的能力失败，只用 provider 级判定：%s: %s",
+                model, type(exc).__name__, exc,
+            )
+            return base
+        declared = tuple(getattr(detail, "capabilities", ()) or ())
+        return base | {cap for name in declared if (cap := ENGINE_CAP_MAP.get(str(name)))}
+
     @property
     def _dataset_id(self) -> str:
         return self.dataset.id if self.dataset is not None else ""
@@ -139,7 +167,7 @@ class EvalRunner:
         started_ns = self.clock.monotonic_ns()
 
         self._ensure_persisted()
-        skip = check_capabilities(self.task, self.capabilities)
+        skip = check_capabilities(self.task, self.capabilities_for(config.model))
         run_id = config.resume_run_id or config.run_id or new_trace_id()
         previous = self.repo.get_run(run_id) if config.resume_run_id else None
         resuming = previous is not None
