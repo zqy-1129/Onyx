@@ -54,8 +54,9 @@
 
   --row-h: 28px; /* 表格行高：数据密度的核心参数 */
   --panel-title-h: 32px;
-  --rail-w: 56px;
-  --rail-w-expanded: 200px;
+  --rail-w: 64px;
+  --rail-w-expanded: 220px;
+  --rail-icon: 20px; /* rail 图标：收起态它是唯一的可点通道，16px 在这个宽度下太小 */
   --topbar-h: 48px;
 
   --fs-xs: 11px;

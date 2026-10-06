@@ -179,8 +179,11 @@ export function CapSymbol({ state, cap, reason }: { state: string; cap: string; 
   )
 }
 
-export function StatusDot({ ok }: { ok: boolean }) {
-  return <span className={`status-dot ${ok ? 'status-ok' : 'status-err'}`} title={ok ? '可达' : '不可达'} />
+/** `ok === null` 是"还不知道"：画成灰点，不能画成红色的不可达（R2/R5）。 */
+export function StatusDot({ ok }: { ok: boolean | null }) {
+  const cls = ok === null ? 'status-unknown' : ok ? 'status-ok' : 'status-err'
+  const label = ok === null ? '状态未知' : ok ? '可达' : '不可达'
+  return <span className={`status-dot ${cls}`} title={label} />
 }
 
 /* ── 空态 / 骨架 ───────────────────────────────────────── */
