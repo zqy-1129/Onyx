@@ -99,6 +99,21 @@ def test_metrics_and_engine_are_protected_too():
     assert mod.violations(["onyx/store/sinks/otlp.py", "onyx/obs/engine.py"])
 
 
+def test_a_protected_file_can_never_be_the_trigger():
+    """内建 visitor 自己既是"实现前缀下"又是"受保护内核"——它不许触发自己的门禁。
+
+    真实触发过一次：S33 只改了 `gateway.py` + `obs/visitors/anomaly.py`（纯内核改动），
+    脚本报"接入 anomaly.py 时改了 gateway.py"。一个会误报的门禁，第一次误报之后就会被绕过，
+    所以这条既补断言也补反向：实现侧带着内核一起动，仍然必须红。
+    """
+    assert not mod.is_implementation("onyx/obs/visitors/anomaly.py")
+    assert mod.violations(["onyx/obs/visitors/anomaly.py", "onyx/llm/gateway.py"]) == []
+    assert mod.violations(["onyx/obs/visitors/token.py", "README.md"]) == []
+    # 反向：新实现 + 内建 visitor = 依旧要红
+    leak = mod.violations(["onyx/llm/providers/vllm.py", "onyx/obs/visitors/anomaly.py"])
+    assert leak and leak[0][1] == "onyx/obs/visitors/anomaly.py"
+
+
 def test_windows_separators_are_normalized():
     """Windows 上 `git diff --name-only` 通常是正斜杠，但手动传参可能是反斜杠。"""
     assert mod.is_implementation("onyx\\llm\\providers\\vllm.py")

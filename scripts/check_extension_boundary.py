@@ -63,10 +63,21 @@ IMPL_PREFIXES = (
 )
 
 
-def is_implementation(path: str) -> bool:
-    """这个文件是"某个扩展点的一个实现"吗？"""
+def is_protected(path: str) -> bool:
     normalized = path.replace("\\", "/")
-    if normalized in REGISTRATION_POINTS:
+    return any(normalized.startswith(prefix) for prefix, _reason in PROTECTED)
+
+
+def is_implementation(path: str) -> bool:
+    """这个文件是"某个扩展点的一个实现"吗？
+
+    受保护的内核文件**永远不算**：`onyx/obs/visitors/anomaly.py` 既在 `obs/visitors/`
+    这个实现前缀下、又是内建实现（受保护）。让它可以充当触发者，就等于
+    "只改内核"也会被判成抽象泄漏——而一个会误报的门禁，第一次误报之后就会被绕过。
+    真正要抓的是"接一个新实现时顺手改了内核"，所以触发者必须是实现侧的文件。
+    """
+    normalized = path.replace("\\", "/")
+    if normalized in REGISTRATION_POINTS or is_protected(normalized):
         return False
     return normalized.startswith(IMPL_PREFIXES)
 
