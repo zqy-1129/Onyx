@@ -14,7 +14,13 @@ from typer.testing import CliRunner
 from onyx.cli import app
 from onyx.report.usage_report import CSV_COLUMNS
 from onyx.store.db import Database
-from onyx.store.records import TokenPartRecord, TraceRecord, UsageRecord
+from onyx.store.records import (
+    ModelRecord,
+    ProviderRecord,
+    TokenPartRecord,
+    TraceRecord,
+    UsageRecord,
+)
 from onyx.store.repos import TraceRepo, UsageRepo
 
 runner = CliRunner()
@@ -34,12 +40,14 @@ def _db(tmp_path) -> Database:
     return Database(tmp_path / "onyx.sqlite")
 
 
-def _seed(tmp_path, *, trace_id: str = "T1", with_parts: bool = True, closing: bool = True):
+def _seed(tmp_path, *, trace_id: str = "T1", with_parts: bool = True, closing: bool = True,
+          attribution: dict | None = None):
     db = _db(tmp_path)
     TraceRepo(db).upsert(TraceRecord(
         id=trace_id, kind="generation", purpose="chat",
         started_at="2026-10-05T10:00:00+00:00", status="ok",
         provider_id="ollama-local", model_id="ollama-local/qwen3.5:9b", model_name="qwen3.5:9b",
+        extra={"attribution": attribution} if attribution else {},
     ))
     UsageRepo(db).upsert(UsageRecord(
         trace_id=trace_id, source="engine", confidence="high",
@@ -47,13 +55,21 @@ def _seed(tmp_path, *, trace_id: str = "T1", with_parts: bool = True, closing: b
     ))
     if with_parts:
         messages = 800 if closing else 1200
+        # clamp 时 `parts.py` 按设计把 template_ctl 记 0（残差为负不掩盖），种子要跟它一致，
+        # 否则测的是"一个现实中不存在的形状"。
+        ctl = 100 if closing or not attribution else 0
         UsageRepo(db).replace_parts(trace_id, [
             TokenPartRecord(trace_id=trace_id, part="system", tokens=100),
             TokenPartRecord(trace_id=trace_id, part="messages", ord=1, tokens=messages),
-            TokenPartRecord(trace_id=trace_id, part="template_ctl", tokens=100),
+            TokenPartRecord(trace_id=trace_id, part="template_ctl", tokens=ctl),
             TokenPartRecord(trace_id=trace_id, part="output", tokens=50),
         ])
     db.close()
+
+
+#: 真机 bench `01M47VS1…` 的形状：分段按启发式数 ⇒ 求和超过引擎计数 ⇒ 残差为负被 clamp。
+_CLAMPED = {"count_source": "heuristic", "clamped": True, "residual_raw": -300,
+            "input_segments_tokens": 1300, "template_ctl_tokens": 0, "has_template": False}
 
 
 # ── token explain ────────────────────────────────────────────────
@@ -73,8 +89,52 @@ def test_explain_reports_closure_and_exits_one_when_it_does_not_add_up(tmp_path)
     payload = json.loads(_run("token", "explain", "T1", "--json").output)
     assert payload["closure"] == {"checked": True, "closed": False, "sum": 1400,
                                  "reported": 1000, "delta": 400,
-                                 "note": "分段求和比采信值多 400 tok"}
+                                 "count_source": None, "clamped": None, "residual_raw": None,
+                                 "note": "分段求和比采信值多 400 tok；这条没记归因档位，说不清原因"}
     assert payload["clean"] is False
+    assert payload["attribution"] == {"recorded": False, "count_source": None,
+                                      "clamped": None, "residual_raw": None}
+
+
+def test_explain_names_the_attribution_tier_and_gives_the_calibration_command(tmp_path):
+    """S39 DoD①：一条未标定的 clamp 行，CLI 要说出**档位、残差、下一步命令**。
+
+    这一步的全部意义在于"不闭合"不再是一句判决词，而是一个能顺着走的原因链；
+    所以这里断言的是内容与退出码，不是排版。
+    """
+    _seed(tmp_path, closing=False, attribution=_CLAMPED)
+    result = _run("token", "explain", "T1")
+    assert result.exit_code == 1, result.output
+    assert "分段按 heuristic" in result.output
+    assert "clamp" in result.output and "onyx calibrate --model qwen3.5:9b" in result.output
+
+    payload = json.loads(_run("token", "explain", "T1", "--json").output)
+    assert payload["closure"]["count_source"] == "heuristic"
+    assert payload["closure"]["clamped"] is True and payload["closure"]["residual_raw"] == -300
+    assert payload["closure"]["sum"] == 1300 and payload["closure"]["delta"] == 300
+
+
+def test_explain_does_not_tell_an_already_calibrated_model_to_calibrate_again(tmp_path):
+    """档位是当时的记录，标定是现在的档案——老行配新档案时说"重跑就闭合"，不说"去标定"。"""
+    from onyx.store.repos import ModelRepo
+
+    db = _db(tmp_path)
+    models = ModelRepo(db)
+    #: model 表对外键 provider_id 有约束，所以"标定过的档案"要先有通道这一行
+    models.upsert_provider(ProviderRecord(
+        id="ollama-local", kind="ollama", base_url="http://127.0.0.1:11434",
+        api_style="native", caps=("chat", "tools"), version="0.35.1",
+    ))
+    models.upsert_model(ModelRecord(
+        id="ollama-local/qwen3.5:9b", provider_id="ollama-local", name="qwen3.5:9b",
+        usage_ratio=0.69, usage_ratio_n=40,
+    ))
+    db.close()
+    _seed(tmp_path, closing=False, attribution=_CLAMPED)
+    result = _run("token", "explain", "T1")
+    assert result.exit_code == 1, result.output
+    assert "calibrate --model" not in result.output
+    assert "标定前跑的" in result.output and "重跑" in result.output
 
 
 def test_explain_is_clean_when_parts_add_up(tmp_path):

@@ -1447,12 +1447,30 @@ def traces_show(
         console.print(alt_table)
 
         if bundle.parts:
-            part_table = Table(title="分段归因（Σ分段 + template_ctl = 引擎计数）", pad_edge=False)
+            attribution = (record.extra or {}).get("attribution") or {}
+            # 这句限定原本是**无条件等式**，而它只在没被 clamp 时成立：`template_ctl` 就是残差，
+            # 残差为负时按设计 clamp 成 0，于是 Σ分段 > 引擎计数（S39 取证：未标定的模型条条如此）。
+            # 写在表前而不是表标题里：rich 会把长标题按表格宽度折行，条件句会被劈成两截读不出意思。
+            tier = attribution.get("count_source")
+            # 这一句原本是**无条件等式**，而它只在没被 clamp 时成立：`template_ctl` 就是残差，
+            # 残差为负时按设计 clamp 成 0，于是 Σ分段 > 引擎计数（S39 取证：未标定的模型条条如此）。
+            # 两个分支都自带限定词，并且写在同一行——`test_release_surface` 就是按行查这句话的。
+            qualify = ("Σ分段 + template_ctl = 引擎计数（仅未 clamp 时成立）" if attribution
+                       else "Σ分段 + template_ctl = 引擎计数（这条没记归因档位，clamp 与否判不了）")
+            console.print(f"[bold]分段归因[/]｜{qualify}"
+                          + (f"｜本条分段按 {tier} 数" if tier else ""))
+            part_table = Table(title="分段归因", pad_edge=False)
             for column in ("part", "tokens", "bytes"):
                 part_table.add_column(column)
             for part in bundle.parts:
                 part_table.add_row(part.part, str(part.tokens), str(part.bytes if part.bytes else "—"))
             console.print(part_table)
+            if attribution.get("clamped"):
+                console.print(
+                    f"[yellow]! 本条已 clamp[/]（残差 {attribution.get('residual_raw')} ⇒ template_ctl 记 0）："
+                    "分段计数器比引擎高估，各段只能比相对占比，不能当"
+                    "「这部分花了多少 token」。原因与修法见 onyx token explain "
+                    f"{record.id}")
 
         if calls:
             call_table = Table(title="工具调用", pad_edge=False)
@@ -3727,7 +3745,8 @@ def token_explain(
 
     result = explain(bundle, fitted_ratio=getattr(model, "usage_ratio", None),
                      fitted_n=int(getattr(model, "usage_ratio_n", 0) or 0),
-                     model=record.model_name, provider_id=record.provider_id)
+                     model=record.model_name, provider_id=record.provider_id,
+                     attribution=(record.extra or {}).get("attribution"))
     if json_out:
         typer.echo(_json.dumps(result.as_dict(), ensure_ascii=False, indent=2, default=str))
         raise typer.Exit(0 if result.clean else 1)
@@ -3765,14 +3784,20 @@ def token_explain(
 
 
 def _closure_line(closure: dict) -> str:
-    """分段闭合那一行。三种状态必须互不冒充：闭合 / 不闭合（带差值）/ 判不了（带原因）。"""
-    head = "分段闭合（Σ非 output 分段 vs 采信 in）："
+    """分段闭合那一行。三种状态必须互不冒充：闭合 / 不闭合（带差值）/ 判不了（带原因）。
+
+    档位要跟着印：闭合与不闭合的差别不在"有没有算错"，而在**分段是按哪一档计数数的**
+    （未标定 ⇒ heuristic 高估 ⇒ 残差为负被 clamp ⇒ 求和必然大于引擎计数）。
+    """
+    tier = closure.get("count_source")
+    head = "分段闭合（Σ非 output 分段 vs 采信 in" + (f"，分段按 {tier}" if tier else "") + "）："
     if not closure.get("checked"):
         return f"{head}未判定｜{closure.get('note', '没有分段归因')}"
     if closure.get("closed"):
         return f"{head}✓ 闭合（求和 {closure.get('sum')} == {closure.get('reported')}）"
+    clamp = "｜残差 {} 被 clamp 成 0".format(closure.get("residual_raw")) if closure.get("clamped") else ""
     return (f"{head}✗ 不闭合｜求和 {closure.get('sum')} vs 采信 {closure.get('reported')}，"
-            f"差 {closure.get('delta', 0):+d} tok")
+            f"差 {closure.get('delta', 0):+d} tok{clamp}")
 
 
 # ── report：用量汇总（S38）────────────────────────────────────────
