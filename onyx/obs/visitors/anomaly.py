@@ -41,13 +41,17 @@ class AnomalyVisitor(BaseVisitor):
             }, severity=Severity.ERROR)
             return  # 请求本身失败了，输出形态类判定没有意义
 
-        if state.text_chars == 0 and state.thinking_chars > 0:
-            state.add_anomaly("EMPTY_CONTENT_WITH_THINKING", {
-                "thinking_chars": state.thinking_chars,
-                "hint": "P5/P12：预算被推理吃光。评测中这不算答错，是没预算答",
-            })
-        elif state.text_chars == 0 and state.thinking_chars == 0:
-            state.add_anomaly("EMPTY_OUTPUT", {"finish_reason": state.finish_reason})
+        # 输出形态这一族只对生成调用有意义。向量化（S33）没有正文也没有 thinking：
+        # 不按 kind 关掉，每一条 embed trace 都会挂着 EMPTY_OUTPUT，
+        # 而看板上"引擎没输出文本"与"模型没答出来"就成了同一件事。
+        if state.kind == "generation":
+            if state.text_chars == 0 and state.thinking_chars > 0:
+                state.add_anomaly("EMPTY_CONTENT_WITH_THINKING", {
+                    "thinking_chars": state.thinking_chars,
+                    "hint": "P5/P12：预算被推理吃光。评测中这不算答错，是没预算答",
+                })
+            elif state.text_chars == 0 and state.thinking_chars == 0:
+                state.add_anomaly("EMPTY_OUTPUT", {"finish_reason": state.finish_reason})
 
         summary = state.latency_summary()
         if summary.get("prefill_mode") == "warm":

@@ -23,9 +23,13 @@ from onyx.core.errors import OnyxError
 from onyx.core.event import CONTRACT_VERSION, EventType, TraceEvent, make_event
 from onyx.core.ids import new_trace_id
 from onyx.core.types import (
+    Cap,
+    Embedding,
+    EmbedRequest,
     Generation,
     GenerationRequest,
     ReconciledUsage,
+    Status,
     TokenSample,
     TokenSource,
     TraceContext,
@@ -93,6 +97,23 @@ class GatewayResult:
     @property
     def ok(self) -> bool:
         return self.generation.status.value == "ok"
+
+
+@dataclass(frozen=True, slots=True)
+class EmbedGatewayResult:
+    """向量化的结果。**向量本身不落库**（一次 1024 维 float 数组比它服务的文本长得多，
+    而没有任何消费者读它——存了只会让 `.data` 膨胀）。要留的是出处：输入、计数、耗时。
+    """
+
+    trace_id: str
+    embedding: Embedding
+    usage: ReconciledUsage | None
+    anomalies: tuple[tuple[str, str, dict[str, Any]], ...]
+    record_refs: dict[str, str]
+
+    @property
+    def ok(self) -> bool:
+        return self.embedding.status is Status.OK
 
 
 class Gateway:
@@ -216,6 +237,94 @@ class Gateway:
             anomalies=tuple(state.anomalies) if state else (),
             latency=state.latency_summary() if state else {},
             record_refs={"messages": messages_ref, "tools": tools_ref or "", "output": output_ref},
+        )
+
+    # ── 向量化入口 ────────────────────────────────────────────────
+    def embed(
+        self,
+        req: EmbedRequest,
+        *,
+        purpose: TracePurpose | str | None = None,
+        trace_id: str | None = None,
+    ) -> EmbedGatewayResult:
+        """一次批量向量化。**没有 `EmbeddingProvider` 就是明确的 unsupported**。
+
+        这里刻意不做任何隐式降级（"那就用 chat 生成文本再解析成向量"之类）：
+        那条路会产出一个看着像向量的东西，而它测的是模型会不会输出 JSON，不是表示质量。
+        能力缺失要在这里留一条错误 trace，而不是在下游变成一个分数。
+        """
+        from onyx.llm.providers.base import EmbeddingProvider
+
+        tid = trace_id or new_trace_id()
+        ctx = req.context
+        if purpose is not None:
+            ctx = dataclasses.replace(ctx, purpose=TracePurpose(purpose))
+        start_ns = self.clock.monotonic_ns()
+        inputs_ref = self.blobs.put_json({"model": req.model, "inputs": list(req.inputs)})
+
+        self._emit(make_event(EventType.TRACE_START, tid, {
+            # kind 由**入口**决定，不读 `ctx.kind`：TraceContext 的默认值就是 generation，
+            # 于是"默认值"与"有人显式要求记成 generation"根本分不开。
+            # 一条向量化调用被记成 generation，会让所有按 kind 分的统计说谎（S33 实测踩到）
+            "kind": str(TraceKind.EMBED),
+            "purpose": ctx.purpose_label,
+            "provider_id": getattr(self.provider, "id", ""),
+            "model": req.model,
+            "model_id": self.model_id,
+            "params": {"batch_size": req.batch_size},
+            "messages_ref": inputs_ref,
+            "tools_ref": None,
+            "keep_alive": req.keep_alive,
+            "context": _context_dict(ctx),
+            "contract_version": CONTRACT_VERSION,
+        }, clock=self.clock))
+
+        if not isinstance(self.provider, EmbeddingProvider):
+            provider_id = getattr(self.provider, "id", type(self.provider).__name__)
+            detail = {"cap": str(Cap.EMBED), "provider_id": provider_id,
+                      "model": req.model, "batch_size": req.batch_size}
+            self._emit(make_event(EventType.ANOMALY, tid, {
+                "code": "EMBED_UNSUPPORTED", "severity": severity_of("EMBED_UNSUPPORTED"),
+                "detail": detail,
+            }, clock=self.clock))
+            failed = Embedding(
+                model=req.model, status=Status.ERROR,
+                error=f"provider {provider_id} 不提供向量化（Cap.EMBED 未实现）",
+                extra=detail,
+            )
+            state = self._emit(make_event(EventType.TRACE_END, tid, {
+                "status": str(Status.ERROR),
+                "wall_ms": (self.clock.monotonic_ns() - start_ns) / 1e6,
+                "error": failed.error,
+            }, clock=self.clock))
+            return EmbedGatewayResult(
+                trace_id=tid, embedding=failed, usage=state.reconciled if state else None,
+                anomalies=tuple(state.anomalies) if state else (),
+                record_refs={"messages": inputs_ref},
+            )
+
+        try:
+            result = self.provider.embed(req, trace_id=tid, on_event=self._forward)
+        except OnyxError as exc:
+            self._fail(tid, start_ns, exc)
+            raise
+        except Exception as exc:
+            self._fail(tid, start_ns, exc)
+            raise
+
+        wall_ms = (self.clock.monotonic_ns() - start_ns) / 1e6
+        embedding = dataclasses.replace(result, wall_ms=wall_ms)
+        if self.sample_gpu:
+            self._emit_gpu_sample(tid, req.model)
+        state = self._emit(make_event(EventType.TRACE_END, tid, {
+            "status": str(embedding.status), "wall_ms": wall_ms, "error": embedding.error,
+            "vectors": len(embedding.vectors), "dimension": embedding.dimension,
+            "batch_size": req.batch_size,
+        }, clock=self.clock))
+        return EmbedGatewayResult(
+            trace_id=tid, embedding=embedding, usage=state.reconciled if state else None,
+            anomalies=tuple(state.anomalies) if state else (),
+            record_refs={"messages": inputs_ref},
         )
 
     # ── 内部 ──────────────────────────────────────────────────────

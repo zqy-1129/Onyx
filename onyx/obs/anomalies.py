@@ -76,6 +76,11 @@ SPECS: dict[str, AnomalySpec] = {
                     "步数/时间/token 预算耗尽", "提高预算或简化任务"),
         AnomalySpec("TOOL_ERROR", Severity.WARN,
                     "工具执行失败", "先跑 onyx tools contract 区分是工具坏了还是模型用错了"),
+        # ── 能力与端点 ────────────────────────────────────────────
+        AnomalySpec("EMBED_UNSUPPORTED", Severity.ERROR,
+                    "向量化请求打到了没有实现 EmbeddingProvider 的引擎",
+                    "换有 embedding 能力的模型（Ollama 的 card capabilities 含 embedding）；"
+                    "评测侧应整场 skip 并写明原因，而不是改用 chat 拼一个假向量"),
         # ── 输出形态 ──────────────────────────────────────────────
         AnomalySpec("EMPTY_CONTENT_WITH_THINKING", Severity.WARN,
                     "正文为空但产出了推理内容（P5/P12：预算被 thinking 吃光）",

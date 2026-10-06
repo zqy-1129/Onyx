@@ -14,6 +14,8 @@ from onyx.core.event import TraceEvent
 from onyx.core.types import (
     AdminResult,
     Cap,
+    Embedding,
+    EmbedRequest,
     Generation,
     GenerationRequest,
     LoadedModel,
@@ -52,6 +54,25 @@ class AdminProvider(Protocol):
     def pull(self, name: str, *, on_event: EventCB | None = None) -> AdminResult: ...
     def unload(self, name: str) -> AdminResult: ...
     def delete(self, name: str) -> AdminResult: ...
+
+
+@runtime_checkable
+class EmbeddingProvider(Protocol):
+    """可选能力：把一批文本向量化。**刻意不并入 `LlmProvider`**。
+
+    并进去就是逼每个 provider 假装支持：`openai_compat` 的 `/v1/embeddings` 本机没实测过，
+    外部插件更未必有——而协议里每个方法都得有契约测试兜着（S16a 的教训：
+    内置实现与内核一起过拟合，只有照协议写的外部实现会把抽象泄漏顶出来）。
+    所以这里是"有就声明、没有就明确报 unsupported"，gateway 不做隐式降级。
+    """
+
+    def embed(
+        self,
+        req: EmbedRequest,
+        *,
+        trace_id: str = "",
+        on_event: EventCB | None = None,
+    ) -> Embedding: ...
 
 
 def emit(on_event: EventCB | None, event: TraceEvent) -> None:
