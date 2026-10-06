@@ -178,20 +178,15 @@ def usage_summary(
     bucket_minutes: int = Query(60, ge=1, le=1440),
     state: AppState = Depends(get_state),
 ) -> UsageSummaryView:
-    summary = state.usage.summarize(since=since, model_id=model)
-    drift_values = [value for _, value in summary.drift_samples if value is not None]
-    ordered = sorted(drift_values)
-    drift = {
-        "n": len(ordered),
-        "max": ordered[-1] if ordered else None,
-        "p50": ordered[len(ordered) // 2] if ordered else None,
-        "over_threshold": sum(1 for v in ordered if v > 0.10),
-    }
-    return UsageSummaryView(
-        traces=summary.traces, in_tokens=summary.in_tokens, out_tokens=summary.out_tokens,
-        thinking_tokens=summary.thinking_tokens, by_source=summary.by_source,
-        by_confidence=summary.by_confidence,
-        by_prefill_mode=state.usage.by_prefill_mode(since=since),
-        drift=drift,
-        timeseries=state.usage.timeseries(bucket_minutes=bucket_minutes, since=since),
-    )
+    """Token Ledger 的汇总。**算法在 `report.usage_report.build_overview`**：
+    CLI 的 `onyx report usage` 走同一个函数——两处各算 p50 与阈值，
+    同一份库就会在看板与终端上给出两个"漂移超阈率"。"""
+    from onyx.report.usage_report import build_overview
+
+    try:
+        overview = build_overview(state.usage, since=since, model=model,
+                                  bucket_minutes=bucket_minutes)
+    except ValueError as exc:
+        # `?since=7d` 这类写法字典序比所有行都大：不拦就等于告诉前端"这段时间没有请求"。
+        raise HTTPException(400, str(exc)) from exc
+    return UsageSummaryView(**overview.as_dict())

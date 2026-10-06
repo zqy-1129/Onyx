@@ -178,6 +178,11 @@ class FleetView(BaseModel):
 
 
 class UsageSummaryView(BaseModel):
+    #: 查询窗口也回给调用方：一份汇总不写"从什么时候起到哪、桶多大"，
+    #: 就分不清"这段时间没跑"与"跑了很多但被窗口切掉了"
+    since: str | None = None
+    model: str | None = None
+    bucket_minutes: int = 60
     traces: int = 0
     in_tokens: int = 0
     out_tokens: int = 0

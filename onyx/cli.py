@@ -59,6 +59,10 @@ probe_app = typer.Typer(help="语义实测探针：把引擎行为变成可复�
 app.add_typer(probe_app, name="probe")
 perf_app = typer.Typer(help="吞吐/延迟基线：条件相同才可比，没测到不写 0", no_args_is_help=True)
 app.add_typer(perf_app, name="perf")
+token_app = typer.Typer(help="token 采信的来源解释：这个数是谁报的、别的档差多少", no_args_is_help=True)
+app.add_typer(token_app, name="token")
+report_app = typer.Typer(help="离线报告：把库里的汇总拉成 csv / markdown", no_args_is_help=True)
+app.add_typer(report_app, name="report")
 
 
 @dataclass
@@ -3688,6 +3692,146 @@ def _model_quantization(provider: object, model: str) -> str:
     except Exception:  # noqa: BLE001 - 同上：拿不到就留空
         return ""
     return ""
+
+
+# ── token：采信解释（S38）─────────────────────────────────────────
+@token_app.command("explain")
+def token_explain(
+    trace_id: str = typer.Argument(..., help="trace id（`onyx traces ls` 里第一列）"),
+    db: Path = typer.Option(None, "--db"),
+    json_out: bool = typer.Option(False, "--json", help="机器可读输出"),
+) -> None:
+    """这条 trace 的 token 数是谁报的、换个档差多少、分段闭合吗。
+
+    `traces show` 已经列出三张表；这里只回答它没答的判断题，而且判定全走
+    `measurement` 的现成常量与口径——不出现第二套阶梯或第二个阈值。
+    """
+    import json as _json
+
+    from rich.console import Console
+    from rich.table import Table
+
+    from onyx.llm.measurement.explain import explain
+    from onyx.store.repos import ModelRepo, TraceRepo, UsageRepo
+
+    settings = _settings()
+    with Database(_db_path(settings, db)) as database:
+        record = TraceRepo(database).get(trace_id)
+        if record is None:
+            typer.echo(f"没有这条 trace：{trace_id}", err=True)
+            typer.echo("用 onyx traces ls 找 id（游标分页，不是模糊搜索）。", err=True)
+            raise typer.Exit(2)
+        bundle = UsageRepo(database).fetch(trace_id)
+        model = ModelRepo(database).find_by_name(record.provider_id, record.model_name) \
+            if record.model_name else None
+
+    result = explain(bundle, fitted_ratio=getattr(model, "usage_ratio", None),
+                     fitted_n=int(getattr(model, "usage_ratio_n", 0) or 0),
+                     model=record.model_name, provider_id=record.provider_id)
+    if json_out:
+        typer.echo(_json.dumps(result.as_dict(), ensure_ascii=False, indent=2, default=str))
+        raise typer.Exit(0 if result.clean else 1)
+
+    console = Console()
+    console.print(f"[bold]{result.trace_id}[/bold]  {result.model} @ {result.provider_id}")
+    console.print(f"采信：[bold]{result.chosen}[/] 置信度 {result.confidence} "
+                  f"漂移 {'—' if result.drift_pct is None else f'{result.drift_pct:.2%}'}"
+                  "（drift 是与次优来源的相对差，不是百分比数字本身）")
+
+    tier_table = Table(title="保真阶梯在这一条上的实际状态", pad_edge=False)
+    for column in ("档", "状态", "in", "out", "为什么"):
+        tier_table.add_column(column)
+    for row in result.tiers:
+        tier_table.add_row(row.source, row.status,
+                           "—" if row.in_tokens is None else str(row.in_tokens),
+                           "—" if row.out_tokens is None else str(row.out_tokens), row.note[:70])
+    console.print(tier_table)
+
+    if result.deltas:
+        delta_table = Table(title="各来源与采信值的差", pad_edge=False)
+        for column in ("来源", "in", "Δin", "Δ%", "Δout"):
+            delta_table.add_column(column)
+        for item in result.deltas:
+            delta_table.add_row(str(item["source"]), str(item["in_tokens"]),
+                                 f"{item['in_delta']:+d}",
+                                 "—" if item["in_pct"] is None else f"{item['in_pct']:+.1f}%",
+                                 "—" if item["out_delta"] is None else f"{item['out_delta']:+d}")
+        console.print(delta_table)
+
+    console.print(_closure_line(result.closure))
+    for line in result.advice:
+        console.print(f"[yellow]→[/] {line}")
+    raise typer.Exit(0 if result.clean else 1)
+
+
+def _closure_line(closure: dict) -> str:
+    """分段闭合那一行。三种状态必须互不冒充：闭合 / 不闭合（带差值）/ 判不了（带原因）。"""
+    head = "分段闭合（Σ非 output 分段 vs 采信 in）："
+    if not closure.get("checked"):
+        return f"{head}未判定｜{closure.get('note', '没有分段归因')}"
+    if closure.get("closed"):
+        return f"{head}✓ 闭合（求和 {closure.get('sum')} == {closure.get('reported')}）"
+    return (f"{head}✗ 不闭合｜求和 {closure.get('sum')} vs 采信 {closure.get('reported')}，"
+            f"差 {closure.get('delta', 0):+d} tok")
+
+
+# ── report：用量汇总（S38）────────────────────────────────────────
+@report_app.command("usage")
+def report_usage(
+    since: str = typer.Option(
+        None, "--since",
+        help="起始时间（UTC）：`YYYY-MM-DD` 或 ISO 时间；写错格式会直接报错，不会静默查空",
+    ),
+    model: str = typer.Option(None, "--model", help="只统计某个 model_id"),
+    bucket_minutes: int = typer.Option(60, "--bucket-minutes", min=1, max=1440),
+    fmt: str = typer.Option("table", "--fmt", help="table / csv / markdown / json"),
+    out: Path = typer.Option(None, "--out", help="写到文件（csv/markdown 尤其建议）"),
+    db: Path = typer.Option(None, "--db"),
+) -> None:
+    """跨时间的 token 用量汇总。**与 `/api/usage/summary` 同一份算法**。"""
+    import json as _json
+
+    from onyx.report.usage_report import (
+        build_overview,
+        normalize_since,
+        render_csv,
+        render_markdown,
+        render_table,
+    )
+    from onyx.store.repos import UsageRepo
+
+    if fmt not in {"table", "csv", "markdown", "json"}:
+        typer.echo(f"--fmt 只认 table/csv/markdown/json，收到 {fmt!r}", err=True)
+        raise typer.Exit(2)
+
+    # 先校验时间再开库：把 `with Database(...)` 整个包进 try 会把库里抛的
+    # ValueError 也报成"--since 写错了"，那是把一个 bug 换成一个假解释。
+    try:
+        since = normalize_since(since)
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(2) from exc
+
+    settings = _settings()
+    with Database(_db_path(settings, db)) as database:
+        overview = build_overview(UsageRepo(database), since=since, model=model,
+                                 bucket_minutes=bucket_minutes)
+
+    if fmt == "json":
+        text = _json.dumps(overview.as_dict(), ensure_ascii=False, indent=2, default=str) + "\n"
+    elif fmt == "csv":
+        text = render_csv(overview)
+    elif fmt == "markdown":
+        text = render_markdown(overview)
+    else:
+        text = "\n".join(render_table(overview)) + "\n"
+
+    if out is not None:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(text, encoding="utf-8", newline="\n")
+        typer.echo(f"已写出 {fmt} 用量汇总：{out}（{overview.traces} 条 trace）")
+        return
+    typer.echo(text, nl=False)
 
 
 def _force_utf8_stdio() -> None:
