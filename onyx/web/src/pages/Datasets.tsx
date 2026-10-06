@@ -154,7 +154,6 @@ export function DatasetsPanel({ onImported }: { onImported: () => void }) {
       <Panel
         title="导入数据集"
         note="发的是 JSONL 文本，不是服务器上的路径"
-        flush
       >
         <div className="row-wrap gap-3">
           <label className="field">

@@ -87,26 +87,28 @@ export function EvalMatrixPage() {
         <EmptyState title="没有 done 状态的运行" hint="先跑一次：onyx eval run --task intent_classification --model …" />
       ) : null}
       {grid ? (
-        <table className="matrix">
-          <thead>
-            <tr>
-              <th>模型</th>
-              {grid.tasks.map((task) => (
-                <th key={task}>{task}</th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {grid.rows.map((row) => (
-              <tr key={row.model}>
-                <th className="mono">{row.model}</th>
-                {row.cells.map((cell, index) => (
-                  <GridCell key={grid.tasks[index]} cell={cell} />
+        <div className="table-wrap">
+          <table className="matrix">
+            <thead>
+              <tr>
+                <th>模型</th>
+                {grid.tasks.map((task) => (
+                  <th key={task}>{task}</th>
                 ))}
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {grid.rows.map((row) => (
+                <tr key={row.model}>
+                  <th className="mono">{row.model}</th>
+                  {row.cells.map((cell, index) => (
+                    <GridCell key={grid.tasks[index]} cell={cell} />
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       ) : null}
       {view?.warnings.length ? (
         <div className="warnbox">

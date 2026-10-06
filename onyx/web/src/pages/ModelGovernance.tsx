@@ -85,7 +85,6 @@ export function ModelGovernancePanel({
     <Panel
       title="模型治理"
       note={`与 onyx models pull / rm 同源 · 通道 ${providerId || UNKNOWN}`}
-      flush
     >
       {unsupported ? (
         <div className="banner banner-warn">

@@ -326,7 +326,7 @@ export function ToolBenchPage() {
           </Panel>
         </div>
         <div className="col-4">
-          <Panel title="上下文开销" note="P17：大头通常在模板脚手架，不在描述" flush>
+          <Panel title="上下文开销" note="P17：大头通常在模板脚手架，不在描述">
             {cost.error ? <ErrorState error={cost.error} /> : null}
             {cost.loading && !cost.data ? <Skeleton rows={5} /> : null}
             {lines.map((line) => (

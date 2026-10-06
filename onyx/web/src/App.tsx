@@ -27,15 +27,12 @@ const EVAL_TABS: Array<{ path: string; label: string }> = [
   { path: '/eval/datasets', label: '数据集' },
 ]
 
-const EVAL_NOTE = '发起评测与导入数据集都在这里；被中断的运行不进矩阵，半截分数没有可比性'
-
 interface NavItem {
   path: string
   glyph: string
   label: string
   /** 子页在 rail 展开时挂在本项下面；收起态回落到内容区的 subnav，否则子页又只能手敲 hash 才到得了 */
   children?: Array<{ path: string; label: string }>
-  note?: string
 }
 
 const NAV: NavItem[] = [
@@ -45,7 +42,7 @@ const NAV: NavItem[] = [
   { path: '/traces', glyph: '≡', label: 'Traces' },
   { path: '/usage', glyph: '∿', label: 'Token Ledger' },
   { path: '/tools', glyph: '⚒', label: 'Tool Bench' },
-  { path: '/eval', glyph: '◎', label: '评测', children: EVAL_TABS, note: EVAL_NOTE },
+  { path: '/eval', glyph: '◎', label: '评测', children: EVAL_TABS },
 ]
 
 function useTheme(): [string, () => void] {
@@ -113,18 +110,15 @@ export function App() {
   return (
     <div className="shell">
       <nav className={`rail${railOpen ? ' open' : ''}`} aria-label="主导航">
-        <div className="rail-head">
-          <span className="rail-logo" aria-hidden="true">◈</span>
-          <button
-            className="rail-toggle"
-            onClick={toggleRail}
-            aria-expanded={railOpen}
-            title={railOpen ? '收起侧边栏（只留图标）' : '展开侧边栏'}
-          >
-            <span className="rail-glyph" aria-hidden="true">{railOpen ? '◀' : '▶'}</span>
-            {railOpen ? <span className="rail-label">收起</span> : null}
-          </button>
-        </div>
+        <button
+          className="rail-logo"
+          onClick={toggleRail}
+          aria-expanded={railOpen}
+          title={railOpen ? '收起侧边栏（只留图标）' : '展开侧边栏'}
+        >
+          <span className="rail-glyph" aria-hidden="true">◈</span>
+          {railOpen ? <span className="rail-label">Onyx</span> : null}
+        </button>
 
         <div className="rail-nav">
           {NAV.map((item) => {
@@ -153,7 +147,6 @@ export function App() {
                         {child.label}
                       </button>
                     ))}
-                    {item.note ? <p className="rail-sub-note">{item.note}</p> : null}
                   </div>
                 ) : null}
               </div>
@@ -186,7 +179,6 @@ export function App() {
                   {tab.label}
                 </button>
               ))}
-              <span className="subnav-note">{EVAL_NOTE}</span>
             </nav>
           ) : null}
           {content}

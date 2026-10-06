@@ -46,17 +46,9 @@ a:hover { text-decoration: underline; }
    悬停展开会让"点不到的文字"和"看得见的图标"随机切换，读数时不该有这种惊喜 */
 .rail.open { width: var(--rail-w-expanded); flex-basis: var(--rail-w-expanded); }
 
-.rail-head {
-  display: flex; align-items: center; justify-content: center; gap: var(--space-2);
-  padding-bottom: var(--space-2);
-}
-.rail.open .rail-head { justify-content: flex-start; padding-left: var(--space-3); }
-.rail-logo {
-  font-family: var(--font-mono); font-weight: 700; font-size: var(--fs-xl);
-  color: var(--accent); letter-spacing: .5px; line-height: 1;
-}
-
-.rail-item, .rail-toggle, .rail-engine-head {
+/* logo 行本身是开合开关：与下面的菜单项共用同一套盒模型，
+   所以 ◈ 与 ◫ ▤ ▶ ≡ 严格落在同一列上，不再各算一套 padding */
+.rail-logo, .rail-item, .rail-engine-head {
   width: 100%; display: flex; align-items: center; gap: var(--space-3);
   padding: 8px var(--space-3); color: var(--text-secondary);
   border-left: 2px solid transparent; cursor: pointer; white-space: nowrap;
@@ -64,14 +56,18 @@ a:hover { text-decoration: underline; }
   font-family: inherit; text-align: left;
   transition: background var(--dur-fast), color var(--dur-fast);
 }
+.rail-logo { margin-bottom: var(--space-2); }
+.rail-logo .rail-glyph { color: var(--accent); font-weight: 700; }
+.rail-logo .rail-label { color: var(--text-primary); font-weight: 600; letter-spacing: .3px; }
+.rail:not(.open) .rail-logo,
 .rail:not(.open) .rail-item,
-.rail:not(.open) .rail-toggle,
 .rail:not(.open) .rail-engine-head,
 .rail:not(.open) .rail-engine-dot { justify-content: center; padding-inline: var(--space-2); }
-.rail-item:hover, .rail-toggle:hover, .rail-engine-head:hover {
+.rail-logo:hover, .rail-item:hover, .rail-engine-head:hover {
   background: var(--bg-elevated); color: var(--text-primary);
 }
-.rail-item:focus-visible, .rail-toggle:focus-visible, .rail-sub-item:focus-visible,
+.rail-logo .rail-glyph:hover { color: var(--accent); }
+.rail-logo:focus-visible, .rail-item:focus-visible, .rail-sub-item:focus-visible,
 .rail-engine-head:focus-visible, .rail-engine-dot:focus-visible {
   outline: 1px solid var(--accent); outline-offset: -2px;
 }
@@ -104,11 +100,6 @@ a:hover { text-decoration: underline; }
 .rail-sub-item:hover { background: var(--bg-elevated); color: var(--text-primary); }
 .rail-sub-item.active {
   color: var(--text-primary); background: var(--accent-dim); border-left-color: var(--accent);
-}
-.rail-sub-note {
-  margin: var(--space-1) var(--space-3) 0;
-  padding-left: calc(var(--space-3) + var(--rail-icon));
-  color: var(--text-muted); font-size: var(--fs-xs); line-height: 1.35; white-space: normal;
 }
 
 /* 引擎状态块：常驻底部，收起态只剩状态灯，展开侧栏后才有身份与新鲜度 */
@@ -163,15 +154,20 @@ a:hover { text-decoration: underline; }
   background: var(--bg-panel); border: 1px solid var(--border);
   border-radius: var(--radius-panel); display: flex; flex-direction: column; min-width: 0;
 }
+/* 标题行宁可长高也不许把字顶出边框：固定 32px + 不换行时，
+   窄面板上「prefill 冷 / 热」这类两行标题会直接溢出面板外沿 */
 .panel-head {
-  height: var(--panel-title-h); flex: 0 0 var(--panel-title-h);
-  display: flex; align-items: center; gap: var(--space-2);
-  padding: 0 var(--space-3); border-bottom: 1px solid var(--border);
+  min-height: var(--panel-title-h); flex: 0 0 auto;
+  display: flex; align-items: center; gap: var(--space-2); row-gap: 2px;
+  flex-wrap: wrap; padding: 4px var(--space-3); border-bottom: 1px solid var(--border);
 }
-.panel-title { font-size: var(--fs-md); font-weight: 600; letter-spacing: .2px; }
-/* 口径说明：面板必须自述"这个数字是怎么来的"（R1） */
-.panel-note { color: var(--text-muted); font-size: var(--fs-xs); font-family: var(--font-mono); }
-.panel-head-spacer { flex: 1 1 auto; }
+.panel-title { font-size: var(--fs-md); font-weight: 600; letter-spacing: .2px; min-width: 0; }
+/* 口径说明：面板必须自述"这个数字是怎么来的"（R1）——所以让它换行，不做截断 */
+.panel-note {
+  color: var(--text-muted); font-size: var(--fs-xs); font-family: var(--font-mono);
+  min-width: 0; overflow-wrap: anywhere;
+}
+.panel-head-spacer { flex: 1 1 auto; min-width: 0; }
 .panel-body { padding: var(--space-3); min-width: 0; }
 .panel-body.flush { padding: 0; }
 
@@ -293,6 +289,7 @@ td.mono, th.mono { font-family: var(--font-mono); }
   background: var(--bg-elevated); color: var(--text-primary);
   border: 1px solid var(--border-strong); border-radius: var(--radius-chip);
   padding: 3px 10px; font-size: var(--fs-sm); font-family: inherit; cursor: pointer;
+  white-space: nowrap; flex: 0 0 auto;
   transition: background var(--dur-fast), border-color var(--dur-fast);
 }
 .btn:hover { background: var(--border); border-color: var(--text-muted); }
@@ -334,6 +331,9 @@ textarea.input { font-family: var(--font-ui); resize: vertical; line-height: 1.5
  * R2：矩阵与 diff 里的「—」与 0 必须在视觉上不同；
  * R5：红只用于"这次请求失败"，模型答错是测量结果，用琥珀色。 */
 .matrix { width: 100%; border-collapse: separate; border-spacing: 0; }
+/* 放进滚动容器时按内容宽排：任务名是 intent_classification 这种长整词，
+   挤进窄列会一个字一行，读不出列名不如横向滚 */
+.table-wrap .matrix { min-width: max-content; }
 .matrix th, .matrix td { border-bottom: 1px solid var(--border); padding: 6px var(--space-2); text-align: left; }
 .matrix thead th { color: var(--text-secondary); font-size: var(--fs-xs); text-transform: uppercase; letter-spacing: .4px; }
 .matrix tbody th { color: var(--text-secondary); font-weight: 500; }
@@ -385,4 +385,3 @@ textarea.input { font-family: var(--font-ui); resize: vertical; line-height: 1.5
 }
 .subnav-item:hover { color: var(--text-primary); border-color: var(--border-strong); }
 .subnav-item.active { color: var(--text-primary); border-color: var(--accent); background: var(--accent-dim); }
-.subnav-note { color: var(--text-muted); font-size: var(--fs-xs); align-self: center; margin-left: var(--space-2); }
