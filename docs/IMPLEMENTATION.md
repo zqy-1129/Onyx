@@ -3148,11 +3148,13 @@ fitted  没报数（n=0，需≥30）
              eval 286 vs 245、119 vs 97、281 vs 241 …
 闭合的那 2 条都是 in=17 的一元 chat（分段只有一个 messages，没什么可错）
 ```
-⇒ **`traces show` 那张表的标题「Σ分段 + template_ctl = 引擎计数」目前是宣称一个不成立的等式**。
-不闭合的比例与 prompt 长度大致成固定比（bench 两档都恰好 +30.7%/+30.8%），
-所以它不是噪声，是归因路径上一个随长度线性放大的固定多算——但**这一步不去修它**：
-修它要动 `obs/visitors/token.py` 与 reconciler（内核），而 S38 的产出是两个只读入口。
-已登记为 **S39**，判据用这里的真实数字（见 ROADMAP 待办与 STATUS §3）。
+⇒ **`traces show` 那张表的标题「Σ分段 + template_ctl = 引擎计数」是宣称一个无条件的等式，
+而它只在未 clamp 时成立**。不闭合的比例与 prompt 长度大致成固定比（bench 两档都恰好 +30.7%/+30.8%），
+所以它不是噪声，是归因计数器随长度线性高估。**这一步不去修它**（S38 的产出是两个只读入口），
+登记为 S39。
+> 归档时我以为"修它要动内核（`obs/visitors/token.py` + reconciler）"——**这句是错的**，
+> S39 取证后发现根因是**库里 5 个模型的 `usage_ratio` 全是 NULL**（fitted 档从未标定 ⇒ 分段走启发式 ⇒
+> 高估 ⇒ `parts.py` 按设计把负的残差 clamp 成 0），修法不需要动内核。写在下面作为对照。
 
 内核其实**早就在报这件事**：161 条不闭合的 trace **全部**带 `ATTRIBUTION_CLAMPED`
 （"分段计数之和超过引擎计数 ⇒ 归因不可信"；全库这个码有 485 行），
@@ -3206,6 +3208,86 @@ uv run python scripts/check_extension_boundary.py                    # 无新增
 `since = normalize_since(since)` 删掉 ⇒ **9 条红**（6 种坏写法各自红、"不折 UTC 就丢边界那一发"红、
 API 那条不再 400、`--since` 归一化红）。CLI 那条 `exit 2` 不跟着红——因为 CLI 自己还校验了一次，
 **两处校验各自独立被守住**，这正是要的形状（少一处还有另一处，两处都在才谈得上同源）。
+
+---
+
+## S39 — 分段归因"不闭合"的根因是**没标定**，所以修法是把等式写回它的条件
+
+**为什么是这一步**：S38 的 `token explain` 第一次跑就把自己的判定器判成缺陷——最新 200 条里
+有分段归因的 163 条**只有 2 条闭合**。登记时我以为要在"缩放分段"与"改掉等式"之间做选择，
+**取证之后发现两个都不必**：
+
+```
+库里 5 个模型的 usage_ratio 全是 NULL —— fitted 档从来没有被标定过，一次都没有。
+归因用的计数器由 `gateway.text_counter(ctx)` 选档：gguf_vocab → fitted(需 ratio 且 n≥30) → heuristic。
+前两条在生产里都是空的 ⇒ 分段一直按启发式数，而 qwen3.5:9b 上启发式比引擎高 31.6%。
+`measurement/parts.py` 的口径是「template_ctl = 引擎计数 − Σ分段（残差）」，残差为负 ⇒ clamp 成 0，
+于是 Σ分段 > 引擎计数——**不闭合不是算错，是 clamp 的既定行为在报"计数器高估"**（161/161 与
+`ATTRIBUTION_CLAMPED` 同现，这条实测已经证明它俩是同一件事）。
+```
+
+真机验证（同一条代码路径，只改了标定状态）：
+```
+onyx calibrate --model qwen3.5:9b --n 40        # 中文 0.693 tok/字、模板固定开销 10.62、R²=1.0、最大相对误差 0.89%
+                                                #   已写回 ⇒ fitted 档生效
+onyx chat --model qwen3.5:9b "…"                # trace 01M4872J2ZV3NDMPABDDXDA2MY
+onyx token explain 01M4872J…                    # 分段闭合：✓ 闭合（求和 25 == 25）  退出码 0
+                                                # 阶梯同时长出 fitted 一行：in 27（heuristic 27，引擎 25）
+```
+
+**所以决定是三件事，而且没有一件需要动内核**：
+1. **不把分段缩放到采信总数**。缩放会把"计数器高估"这个事实抹成一个自洽的假数——
+   残差本来就是设计里的信息位（`parts.py` 的注释写着"原样记录，不掩盖"）。
+   该修的是**档位在生产里是死的**这件事，而它已经有工具（`onyx calibrate`）也有体检项
+   （doctor「token 计量档位」现在就报"未标定 4 个模型 ⇒ 归因只能 heuristic/low"）——
+   缺的是**读得出根因的文案**：同一条信息在 `traces show` 的表头里被写成了一个无条件的等式。
+2. **`token explain` 的 `→ 建议` 要说对根因**。现在那句是"分段不闭合是采集侧的缺陷"——
+   不够：它漏了唯一 actionable 的那一步。改成"未标定 ⇒ 归因走启发式计数器，高估即 clamp ⇒
+   `onyx calibrate --model <名字>`"，并把**这条 trace 实际用的档位**（`attribution.count_source`）印出来。
+   判据不许只读求和：`clamped` 与"分段本来就等于引擎计数"是两种不同的状态，
+   前者是"计数器不可信"，后者是"这一发没什么可错"。
+3. **`traces show` 与看板的分段表标题改成条件句**，并在 `clamped` 的那一条直接把结论印在表下：
+   「Σ分段 + template_ctl = 引擎计数（仅未 clamp 时成立）｜本条已 clamp ⇒ 分段只用于比较各段的相对占比」。
+   历史行**不回填、不重算**——那是伪造当时的测量。
+
+**顺带收掉 S38 登记的另半条**：`UsageRepo.timeseries` 的 `COALESCE(AVG(...),0)` 与
+`Usage.tsx` 的 `Number(x ?? 0)`——速率列没测到 ⇒ SQL 给 0 ⇒ 折线为空桶掉到 0。
+改成 SQL 出 NULL、前端在 NULL 处断线（`render_table`/`_num` 已把 0 显示成「—」，那是渲染层的兜底，
+不是根因）。它跨 store + 前端，与上面三条同属"同一个量的两种说法要一致"，所以放在一起做。
+
+**产出文件（计划）**
+```
+onyx/llm/measurement/explain.py       # 建议文案按 count_source/clamped 分支；阶梯行带上归因档位
+onyx/cli.py                           # traces show 的分段表标题与 clamp 结论行
+onyx/store/repos/usage_repo.py        # timeseries 的速率列去掉 COALESCE(...,0) ⇒ NULL
+onyx/web/src/pages/Usage.tsx          # null 处断线，不再 ?? 0
+docs/STATUS.md / docs/PROBES.md       # 标定实测（0.693 tok/字、模板开销 10.62、R²=1.0）进 P9/P11 口径
+tests/unit/test_measurement_explain.py / test_cli_traces.py / test_report_usage.py / 前端 vitest
+```
+（都不是边界脚本的 PROTECTED 文件 ⇒ 这一步不需要"内核单独成提交"的拆分。）
+
+**自测**
+```bash
+uv run pytest tests/unit/test_measurement_explain.py tests/unit/test_cli_traces.py -q
+uv run onyx token explain <未标定模型的一条老 trace>      # 必须点名"未标定 ⇒ clamp"并给出 calibrate 命令
+uv run onyx token explain 01M4872J2ZV3NDMPABDDXDA2MY      # 标定后那条：✓ 闭合、退出码 0
+uv run onyx traces show <trace>                            # 标题是条件句；clamp 的那条印出相对占比那句
+uv run onyx report usage --fmt csv | head                  # 空桶的速率列是空而不是 0
+uv run pytest tests/integration -m live                    # 标定生效后的真机闭合断言
+```
+**DoD**：① 一条**未标定**的 trace ⇒ `token explain` 说得出"归因档位 = heuristic、已 clamp、
+先跑 `onyx calibrate --model X`"，且**不**把 25==25 那种"没东西可测"当成通过（注入：伪造一条
+parts 为空但 engine_in 有值的 bundle ⇒ 必须仍是「未判定」）；② 一条**已标定**的真机 trace ⇒ ✓ 闭合、
+退出码 0（拿 `01M4872J…` 复跑为证）；③ `traces show` 与看板的标题不再是无条件等式，
+grep 全仓不再有"Σ分段 + template_ctl = 引擎计数"这句不带条件的写法（钉成一条结构断言）；
+④ 速率列的"没测到"从 SQL 起就是 NULL，前端折线在此断线，而 **token 数的 0 仍然显示 0**；
+⑤ 五道门全绿；STATUS §3 那条"161/163 不闭合"从已知缺陷移到已修，并带上标定前后的对照数字。
+
+**提交**：
+`docs(m12): S39 方案 —— 分段不闭合的根因是没标定，不是归因算错`
+`fix(measurement): explain 说清 clamp 与归因档位，给出 calibrate 这一步`
+`fix(cli+web): 「Σ分段 + template_ctl = 引擎计数」改成条件句；速率列的 0 从 SQL 起就是 NULL`
+`docs(m12): S39 归档（标定实测 0.693 tok/字、R²=1.0，与闭合前后对照）`
 
 ---
 
