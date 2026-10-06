@@ -1646,7 +1646,8 @@ python -c "yaml.safe_load(ci.yml)" → 3 个 job 解析正常
 默认按"不发行"处理（当前即默认保留所有权利）。决定发行时加一个 `LICENSE` 文件 + 一处政策改写即可。
 
 **验收 DoD**：M8 出口判据达成——新机器一条命令装得上并 `doctor` 全绿（本机干净环境已验），
-CI 能挡住 lint-imports / 边界脚本 / 覆盖率下跌；仓库尚无远端 ⇒ workflow 的首次真跑待推送之后。
+CI 能挡住 lint-imports / 边界脚本 / 覆盖率下跌；2026-10-06 已推到 GitHub（远端此前为空仓库），
+**workflow 的首次真跑结果尚未核对**——本机没有 `gh`，得在 Actions 页面上确认那四个 job。
 
 **提交**：`chore(release): 0.8.0 —— 版本策略、CHANGELOG 与五道门的 CI（S22）`
 

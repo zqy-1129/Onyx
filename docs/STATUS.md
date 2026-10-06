@@ -251,7 +251,8 @@ uv build && uv tool install --from dist/*.whl …  # 干净环境装起来：ver
 API：openapi 32 paths / 34 operations（含 `GET /api/stream` SSE）
 CI：.github/workflows/ci.yml 四个 job——后端五道门 + `-m e2e`、前端（tsc/vitest/build）、
 **浏览器（S40：npm ci + playwright install chromium + `-m browser`）**、打包安装冒烟
-（本机已验证命令本身可跑通；仓库尚无远端 ⇒ 还没真跑过一次）
+（本机已验证命令本身可跑通；2026-10-06 已推到 `github.com/zqy-1129/Onyx`，
+**首次真跑的结果还没核对**——本机没有 `gh`，要在 Actions 页面上看那四个 job 是不是真绿）
 ```
 
 真机跑过的证据（可复查，都在 git 里）：
