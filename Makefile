@@ -19,7 +19,7 @@ lint:            ## 代码风格 + 架构边界契约		→ uv run ruff check . &
 	$(UV) ruff check .
 	$(UV) lint-imports
 
-coverage:         ## 覆盖率门禁（离线套件，fail_under=80）	→ uv run coverage run -m pytest -q && uv run coverage report
+coverage:         ## 覆盖率门禁（离线套件，fail_under=85）	→ uv run coverage run -m pytest -q && uv run coverage report
 	$(UV) coverage run -m pytest -q
 	$(UV) coverage report
 

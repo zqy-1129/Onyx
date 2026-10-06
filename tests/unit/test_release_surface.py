@@ -109,3 +109,27 @@ def test_makefile_exposes_the_coverage_gate():
 
     assert "coverage:" in make
     assert "fail_under" in (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+
+
+def test_coverage_floor_is_pinned_and_carries_its_own_reason():
+    """地板值、它的口径、以及"为什么是这个数"必须同时被钉住。
+
+    `fail_under` 的作用是**挡住退化**，不是让我们通过：80 配 90% 上下的实测意味着
+    一次 -10 个点的真实退化会全绿通过，而"门禁在守"这件事看起来照样成立。
+    S35 把它抬到 85（留 6 个点余量）——余量小到一次真实退化就会被挡住，
+    又大到正常的增删代码不会逼人顺手把地板调回去。
+
+    数值本身之外还要断言注释：一个没有理由的数字，下一个人只会把它当成
+    "某人随手写的 80"，而改成 70 看起来是修 CI 而不是放水。
+    """
+    coverage = _pyproject()["tool"]["coverage"]
+    assert coverage["run"]["branch"] is True, \
+        "门禁必须数分支：只数语句会让「两岔只走过一岔」的文件看起来很高"
+    assert coverage["report"]["fail_under"] == 85, \
+        "地板被悄悄调回 80（或更低）就等于没有门禁——它是用来挡退化的"
+
+    text = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    above = text.split("[tool.coverage.report]")[1].split("fail_under")[0]
+    assert re.search(r"\d{4}-\d{2}-\d{2}", above), "要写明实测是哪天量的"
+    assert "%" in above, "要写明当前实测值，否则没人算得出余量是几个点"
+    assert "离线" in above, "必须写明用离线套件量：CI 机器上不一定有 Ollama"

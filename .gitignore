@@ -13,5 +13,7 @@ onyx.toml
 reports/
 node_modules/
 dist/
+# tsc --noEmit 也会留这个增量缓存：它让"跑一次类型检查"脏一次工作树
+*.tsbuildinfo
 .DS_Store
 uv.lock.bak

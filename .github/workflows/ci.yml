@@ -52,7 +52,7 @@ jobs:
           git fetch --no-tags --depth=50 origin "${GITHUB_SHA}" || true
           uv run python scripts/check_extension_boundary.py --base "$BASE" --head HEAD --verbose
 
-      - name: 离线测试 + 覆盖率门禁（fail_under=80 让这一步自己失败）
+      - name: 离线测试 + 覆盖率门禁（fail_under=85 让这一步自己失败）
         run: |
           uv run coverage run -m pytest -q
           uv run coverage report

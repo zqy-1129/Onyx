@@ -63,11 +63,18 @@ source = ["onyx"]
 branch = true
 
 [tool.coverage.report]
-# 门禁是 80%，但**必须用离线套件量**：CI 机器上不一定有 Ollama。
-# 基线（2026-10-04，离线 1128 项 / 分支覆盖）= 89%，最低的是 probe/checks 17%
-# （那些代码只在 `-m live` / `-m probe` 里跑，离线量不到）。
-# 留 9 个点的余量：低到刚好贴线的门禁会在下一次正常改动时被绕过。
-fail_under = 80
+# 门禁必须用**离线套件**量：CI 机器上不一定有 Ollama，`-m live` / `-m probe` 不算在内。
+# 实测（2026-10-06，离线 1648 passed / 1 skipped / 36 deselected，分支覆盖）= 90%，地板 85 ⇒ 余量 5 个点。
+#   · 最低的那几行是刻意的：`tools/reference_mcp_server.py` 11%——它按设计只在**子进程**里跑
+#     （契约矩阵的 mcp_stdio 列与 stdio 测试都靠它），父进程只 import 它，量不到正文；
+#     `probe/checks` 同理，那些代码只在 `-m live` / `-m probe` 里执行。
+#     不 omit 它们：一个数字里含着"这里量不到"比把它藏起来好。
+# 为什么从 80 抬到 85：地板的目的是**挡住退化**，不是让我们通过。80 配 90 的实测
+# 意味着一次 -10 个点的真实退化会全绿通过，而"门禁在守"看起来照样成立。
+# 5 个点的余量小到一次成规模的删测试会被挡，又大到正常的增删代码不会逼人调地板。
+# 这条判断由 `tests/unit/test_release_surface.py::test_coverage_floor_is_pinned_and_carries_its_own_reason`
+# 钉住——值、口径（branch=true）和这段理由三者同时被断言。
+fail_under = 85
 show_missing = true
 skip_covered = false
 exclude_lines = [
