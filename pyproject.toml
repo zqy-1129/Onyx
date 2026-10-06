@@ -12,7 +12,11 @@ tokens = ["minja>=0.3", "tokenizers>=0.20", "gguf>=0.10"]
 api = ["fastapi>=0.115", "uvicorn[standard]>=0.30", "pydantic>=2.7"]
 bench = ["rapidfuzz>=3.9", "datasets>=3.0"]
 analysis = ["duckdb>=1.1"]
-dev = ["pytest>=8.3", "pytest-asyncio>=0.24", "ruff>=0.6", "import-linter>=2.0", "respx>=0.21", "coverage>=7.6"]
+dev = ["pytest>=8.3", "pytest-asyncio>=0.24", "ruff>=0.6", "import-linter>=2.0", "respx>=0.21", "coverage>=7.6",
+  # 真浏览器那一档（S40）。本机不需要下载浏览器：`channel="msedge"` 直接吃系统 Edge；
+  # CI 的 ubuntu 没有 Edge，那里才真的跑 `playwright install chromium`。
+  "playwright>=1.48",
+]
 
 [project.scripts]
 onyx = "onyx.cli:main"
@@ -32,9 +36,13 @@ testpaths = ["tests"]
 markers = [
   "live: 需要运行中的 Ollama",
   "probe: 语义实测实验",
-  "e2e: 浏览器端到端",
+  "e2e: 页面取数同源 + SSE 在真 HTTP 连接上被读到（不起浏览器）",
+  "browser: 真浏览器驱动（S40）——要 node/vite 与浏览器，所以后端那个 CI job 跑不了它",
 ]
-addopts = "-m 'not live and not probe and not e2e' --strict-markers -q"
+# `browser` 单独一档而不是并进了 e2e：CI 的后端 job 里没有 node，
+# 并进去等于把那一步必红；而默认档（量覆盖率那一档）必须继续排除这两档，
+# 否则覆盖率数字会随浏览器时序抖动，而 fail_under=85 是要能被信任的。
+addopts = "-m 'not live and not probe and not e2e and not browser' --strict-markers -q"
 # 挂死时自动 dump 所有线程栈：死锁必须留下现场，而不是让人干等
 faulthandler_timeout = 90
 
