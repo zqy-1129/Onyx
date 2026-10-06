@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
-from onyx.core.types import Cap, Generation, GenerationRequest, ToolSpec
+from onyx.core.types import Cap, Embedding, EmbedRequest, Generation, GenerationRequest, ToolSpec
 
 if TYPE_CHECKING:
     from onyx.eval.datasets.loader import Dataset
@@ -122,6 +122,14 @@ class Skip:
         )
 
 
+#: 任务能发起的请求类型，以及判分时拿到的样本类型。
+#: 只写 `GenerationRequest` 的话，S33 的向量化任务就必须去改内核的调用路径
+#: （gateway 已经有 `embed()` 了，任务协议却不认它的请求类型）——
+#: 那正是边界门禁要拦的"抽象装不下实现"。所以这里把"多请求类型"写进契约本身。
+Request = GenerationRequest | EmbedRequest
+Sample = Generation | Embedding
+
+
 @runtime_checkable
 class EvalTask(Protocol):
     id: str
@@ -132,8 +140,8 @@ class EvalTask(Protocol):
     metric_names: tuple[str, ...]
 
     def load(self, *, split: str = "default", limit: int | None = None) -> Iterator[Case]: ...
-    def build(self, case: Case) -> GenerationRequest: ...
-    def grade(self, case: Case, sample: Generation) -> Grade: ...
+    def build(self, case: Case) -> Request: ...
+    def grade(self, case: Case, sample: Sample) -> Grade: ...
     def aggregate(self, grades: Sequence[Grade], *, seed: int = 0) -> dict[str, Any]: ...
 
 

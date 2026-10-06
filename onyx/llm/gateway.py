@@ -246,6 +246,7 @@ class Gateway:
         *,
         purpose: TracePurpose | str | None = None,
         trace_id: str | None = None,
+        context: TraceContext | None = None,
     ) -> EmbedGatewayResult:
         """一次批量向量化。**没有 `EmbeddingProvider` 就是明确的 unsupported**。
 
@@ -256,7 +257,7 @@ class Gateway:
         from onyx.llm.providers.base import EmbeddingProvider
 
         tid = trace_id or new_trace_id()
-        ctx = req.context
+        ctx = context or req.context
         if purpose is not None:
             ctx = dataclasses.replace(ctx, purpose=TracePurpose(purpose))
         start_ns = self.clock.monotonic_ns()

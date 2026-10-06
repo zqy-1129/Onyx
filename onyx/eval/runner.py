@@ -23,7 +23,7 @@ from typing import Any
 from onyx import __version__
 from onyx.core.clock import SYSTEM_CLOCK, Clock, utc_now_iso
 from onyx.core.ids import new_trace_id
-from onyx.core.types import Cap, TraceContext, TracePurpose
+from onyx.core.types import Cap, EmbedRequest, TraceContext, TracePurpose
 from onyx.eval.datasets.loader import Dataset
 from onyx.eval.gpu_lock import GpuLock
 from onyx.eval.metrics import jsonable
@@ -349,28 +349,37 @@ class EvalRunner:
             purpose=config.purpose, eval_run_id=run_id, case_id=case.id,
             sample_seq=seq, root_trace_id=run_id,
         )
+        #: 走哪条入口由 `build()` 返回的**请求类型**决定，不看任务 id。
+        #: 写成 `if self.task.id == "semantic_similarity"` 的话，第二个非生成任务又得改这里。
+        embed_call = isinstance(request, EmbedRequest)
+        call = self.gateway.embed if embed_call else self.gateway.generate
+        stage = "embed" if embed_call else "generate"
         try:
-            result = self.gateway.generate(
-                request, purpose=config.purpose, context=context
-            )
+            result = call(request, purpose=config.purpose, context=context)
         except Exception as exc:  # noqa: BLE001 - 单条失败不许中断整轮（见模块文档）
             return Grade(
                 case_id=case.id, seq=seq, score=0.0, verdict=Verdict.ERROR, passed=None,
                 error=f"{type(exc).__name__}: {exc}"[:500],
-                extra={"stage": "generate"},
+                extra={"stage": stage},
             )
 
         usage = result.usage
         cost["requests"] += 1
-        if usage is None or usage.in_tokens is None or usage.out_tokens is None:
+        #: 向量调用**没有**输出 token：那是事实，不是"引擎没报"。
+        #: 沿用"进出都必须有数"的判据会把每条 embed 都记成 `in_tokens_unknown`，
+        #: 于是新通路在自己的成本报表里被抹成"什么都没测到"。
+        out_known = embed_call or (usage is not None and usage.out_tokens is not None)
+        if usage is None or usage.in_tokens is None or not out_known:
             # 不知道就是不知道：记一个计数，而不是把 None 当 0 加进成本
             cost["in_tokens_unknown"] += 1
         else:
             cost["in_tokens"] += usage.in_tokens
-            cost["out_tokens"] += usage.out_tokens
+            cost["out_tokens"] += int(usage.out_tokens or 0)
 
+        #: 判分拿到的样本与发起的请求同类型：生成任务收 Generation，向量化任务收 Embedding
+        sample = result.embedding if embed_call else result.generation
         try:
-            grade = self.task.grade(case, result.generation)
+            grade = self.task.grade(case, sample)
         except Exception as exc:  # noqa: BLE001 - grader 崩了也不能丢掉这条 trace
             return Grade(
                 case_id=case.id, seq=seq, score=0.0, verdict=Verdict.ERROR, passed=None,
