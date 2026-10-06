@@ -387,15 +387,16 @@ MIN_TOKENS_PER_HANZI = 0.5
 
 
 def _min_prompt_tokens(prompt: str) -> int:
-    """正文的 token 下限（只由汉字推出）。0 表示推不出来 ⇒ 不做截断判断。
+    """正文的 token 下限。**实现只有一份**（`measurement.heuristic.min_prompt_tokens`）：
+    吞吐基线也要用同一个判据识别"引擎把正文裁了"，两处各写一个常数迟早会分叉成
+    "评测说没切、基线说切了"。0 表示推不出来 ⇒ 不做截断判断。
 
     这不是"用估算冒充测量"：估算在这里的用途是**把样本踢出分母**（记 skip），
     而不是给模型打分——它只会让人看不见这一条，不会把"没测"说成"不会"。
     """
-    from onyx.llm.measurement.heuristic import split_cjk
+    from onyx.llm.measurement.heuristic import min_prompt_tokens
 
-    cjk, _other = split_cjk(prompt)
-    return int(cjk * MIN_TOKENS_PER_HANZI)
+    return min_prompt_tokens(prompt, tokens_per_hanzi=MIN_TOKENS_PER_HANZI)
 
 
 def _engine_in_tokens(sample: Generation) -> int | None:
