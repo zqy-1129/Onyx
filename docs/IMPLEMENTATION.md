@@ -3067,6 +3067,66 @@ uv run ruff check . && uv run lint-imports && uv run python scripts/check_extens
 ④ 摘掉 `builtin_visitors()` 里的 timing ⇒ 端到端那条红（测试里就带着这个注入） ✓；
 ⑤ 五道门全绿 ✓。
 
+## S38 — 两个欠着的入口：`onyx token explain` 与 `onyx report usage`
+
+**为什么是这一步**：STATUS §4 把它定性为"每天都在用但入口缺失"。今天要看一次
+"这条 trace 的 token 数为什么是这个数"，只能人脑里跑一遍对账；要看跨模型的用量汇总，只有看板有
+（`/api/usage/summary`），CLI 与脚本没有。附录 A 的 S4 行甚至一直写着"`token explain` 多源对比表"
+是它的绿条件——**一条从未存在的命令被写进了门禁清单**（这一步同时把那行改成实话）。
+
+**产出文件（计划）**
+```
+onyx/llm/measurement/explain.py       # 单条 trace 的"为什么落在这档"：阶梯判定 + 各来源差值 + 闭合检查
+onyx/report/usage_report.py           # 跨时间用量汇总的渲染（csv / markdown / json 同一份形状）
+onyx/cli.py                           # token_app(explain) + report_app(usage)；共用阈值常量
+onyx/api/routes/traces.py             # 手搓的 p50 与 0.10 换成 stats.median + 共享常量
+tests/unit/test_measurement_explain.py
+tests/unit/test_report_usage.py
+tests/unit/test_cli_token_report.py
+docs/IMPLEMENTATION.md                # 附录 A 的 S4 行改为实话（命令在 S38 落地）
+```
+
+**四条设计决定**
+1. **`token explain` 不复制 `traces show`**：后者已经在渲染"采信 + 各来源对账 + 分段归因"三张表，
+   再抄一份就是第二个事实源。这一步只回答它没答的四问：
+   ① 为什么采信落在这档（engine 报没报 / fitted 的 `n` 到没到 `FITTED_MIN_SAMPLES` /
+   `hf_tokenizer`、`gguf_vocab` 本版本未实现）；② 换成别的档差多少（各来源与采信值的绝对与相对差）；
+   ③ **分段闭合吗**（Σ分段 + `template_ctl` == 引擎计数，P9 口径）——不闭合是采集侧的缺陷，
+   不该由人眼从表里加出来；④ 要升到 fitted 还差几个样本、跑哪条命令。
+   所有判定读现成函数与常量，**不许出现第二个 0.10 或第二套阶梯顺序**。
+2. **CLI 与看板必须同源**：`report usage` 直接吃 `UsageRepo.summarize / by_prefill_mode / timeseries`
+   ——与 `/api/usage/summary` 同一批函数，形状也一样；顺带把路由里手写的
+   `ordered[len(ordered)//2]` 与 `v > 0.10` 换成 `llm/measurement/stats.median()` 与共享常量
+   `DRIFT_THRESHOLD`。**两处各算 p50/阈值的话，同一份库在看板与 CLI 上会给出不同的"漂移超阈率"。**
+3. **未知 ≠ 0 的两种形态**：某来源没报 ⇒ 那一行是「—」+ 缺什么；时间桶里没有 trace ⇒ **不产生行**
+   （补 0 会让"这段时间没跑"被画成"跑了一次但没花 token"，而曲线图上两者形状相同）。
+4. **闭合判定必须会响**：注入一条缺陷（把某个 part 的 tokens 加大）⇒ `token explain` 要报出差值
+   并以退出码 1 结束；否则这条判定只是装饰。同理，`report usage` 的 CSV 列序被测试钉住
+   （列序漂了会让下游脚本静默读错列，而 diff 里看不出来）。
+
+**自测**
+```bash
+uv run pytest tests/unit/test_measurement_explain.py tests/unit/test_report_usage.py \
+              tests/unit/test_cli_token_report.py -q
+uv run onyx token explain <trace_id>          # 真机那条 trace：采信/差值/闭合/标定建议四段
+uv run onyx token explain <trace_id> --json
+uv run onyx report usage --bucket-minutes 720 --fmt markdown
+uv run onyx report usage --fmt csv > .tmp/usage.csv
+uv run onyx --help && uv run onyx token --help && uv run onyx report --help
+```
+**DoD**：① 两个新命令存在且 `--help` 可用，命令数与 STATUS/README 一起改；
+② `token explain` 的四问都有答案，且**没有引入第二套阈值/阶梯**（`DRIFT_THRESHOLD`、
+`FITTED_MIN_SAMPLES` 是唯一来源，测试断言 CLI 与 API 用同一个常量）；
+③ 分段不闭合 ⇒ 退出码 1 并印出差值（注入缺陷验证会响）；
+④ `report usage` 与 `/api/usage/summary` 逐字段核对相等（同一份库、同一时刻）；
+⑤ 五道门全绿，覆盖率不低于地板；附录 A 的 S4 行不再宣称一个当时不存在的命令。
+
+**提交**：
+`docs(m12): S38 方案`
+`feat(measurement): token explain —— 为什么采信落在这档，分段闭合吗`
+`feat(report): onyx report usage —— 与 /api/usage/summary 同源的一份汇总`
+`docs(m12): S38 归档 + 把门禁清单里那句不存在的命令改成实话`
+
 ---
 
 ## 附录 A — 每步自测速查
@@ -3076,7 +3136,7 @@ uv run ruff check . && uv run lint-imports && uv run python scripts/check_extens
 | S1 | `pytest tests/unit -q` | 全过 + `grep` 证明 core 零三方依赖 |
 | S2 | `onyx db init && onyx db info` | `schema_version=1`，迁移可重复执行 |
 | S3 | `onyx chat --stream` | 4 项数字与 `curl+jq` 原始返回一致 |
-| S4 | `onyx probe run --suite usage,cache,think` | `docs/PROBES.md` 有结论；`token explain` 多源对比表 |
+| S4 | `onyx probe run --suite usage,cache,think` | `docs/PROBES.md` 有结论；多源对账表由 `onyx token explain <trace>` 提供（**该行原本写于 S4，当时这条命令并不存在——S38 补齐并把措辞改成实话**） |
 | S5 | `onyx traces show <id>` | token/延迟/工具/原始 body 齐备，来源与置信度可见 |
 | S6 | `onyx probe matrix` | 无 `unknown` 工具格式；`✗(cap)` 与 `unknown` 可区分 |
 | S7 | `onyx doctor` | 全绿；破坏性测试能报出具体项 |
@@ -3111,6 +3171,7 @@ uv run ruff check . && uv run lint-imports && uv run python scripts/check_extens
 | S35 | `uv run onyx tools contract` + `uv run pytest tests/unit/test_tools_mcp_stdio.py` | 5 列且 `mcp_stdio 通过 8 · 失败 0 · 不适用 0`（真子进程，连跑两次一致）；把 `mcp_stdio` 的样本换成起不来的命令 ⇒ 那一列变 `unavailable` 带原因而其余四列照旧；`_request` 去掉会话锁 ⇒ 并发那条测试 5 次里 4 次红 |
 | S36 | `uv run onyx perf run --model qwen3.5:9b --prompt-chars 600,2400 --target-tokens 64 --concurrency 1,2 --repeat 1 --device rtx4060ti-16g` + `onyx perf compare A B` + `uv run pytest -m live tests/integration/test_perf_live.py` | 基线落库且 `状态 done`、指纹可复现（同参数两次跑出同一个 `env_hash`）；换网格的第三条与第一条比 ⇒ **退出码 1 并逐字段列出 `grid`**，加 `--force` 才给差值且结果头上印警告；`--provider mock` 退出码 2；真机那条断言 `timing_source == engine_ns` 且每个数字点得回真 trace；把 `FINGERPRINT_FIELDS` 里删掉任一字段 ⇒ 契约测试点名那个字段红 |
 | S37 | `uv run pytest tests/unit/test_obs_timing.py tests/unit/test_streaming.py -q` + `uv run onyx chat --model … --stream …` + `uv run pytest tests/integration/test_gateway_live.py -m live` | 流式那一发：CLI 表里 TTFT 有数（不再是「—」）、库里 `usage.ttft_ms` 与 `trace.first_token_at` 同时非空且 `ttft_source=measured`、且 `finished − first_token ≈ wall − ttft`（旧行为差整段生成时间）；非流式那发留空但写明 `proxy:prompt_eval_duration`；把 `timing` 从注册表摘掉 ⇒ 落库那条必须变回空 |
+| S38 | `uv run onyx token explain <trace_id>` + `uv run onyx report usage --fmt csv` | 四问齐答（采信为何落这档 / 各来源差值 / 分段是否闭合 / 离标定还差几个样本），且 CLI 与 `/api/usage/summary` 逐字段相等（同一份库同一时刻）；把一个 part 的 tokens 改大 ⇒ `token explain` 退出码 1 并印出差值；时间桶没 trace ⇒ 不产生 0 行 |
 
 ## 附录 B — 架构自测（让"模块化"可验证，而非口号）
 
