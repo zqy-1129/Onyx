@@ -354,3 +354,59 @@ class AlertTriggerRecord:
     status: str = "sent"
     detail: str = ""
     is_test: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class PerfRunRecord:
+    """一次 `onyx perf` 运行的**条件**。
+
+    一张基线能不能被拿来比，全部取决于这里：数字相同而条件不同就是两个不同的事实。
+    `env_hash` 是可比性指纹（字段清单在 `onyx.perf.bench.FINGERPRINT_FIELDS`），
+    `comparable=False` 表示连"哪台引擎、哪个模型"都没认出来——这时 compare 必须拒绝，
+    而不是拿着一个可能张冠李戴的哈希给结论。
+    """
+
+    id: str
+    started_at: str
+    finished_at: str
+    status: str
+    model: str
+    provider_id: str = ""
+    engine_version: str = ""
+    quantization: str = ""
+    device: str = ""
+    num_ctx: int | None = None
+    keep_alive: str = ""
+    stream: bool = True
+    timing_source: str = "unknown"
+    env_hash: str = ""
+    comparable: bool = False
+    conditions: dict[str, Any] = field(default_factory=dict)
+    grid: dict[str, Any] = field(default_factory=dict)
+    elapsed_s: float = 0.0
+    n_requests: int = 0
+    app_version: str = ""
+    git_rev: str = ""
+    note: str = ""
+    error: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class PerfCellRecord:
+    """一个格子的结果。`status != "measured"` 时 `metrics` 是空的——
+    "没测到"必须是一行带原因的记录，不是一行 0（那会被平均进去）。
+    """
+
+    run_id: str
+    cell_key: str
+    phase: str
+    prompt_chars: int
+    target_tokens: int
+    concurrency: int
+    repeat: int
+    status: str = "measured"
+    reason: str = ""
+    n_requests: int = 0
+    n_measured: int = 0
+    metrics: dict[str, Any] = field(default_factory=dict)
+    trace_ids: tuple[str, ...] = ()

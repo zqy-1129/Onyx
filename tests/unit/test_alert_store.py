@@ -40,7 +40,9 @@ def _trigger(i: str, *, code: str = "CONTEXT_OVERFLOW", channel: str = "file",
 
 def test_migration_creates_the_trigger_table(db):
     assert "alert_trigger" in db.table_names()
-    assert db.version() == 7
+    # 只要求"至少到 v7"：这张表从 v7 起就该在。写死 `== 7` 的话，
+    # 每加一条迁移都要来改这个和告警毫无关系的测试（而迁移数量的哨兵在 test_db_migrations）
+    assert db.version() >= 7
 
 
 def test_round_trip_keeps_rule_and_sample_traces(alerts):

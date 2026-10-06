@@ -9,8 +9,9 @@ from __future__ import annotations
 from .alert_repo import AlertRepo
 from .eval_repo import EvalRepo
 from .model_repo import ModelRepo
+from .perf_repo import PerfRepo
 from .tool_repo import ToolRepo
 from .trace_repo import TraceRepo
 from .usage_repo import UsageRepo
 
-__all__ = ["AlertRepo", "EvalRepo", "ModelRepo", "ToolRepo", "TraceRepo", "UsageRepo"]
+__all__ = ["AlertRepo", "EvalRepo", "ModelRepo", "PerfRepo", "ToolRepo", "TraceRepo", "UsageRepo"]

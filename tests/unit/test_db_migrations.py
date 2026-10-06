@@ -15,7 +15,7 @@ def db(tmp_path) -> Database:
 
 #: 仓库里的迁移数量。新增迁移时这个数会变，测试随之更新——
 #: 它是"迁移有没有被意外删掉/改名"的一道哨兵
-EXPECTED_VERSION = 7
+EXPECTED_VERSION = 8
 
 
 def test_fresh_db_applies_migrations(db):
@@ -24,7 +24,7 @@ def test_fresh_db_applies_migrations(db):
     assert {"provider", "model", "trace", "usage", "usage_alt", "token_part", "tool_call",
             "anomaly", "tool_def", "tool_test", "tool_run",
             "dataset", "eval_case", "eval_task", "eval_run", "grade",
-            "retention_run", "alert_trigger"} <= tables
+            "retention_run", "alert_trigger", "perf_run", "perf_cell"} <= tables
     columns = {r["name"] for r in db.query("PRAGMA table_info(usage)")}
     assert {"prefill_mode", "prefill_ms_per_token"} <= columns, "P11 的冷/热分列必须落库"
 
