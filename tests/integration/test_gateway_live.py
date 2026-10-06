@@ -72,11 +72,18 @@ def test_real_conversation_produces_a_complete_trace(runtime):
     assert record is not None, "trace 必须落库"
     assert record.status == "ok" and record.model_name == MODEL
     assert record.provider_id == "ollama-local"
-    assert record.first_token_at is None or record.first_token_at
+    # 这一发是**非流式**：没有逐字交付，就没有"首字时刻"这个量。
+    # 原来这句写作 `assert first_token_at is None or first_token_at`——恒成立，
+    # 看着像检查其实什么都没检查（S37 换掉它，并补下面那条流式的）。
+    assert record.first_token_at is None, "非流式不该有首字时刻，proxy 值也不能顶替"
 
     bundle = UsageRepo(db).fetch(result.trace_id)
+    assert bundle.usage is not None
+    assert bundle.usage.ttft_ms is None
+    assert str(bundle.usage.extra.get("ttft_source", "")).startswith("proxy:"), \
+        "空着要能说清为什么空：这里应记下 prompt_eval_duration 的代理出处"
+
     usage = bundle.usage
-    assert usage is not None
     assert usage.source == "engine", f"应以引擎计数为采信来源，实际 {usage.source}"
     assert usage.confidence == "high"
     assert usage.in_tokens and usage.in_tokens > 0
@@ -96,7 +103,7 @@ def test_real_conversation_produces_a_complete_trace(runtime):
     assert blobs.get_json(record.messages_ref)[0]["content"] == "用一句话解释什么是 KV 缓存"
 
     # GPU 采样（sample_gpu=True）
-    assert record.gpu, "应采到显存/上下文快照"
+    assert record.gpu, "请求期显存采样应落进 trace"
 
     print(f"\n[M1] trace={result.trace_id}")
     print(f"[M1] in={usage.in_tokens} out={usage.out_tokens} src={usage.source}/{usage.confidence}")
@@ -105,6 +112,42 @@ def test_real_conversation_produces_a_complete_trace(runtime):
     print(f"[M1] parts={[(p.part, p.tokens) for p in bundle.parts]}")
     print(f"[M1] gpu={record.gpu}")
     print(f"[M1] anomalies={[(code, sev) for code, sev, _ in result.anomalies]}")
+def test_streaming_trace_records_ttft_within_the_window(runtime):
+    """流式请求：TTFT 的时长与时刻都必须落库，且时刻落在 trace 自己的窗口内。
+
+    这条是 S37 的正向断言——`FIRST_TOKEN` 有人接了，接错了（没写、写成代理值、
+    或时刻跑到窗口外面）都会红。
+    """
+    gateway, db, sink, _ = runtime
+    result = gateway.generate(GenerationRequest.of(
+        MODEL, "用一句话解释什么是 KV 缓存",
+        params=GenParams(max_tokens=255, temperature=0.0), thinking=False, stream=True,
+    ))
+    sink.flush(10.0)
+
+    record = TraceRepo(db).get(result.trace_id)
+    bundle = UsageRepo(db).fetch(result.trace_id)
+    usage = bundle.usage
+    assert record is not None and usage is not None
+    assert record.first_token_at is not None, "流式请求没有首字时刻 ⇒ 事件又没人接了"
+    assert usage.ttft_ms is not None and usage.ttft_ms >= 0
+    assert usage.extra.get("ttft_source") == "measured"
+    # 墙钟时刻必须落在 trace 自己的窗口内：时长（单调钟差）与时刻（墙钟）得讲同一个故事
+    assert record.started_at <= record.first_token_at <= record.finished_at
+    # 更硬的一条：`finished - first_token` 应该约等于 `wall - ttft`。
+    # 事件若在流结束时补发，这里会差出整段生成时间——那正是 S37 之前的行为。
+    from datetime import datetime
+
+    first = datetime.fromisoformat(record.first_token_at)
+    started = datetime.fromisoformat(record.started_at)
+    ended = datetime.fromisoformat(record.finished_at)
+    tail_ms = (ended - first).total_seconds() * 1000.0
+    expected_tail = (usage.wall_ms or 0.0) - usage.ttft_ms
+    assert abs(tail_ms - expected_tail) < max(1500.0, 0.25 * expected_tail), (
+        f"首字时刻与首字时长讲的不是同一个故事：尾巴 {tail_ms:.0f}ms vs 应为 {expected_tail:.0f}ms")
+    assert first > started, "首字时刻不该等于请求起始（那是在说「零延迟」）"
+    print(f"\n[M1-stream] trace={result.trace_id} ttft={usage.ttft_ms}ms "
+          f"first_token_at={record.first_token_at} decode_tps={usage.decode_tps}")
 
 
 def test_real_tool_call_is_recorded_with_args(runtime):

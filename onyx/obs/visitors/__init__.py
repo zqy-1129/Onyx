@@ -28,14 +28,21 @@ class BaseVisitor:
 
 def builtin_visitors() -> tuple[BaseVisitor, ...]:
     """内建观测器。**顺序即依赖**：token 先对账 → cost 用采信值算成本 →
-    anomaly 最后做跨切面判定。"""
+    anomaly 最后做跨切面判定。
+
+    `timing` 排在 cost 之前：它不读任何人的产出（只看 `FIRST_TOKEN` 事件），
+    而 `latency_summary()` 在 TRACE_END 时会读它写的 `ttft_ms`——
+    把不依赖人的放前面，将来真有依赖时也不用回头改顺序。
+    """
     from onyx.obs.visitors.anomaly import AnomalyVisitor
     from onyx.obs.visitors.cost import CostVisitor
     from onyx.obs.visitors.gpu import GpuVisitor
+    from onyx.obs.visitors.timing import TimingVisitor
     from onyx.obs.visitors.token import TokenVisitor
     from onyx.obs.visitors.tool import ToolVisitor
 
-    return (TokenVisitor(), ToolVisitor(), GpuVisitor(), CostVisitor(), AnomalyVisitor())
+    return (TokenVisitor(), ToolVisitor(), GpuVisitor(), TimingVisitor(),
+            CostVisitor(), AnomalyVisitor())
 
 
 def plugin_visitors() -> tuple[BaseVisitor, ...]:

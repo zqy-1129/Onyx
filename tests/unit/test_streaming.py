@@ -224,3 +224,42 @@ def test_ndjson_line_parsing_is_tolerant():
     asm.feed(_native_final())
     gen = asm.build()
     assert json.loads(json.dumps({"n": gen.extra["raw_chunks"]}))["n"] == 2
+
+
+def test_first_token_event_fires_at_the_moment_not_at_the_end():
+    """S37：`trace.first_token_at` 落的是这个事件的墙钟时刻。
+
+    等流结束补发的话，时刻会等于"结束"，那个字段就从"第一个字什么时候到"
+    变成"我们什么时候想起要记"——两者在观测里长得一模一样，而后者没有意义。
+    同时只许发一条：补发 + 即时发会让前端把首字渲染两次。
+    """
+    from onyx.core.clock import FakeClock
+    from onyx.llm.streaming import consume_chunks
+
+    events: list = []
+    gen = consume_chunks(
+        [_native_chunk("第"), _native_chunk("二段"), _native_final()],
+        trace_id="T1", clock=FakeClock(), style="native", model="m",
+        on_event=events.append,
+    )
+    kinds = [str(e.type) for e in events]
+    assert kinds.count("first_token") == 1, f"首字事件重复：{kinds}"
+    assert gen.ttft_ms is not None
+    assert kinds.index("first_token") < max(i for i, k in enumerate(kinds) if k == "text_delta"), \
+        "首字事件必须落在文本增量之间，而不是全部结束之后"
+
+
+def test_non_streaming_proxy_ttft_is_labeled_a_proxy():
+    """非流式没有"首字"这个量：事件仍发（带着 proxy），值不能冒充测量。"""
+    from onyx.core.clock import FakeClock
+    from onyx.llm.streaming import emit_final_events
+
+    events: list = []
+    asm = StreamAssembler(style="native")
+    asm.feed(_native_chunk("答案"))
+    asm.feed(_native_final())
+    emit_final_events(asm.build(model="m"), _native_final(), trace_id="T2",
+                      clock=FakeClock(), on_event=events.append, ttft_ms=None)
+    first = [e for e in events if str(e.type) == "first_token"]
+    assert len(first) == 1 and first[0].payload["proxy"] == "prompt_eval_duration"
+

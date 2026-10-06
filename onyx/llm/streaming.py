@@ -280,6 +280,7 @@ def emit_final_events(
     clock: Any,
     on_event: Any = None,
     ttft_ms: float | None = None,
+    ttft_announced: bool = False,
 ) -> None:
     from onyx.core.event import EventType, make_event
     from onyx.llm.providers.base import emit
@@ -297,7 +298,7 @@ def emit_final_events(
             EventType.FIRST_TOKEN, trace_id,
             {"ttft_ms": ttft_ms, "proxy": "prompt_eval_duration"}, clock=clock,
         ))
-    elif ttft_ms is not None:
+    elif ttft_ms is not None and not ttft_announced:
         emit(on_event, make_event(EventType.FIRST_TOKEN, trace_id, {"ttft_ms": ttft_ms}, clock=clock))
 
     engine = gen.usage_from(TokenSource.ENGINE)
@@ -366,6 +367,11 @@ def consume_chunks(
             continue
         if assembler.feed(chunk) and ttft_ms is None:
             ttft_ms = (clock.monotonic_ns() - start) / 1e6
+            # **在它发生的那一刻发**，不是等流结束补发：`trace.first_token_at` 落的是事件的
+            # 墙钟时刻，补发会让它等于"结束时刻"——那个字段就从"第一个字什么时候到的"
+            # 变成"我们什么时候想起要记"，而两者在观测里长得一模一样。
+            emit(on_event, make_event(
+                EventType.FIRST_TOKEN, trace_id, {"ttft_ms": ttft_ms}, clock=clock))
         message = chunk.get("message") or (chunk.get("choices") or [{}])[0].get("delta") or {}
         if text := message.get("content"):
             emit(on_event, make_event(
@@ -388,5 +394,6 @@ def consume_chunks(
         ttft_ms=ttft_ms,
         wall_ms=(clock.monotonic_ns() - start) / 1e6,
     )
-    emit_final_events(gen, last_raw, trace_id=trace_id, clock=clock, on_event=on_event, ttft_ms=ttft_ms)
+    emit_final_events(gen, last_raw, trace_id=trace_id, clock=clock, on_event=on_event,
+                      ttft_ms=ttft_ms, ttft_announced=ttft_ms is not None)
     return gen

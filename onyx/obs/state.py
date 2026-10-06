@@ -138,6 +138,13 @@ class TraceState:
         if chosen is None:
             return None
         summary = self.latency_summary()
+        # ttft 的出处跟着 ttft 走：`ttft_ms` 为 NULL 时，"为什么是空"必须能在同一行答出来
+        # （measured / proxy:prompt_eval_duration / absent）。少了它，一个空的延迟列
+        # 就只能靠人去猜是通道不给、请求没流式，还是观测漏接了。
+        extra: dict[str, Any] = {"alts": [str(s.source) for s in chosen.alts]}
+        source = self.extra.get("ttft_source")
+        if source:
+            extra["ttft_source"] = source
         return UsageRecord(
             trace_id=self.trace_id, source=chosen.source, confidence=chosen.confidence,
             in_tokens=chosen.in_tokens, out_tokens=chosen.out_tokens,
@@ -148,7 +155,7 @@ class TraceState:
             drift_pct=chosen.drift_pct,
             prefill_mode=summary.get("prefill_mode"),
             prefill_ms_per_token=_round(summary.get("prefill_ms_per_token"), 6),
-            extra={"alts": [str(s.source) for s in chosen.alts]},
+            extra=extra,
         )
 
     def to_alt_records(self) -> list[UsageAltRecord]:
