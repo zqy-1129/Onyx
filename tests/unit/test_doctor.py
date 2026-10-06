@@ -185,11 +185,14 @@ def _alerts_check(tmp_path, monkeypatch, body: str, db):
 
 
 def test_alert_check_is_green_and_reads_out_its_posture(tmp_path, monkeypatch, db):
+    from onyx.core.clock import utc_now_iso
     from onyx.store.records import AlertTriggerRecord
     from onyx.store.repos import AlertRepo
 
+    # 时间戳必须跟着真实时钟走：体检里的"今天投递"按 UTC 日界算，
+    # 写死一个日期就是一条定时炸弹——跨过午夜十二点它才红，而红的原因与被测逻辑无关
     AlertRepo(db).insert_trigger(AlertTriggerRecord(
-        id="t1", created_at="2026-10-05T03:00:00+00:00", code="CONTEXT_OVERFLOW",
+        id="t1", created_at=utc_now_iso(), code="CONTEXT_OVERFLOW",
         severity="error", rule={}, n_in_window=1, window_s=300, channel="file",
         status="sent", detail="写入 1 行"))
     check = _alerts_check(tmp_path, monkeypatch, "[alerts]\nwindow_s = 120\n", db)
