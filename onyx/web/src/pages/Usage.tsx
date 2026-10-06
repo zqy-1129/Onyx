@@ -69,32 +69,32 @@ function SeriesChart({ rows }: { rows: Array<Record<string, number | string>> })
         <span className="muted" style={{ width: 120, flex: '0 0 120px' }}>输入 token</span>
         <Sparkline values={inTokens} width={220} color="var(--info)" />
         <b className="num">{fmtCompact(Math.max(...inTokens))}</b>
-        <span className="muted">峰值</span>
+        <span className="muted nowrap">峰值</span>
       </div>
       <div className="row small">
         <span className="muted" style={{ width: 120, flex: '0 0 120px' }}>输出 token</span>
         <Sparkline values={outTokens} width={220} color="var(--ok)" />
         <b className="num">{fmtCompact(Math.max(...outTokens))}</b>
-        <span className="muted">峰值</span>
+        <span className="muted nowrap">峰值</span>
       </div>
       <div className="row small">
         <span className="muted" style={{ width: 120, flex: '0 0 120px' }}>decode t/s</span>
         <Sparkline values={decode} width={220} color="var(--accent)" />
         <b className="num">{fmtFloat(decode[decode.length - 1])}</b>
-        <span className="muted">最新</span>
+        <span className="muted nowrap">最新</span>
       </div>
       {/* 冷/热两条独立系列，绝不合并（R3） */}
       <div className="row small">
         <span className="muted" style={{ width: 120, flex: '0 0 120px' }}>❄ cold prefill</span>
         <Sparkline values={cold} width={220} color="var(--cold)" />
         <b className="num">{fmtFloat(avg(cold))}</b>
-        <span className="muted">均值 t/s</span>
+        <span className="muted nowrap">均值 t/s</span>
       </div>
       <div className="row small">
         <span className="muted" style={{ width: 120, flex: '0 0 120px' }}>♨ warm prefill</span>
         <Sparkline values={warm} width={220} color="var(--warm)" />
         <b className="num">{fmtFloat(avg(warm))}</b>
-        <span className="muted">均值 t/s</span>
+        <span className="muted nowrap">均值 t/s</span>
       </div>
     </div>
   )
